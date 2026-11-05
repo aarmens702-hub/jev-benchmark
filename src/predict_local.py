@@ -214,7 +214,14 @@ def run_nli(rt: Runtime, dataset: str, stage: str, key: str, guard) -> ArmRun:
     sp = rt.load_split(dataset)
     classes = list(label_texts(dataset, bare=False))
     hyps = arms_local.nli_hypotheses(dataset, bare=False)
-    scorer = rt.make_nli_scorer(key)
+    inner = rt.make_nli_scorer(key)
+
+    def scorer(batch):
+        # A 500-row chunk can take hours, so the guard runs before every batch, not just between chunks.
+        # A stop here drops the partial chunk; the last saved checkpoint stays valid.
+        guard()
+        return inner(batch)
+
     arm = "nli" if key == "large" else f"nli_{key}"
     return run_arm(
         arm, dataset, stage, sp.val[["row_id", "text"]],

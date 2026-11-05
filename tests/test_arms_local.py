@@ -879,8 +879,9 @@ def test_nli_arm_checkpoints_every_500_rows_and_resumes(tmp_path):
         return [float(len(set(tokens(p)) & set(tokens(h)))) for p, h in pairs]
 
     rt = make_runtime(tmp_path, scorer=scorer, clock=clock)
-    # 800 rows x 4 labels = 3200 pairs; the first chunk of 500 rows is 2000 pairs
-    code = predict_local.main(["--stage", "val", "--arm", "nli", "--dataset", "ag_news", "--max-hours", "0.0001"], rt)
+    # 800 rows x 4 labels = 3200 pairs; the first chunk of 500 rows is 2000 pairs = 125 batches = 1.25 h here,
+    # so the 1.3 h limit lets chunk 1 finish and stops chunk 2 a few batches in (that partial chunk is dropped)
+    code = predict_local.main(["--stage", "val", "--arm", "nli", "--dataset", "ag_news", "--max-hours", "1.3"], rt)
     assert code == 2  # stopped itself on the limit
     got, _, _ = predictions.read("nli", "ag_news", stage="val", root=tmp_path / "runs")
     assert len(got) == 500  # exactly one checkpoint chunk kept
@@ -904,8 +905,8 @@ def test_cli_refuses_the_test_stage_and_a_second_model_job(tmp_path):
     assert predict_local.main(["--stage", "val", "--floor"], rt) == 0  # released
 
 
-def test_cli_stops_on_swap_growth_between_chunks(tmp_path):
-    swap = iter([0.0, 0.0])  # baseline, then the check before chunk 1; every later reading is 3 GB
+def test_cli_stops_on_swap_growth_after_a_finished_chunk(tmp_path):
+    swap = iter([0.0] * 127)  # baseline, the chunk-1 check and its 125 batch checks; every later reading is 3 GB
     rt = dataclasses.replace(make_runtime(tmp_path), read_swap_gb=lambda: next(swap, 3.0))
     code = predict_local.main(["--stage", "val", "--arm", "nli", "--dataset", "ag_news"], rt)
     assert code == 2
@@ -933,3 +934,37 @@ def test_embedding_cache_keeps_shards_when_stopped_and_reuses_them(tmp_path):
     assert enc2.seen == texts[8:]  # only the missing texts were embedded
     assert np.allclose(out, FakeEncoder()(texts))
     assert len(list((tmp_path / "emb").glob("shard-*.npz"))) == 3
+
+
+def test_nli_guard_is_checked_before_every_batch_so_a_mid_chunk_swap_jump_stops_the_job(tmp_path):
+    readings = {"n": 0}
+
+    def swap():
+        readings["n"] += 1
+        return 0.0 if readings["n"] <= 10 else 3.0  # baseline, the chunk check, then 8 batch checks are fine
+
+    batches = []
+    rt = dataclasses.replace(make_runtime(tmp_path, scorer=fake_scorer(batches)), read_swap_gb=swap)
+    code = predict_local.main(["--stage", "val", "--arm", "nli", "--dataset", "ag_news"], rt)
+    assert code == 2
+    assert len(batches) == 8  # stopped inside the first 500-row chunk (125 batches), not at its end
+    assert predictions.read("nli", "ag_news", stage="val", root=tmp_path / "runs") is None  # partial chunk dropped
+
+    # A rerun with healthy swap starts from the last checkpoint (none yet) and finishes.
+    rt2 = make_runtime(tmp_path)
+    assert predict_local.main(["--stage", "val", "--arm", "nli", "--dataset", "ag_news"], rt2) == 0
+    got, vecs, _ = predictions.read("nli", "ag_news", stage="val", root=tmp_path / "runs")
+    assert len(got) == 800 and vecs.shape == (800, 4)
+
+
+def test_nli_max_hours_is_checked_inside_a_chunk(tmp_path):
+    clock = FakeClock()
+
+    def scorer(pairs):
+        clock.advance_hours(0.01)
+        return [0.0] * len(pairs)
+
+    seen = []
+    rt = make_runtime(tmp_path, scorer=lambda p: seen.append(1) or scorer(p), clock=clock)
+    code = predict_local.main(["--stage", "val", "--arm", "nli", "--dataset", "ag_news", "--max-hours", "0.05"], rt)
+    assert code == 2 and len(seen) == 5  # 0.05 h at 0.01 h per batch; the 125-batch chunk did not run to its end
