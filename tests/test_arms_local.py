@@ -171,15 +171,13 @@ def test_lr_columns_follow_classes_and_missing_class_gets_zero():
     assert probs.shape == (4, 3) and (probs[:, 0] == 0).all() and np.allclose(probs.sum(axis=1), 1)
 
 
-def test_lr_cv_uses_loo_for_s_2_to_16_5fold_for_35_and_all_c100_at_s1():
+def test_lr_cv_uses_stratified_kfold_with_k_min_s_5_and_c100_at_s1():
     assert arms_local.CV_GRID == (1, 10, 100, 1000)
-    for s in (2, 3, 5, 8, 16):
-        assert arms_local.cv_plan(s) == arms_local.CVPlan("loo", arms_local.CV_GRID)
-    for s in (35, "all"):
-        assert arms_local.cv_plan(s) == arms_local.CVPlan("5fold", arms_local.CV_GRID)
-    assert arms_local.cv_plan(1) == arms_local.CVPlan("none", (100,))
-    assert arms_local.cv_plan(np.int64(8)).scheme == "loo"
-    for bad in (0, 4, 20, "most"):
+    assert arms_local.cv_plan(1) == arms_local.CVPlan(0, (100,))
+    assert [arms_local.cv_plan(s).folds for s in (2, 3, 5, 8, 16, 35, "all")] == [2, 3, 5, 5, 5, 5, 5]
+    assert all(arms_local.cv_plan(s).grid == arms_local.CV_GRID for s in (2, 3, 5, 8, 16, 35, "all"))
+    assert arms_local.cv_plan(np.int64(3)).folds == 3
+    for bad in (0, -1, "most", 2.5, True):
         with pytest.raises(ValueError):
             arms_local.cv_plan(bad)
 
@@ -187,28 +185,32 @@ def test_lr_cv_uses_loo_for_s_2_to_16_5fold_for_35_and_all_c100_at_s1():
 def test_lr_cv_picks_c_from_inside_the_bank_and_fits_final_model_with_it(monkeypatch):
     calls = []
     monkeypatch.setattr(
-        arms_local, "cv_accuracies", lambda X, y, scheme, grid: calls.append((scheme, grid)) or {1: 0.5, 10: 0.9, 100: 0.6, 1000: 0.7}
+        arms_local, "cv_accuracies", lambda X, y, folds, grid: calls.append((folds, grid)) or {1: 0.5, 10: 0.9, 100: 0.6, 1000: 0.7}
     )
     fitted = []
     real = arms_local.lr
     monkeypatch.setattr(arms_local, "lr", lambda train, test, c=100, **kw: fitted.append(c) or real(train, test, c=c, **kw))
     X, y = toy_xy()
     arms_local.lr_cv((X, y), X[:2], s=8)
-    assert calls == [("loo", (1, 10, 100, 1000))] and fitted == [10]
+    assert calls == [(5, (1, 10, 100, 1000))] and fitted == [10]
+    arms_local.lr_cv((X, y), X[:2], s=2)
+    assert calls[-1][0] == 2
     arms_local.lr_cv((X, y), X[:2], s=1)  # no selection at s=1
-    assert len(calls) == 1 and fitted == [10, 100]
+    assert len(calls) == 2 and fitted == [10, 10, 100]
 
 
-def test_cv_accuracies_use_loo_or_stratified_5fold_with_a_fixed_seed(monkeypatch):
+def test_cv_accuracies_use_stratified_kfold_with_a_fixed_seed_and_k_fits_per_c(monkeypatch):
     X, y = toy_xy(n_per_class=6)
-    acc = arms_local.cv_accuracies(X, y, "5fold", (1, 100))
+    acc = arms_local.cv_accuracies(X, y, 5, (1, 100))
     assert set(acc) == {1, 100} and all(0 <= v <= 1 for v in acc.values())
-    assert acc == arms_local.cv_accuracies(X, y, "5fold", (1, 100))
+    assert acc == arms_local.cv_accuracies(X, y, 5, (1, 100))
     n_fits = []
     real = arms_local.fit_lr
     monkeypatch.setattr(arms_local, "fit_lr", lambda *a, **k: n_fits.append(1) or real(*a, **k))
-    arms_local.cv_accuracies(X[:12], y[:12], "loo", (1, 100))
-    assert len(n_fits) == 12 * 2
+    arms_local.cv_accuracies(X, y, 3, (1, 10, 100, 1000))
+    assert len(n_fits) == 3 * 4  # k fits per C, never one per row
+    with pytest.raises(ValueError):
+        arms_local.cv_accuracies(X, y, 1, (100,))
 
 
 def test_choose_c_ties_prefer_100_then_smaller():
@@ -267,7 +269,8 @@ def test_nli_uses_description_as_hypothesis_and_template_for_bare_names():
     assert bare[:2] == [f"This text is about {n}." for n in list(label_texts("banking77", bare=True))[:2]]
     assert "This text is about activate_my_card." in bare
     ag = arms_local.nli_hypotheses("ag_news", bare=False)
-    assert ag == list(label_texts("ag_news", bare=False).values())  # whatever labels.py returns, unaltered
+    assert ag == list(label_texts("ag_news", bare=False).values())  # unaltered
+    assert ag[0] == "world news, international affairs, politics and conflicts"  # the full written text
     assert arms_local.nli_hypotheses("ag_news", bare=True)[3] == "This text is about Sci/Tech."
 
 
@@ -567,6 +570,21 @@ def test_parse_swap_used_reads_macos_sysctl_output():
     assert guards.parse_swap_used_gb("total = 0.00M  used = 0.00M  free = 0.00M") == 0.0
     with pytest.raises(ValueError):
         guards.parse_swap_used_gb("garbage")
+
+
+def test_nli_batch_size_is_the_named_frozen_constant():
+    assert arms_local.NLI_BATCH_SIZE == 16
+    import inspect
+
+    assert inspect.signature(arms_local.nli).parameters["batch_size"].default is arms_local.NLI_BATCH_SIZE
+
+
+def test_wrapper_script_runs_the_cli_without_pythonpath():
+    script = REPO / "scripts" / "predict_local.sh"
+    assert script.stat().st_mode & 0o111
+    env = {k: v for k, v in __import__("os").environ.items() if k != "PYTHONPATH"}
+    out = subprocess.run([str(script), "--help"], capture_output=True, text=True, cwd="/", env=env, timeout=50)
+    assert out.returncode == 0 and "--floor" in out.stdout and "--time-nli" in out.stdout
 
 
 def test_default_readers_return_numbers():

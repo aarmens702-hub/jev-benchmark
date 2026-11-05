@@ -4,9 +4,8 @@
 Keys are the official class names, in the order of the committed file (match by name, not position).
 """
 import json
+import re
 from pathlib import Path
-
-import yaml
 
 THIRD_PARTY = Path(__file__).resolve().parents[1] / "third_party"
 BANKING77_FILE = THIRD_PARTY / "banking77" / "banking77_intents.v1.json"
@@ -18,9 +17,25 @@ def _banking77() -> tuple[dict[str, str], str]:
     return dict(blob["descriptions"]), blob["instructions"]
 
 
+_AG_LABEL_LINE = re.compile(r"^\s*-\s*\{\s*name:\s*(?P<name>[^,]+?)\s*,\s*desc:\s*(?P<desc>.*?)\s*\}\s*$")
+_AG_QUESTION_LINE = re.compile(r"^question:\s*(?P<q>.*?)\s*$")
+
+
 def _ag_news() -> tuple[dict[str, str], str]:
-    blob = yaml.safe_load(AG_NEWS_FILE.read_text(encoding="utf-8"))
-    return {item["name"]: item["desc"] for item in blob["labels"]}, blob["question"]
+    """Read agnews.yaml as literal text. Parsed as YAML, each flow-mapping line would be cut at the
+    first comma inside its description ("world news" instead of the whole sentence)."""
+    descriptions: dict[str, str] = {}
+    question = None
+    for line in AG_NEWS_FILE.read_text(encoding="utf-8").splitlines():
+        if m := _AG_LABEL_LINE.match(line):
+            descriptions[m["name"]] = m["desc"]
+        elif m := _AG_QUESTION_LINE.match(line):
+            question = m["q"]
+        elif line.strip().startswith("- ") and "name:" in line:
+            raise ValueError(f"unreadable label line in {AG_NEWS_FILE.name}: {line!r}")
+    if question is None or not descriptions:
+        raise ValueError(f"{AG_NEWS_FILE.name}: no question or labels found")
+    return descriptions, question
 
 
 def _load(dataset: str) -> tuple[dict[str, str], str]:

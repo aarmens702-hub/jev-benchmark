@@ -5,6 +5,7 @@ Tests marked `data` fetch the two named TRAIN parquet files from Hugging Face (o
 use small synthetic frames and the committed label files, so they run offline.
 """
 import hashlib
+import re
 import unicodedata
 from pathlib import Path
 
@@ -154,12 +155,37 @@ def test_label_files_offline_shape():
         label_texts("imdb", bare=True)
 
 
+def test_ag_news_descriptions_are_the_full_written_text_with_no_stray_keys():
+    # The file is a YAML flow mapping, which would cut each description at its first comma.
+    assert label_texts("ag_news", bare=False) == {
+        "World": "world news, international affairs, politics and conflicts",
+        "Sports": "sports, games, athletes and competitions",
+        "Business": "business, companies, markets and the economy",
+        "Sci/Tech": "science and technology, computers, internet and research",
+    }
+    assert question("ag_news") == "What is this news article mainly about?"
+    assert list(label_texts("ag_news", bare=True).items()) == [(k, k) for k in ["World", "Sports", "Business", "Sci/Tech"]]
+
+
+def test_banking77_descriptions_have_no_truncation_or_stray_keys():
+    import json
+
+    blob = json.loads((REPO / "third_party" / "banking77" / "banking77_intents.v1.json").read_text(encoding="utf-8"))
+    got = label_texts("banking77", bare=False)
+    assert got == blob["descriptions"] and len(got) == 77  # returned exactly as written in the file
+    assert all(isinstance(v, str) and v.strip() and v.strip() == v for v in got.values())
+    assert all(re.fullmatch(r"[a-z0-9_?]+", k, re.I) for k in got)  # names only, no stray keys
+    assert all(v[-1].isalnum() or v[-1] in ".?)" for v in got.values())  # no text cut off mid-string by a parser
+    assert got["activate_my_card"] == "The customer wants to activate a new card or asks how to activate it"
+
+
 def test_third_party_notice_credits_both_repos():
     notice = (REPO / "third_party" / "NOTICE.md").read_text()
     for needle in [
         "Madheshvivekanandan/jev-vs-cosine", "911e91b1093622c605c10067b960c0aff660fc1d", "banking77_intents.v1.json",
         "zhuyansen/jev-zeroshot-vs-bert", "edbf0713583644bd3f47299fd6b104a8b2073219", "agnews.yaml", "MIT License",
         "Madhesh Vivekanandan", "Jason Zhu",
+        "Read as the literal text in the file, because a YAML flow mapping would cut each description at its first comma.",
     ]:
         assert needle in notice, needle
 

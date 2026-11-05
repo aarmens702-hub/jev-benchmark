@@ -15,6 +15,7 @@ is included: no clone, no `.cache/`, no result files. Both repositories are MIT 
 - Source: https://github.com/zhuyansen/jev-zeroshot-vs-bert, file `labels/agnews.yaml`
 - Commit: edbf0713583644bd3f47299fd6b104a8b2073219
 - Use: AG News label descriptions and question
+- Read as the literal text in the file, because a YAML flow mapping would cut each description at its first comma.
 - License: MIT License, Copyright (c) 2026 Jason Zhu (zhuyansen)
 
 ## MIT License text

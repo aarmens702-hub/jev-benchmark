@@ -15,7 +15,7 @@ import numpy as np
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import LeaveOneOut, StratifiedKFold
+from sklearn.model_selection import StratifiedKFold
 
 from guards import check_disk, free_disk_gb
 from labels import label_texts
@@ -39,7 +39,8 @@ LR_MAX_ITER = 5000
 LR_SEED = 0
 CV_SEED = 0
 CV_GRID = (1, 10, 100, 1000)
-NLI_BATCH_SIZE = 16  # pairs per forward pass; fixed for the whole run
+CV_MAX_FOLDS = 5
+NLI_BATCH_SIZE = 16  # pairs per forward pass; the frozen batch size, fixed for the whole run (accepted 2026-11-04)
 NLI_MAX_LEN = 256
 BARE_TEMPLATE = "This text is about {}."
 
@@ -235,55 +236,50 @@ def lr(train, test, c: float = LR_C, classes: Optional[Sequence[str]] = None, ma
 
 
 class CVPlan(NamedTuple):
-    scheme: str  # "none", "loo" or "5fold"
+    folds: int  # 0 means no selection (C fixed)
     grid: tuple
 
 
 def cv_plan(s) -> CVPlan:
-    """C selection per bank size: C=100 at s=1; leave-one-out for s of 2-16; 5-fold for 35 and all."""
+    """C selection per bank size: C=100 with no CV at s=1; otherwise stratified k-fold inside the bank
+    with k = min(s, 5), over C in {1, 10, 100, 1000}. (Leave-one-out was dropped as too slow.)"""
     if isinstance(s, np.integer):
         s = int(s)
-    if s == 1:
-        return CVPlan("none", (LR_C,))
-    if s in (2, 3, 5, 8, 16):
-        return CVPlan("loo", CV_GRID)
-    if s in (35, "all"):
-        return CVPlan("5fold", CV_GRID)
-    raise ValueError(f"s={s!r} is not on the grid 1, 2, 3, 5, 8, 16, 35, all")
+    if s == "all":
+        return CVPlan(CV_MAX_FOLDS, CV_GRID)
+    if isinstance(s, int) and not isinstance(s, bool) and s >= 1:
+        return CVPlan(0, (LR_C,)) if s == 1 else CVPlan(min(s, CV_MAX_FOLDS), CV_GRID)
+    raise ValueError(f"s={s!r} must be a positive integer or 'all'")
 
 
-def cv_accuracies(X, y, scheme: str, grid: Iterable[float]) -> dict[float, float]:
-    """Cross-validated accuracy inside the bank for each C. Uses the bank's own labels only."""
+def cv_accuracies(X, y, folds: int, grid: Iterable[float]) -> dict[float, float]:
+    """Stratified k-fold accuracy inside the bank for each C. Uses the bank's own labels only."""
     y, grid = np.asarray(y), tuple(grid)
-    if scheme == "loo":
-        splitter = LeaveOneOut()
-    elif scheme == "5fold":
-        splitter = StratifiedKFold(n_splits=5, shuffle=True, random_state=CV_SEED)
-    else:
-        raise ValueError(f"unknown CV scheme {scheme!r}")
-    folds = list(splitter.split(X, y))
+    if folds < 2:
+        raise ValueError(f"need at least 2 folds, got {folds}")
+    splits = list(StratifiedKFold(n_splits=folds, shuffle=True, random_state=CV_SEED).split(X, y))
     out, bad = {}, 0
     for c in grid:
         correct = 0
-        for tr, te in folds:
+        for tr, te in splits:
             model, ok = fit_lr(X[tr], y[tr], c, log_non_convergence=False)
             bad += not ok
             correct += int((model.predict(X[te]) == y[te]).sum())
         out[c] = correct / len(y)
     if bad:
-        log.warning("%d of %d CV fits did not converge within max_iter=%d", bad, len(folds) * len(grid), LR_MAX_ITER)
+        log.warning("%d of %d CV fits did not converge within max_iter=%d", bad, len(splits) * len(grid), LR_MAX_ITER)
     return out
 
 
 def choose_c(acc: dict[float, float]) -> float:
-    """Best CV accuracy; ties go to C=100 (the primary arm's value), then to the smaller C."""
+    """Best CV accuracy. Ties go to C=100 (the primary arm's value), then to the smaller C."""
     return max(acc, key=lambda c: (acc[c], c == LR_C, -c))
 
 
 def lr_cv(train, test, s, classes: Optional[Sequence[str]] = None) -> np.ndarray:
     X, y = train
     plan = cv_plan(s)
-    c = plan.grid[0] if plan.scheme == "none" else choose_c(cv_accuracies(X, y, plan.scheme, plan.grid))
+    c = plan.grid[0] if plan.folds == 0 else choose_c(cv_accuracies(X, y, plan.folds, plan.grid))
     return lr(train, test, c=c, classes=classes)
 
 

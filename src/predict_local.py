@@ -1,8 +1,10 @@
 """Run the free arms on the Mac and write prediction files.
 
-    PYTHONPATH=src uv run python -m predict_local --stage val --floor
-    PYTHONPATH=src uv run python -m predict_local --stage val --time-nli
-    PYTHONPATH=src uv run python -m predict_local --stage val --arm nli --dataset ag_news --max-hours 8
+    scripts/predict_local.sh --stage val --floor
+    scripts/predict_local.sh --stage val --time-nli
+    scripts/predict_local.sh --stage val --arm nli --dataset ag_news --max-hours 8
+
+(The script sets PYTHONPATH=src and runs `uv run python -m predict_local`.)
 
 Predictors see only the text of the rows they predict. Labels come from banks and nowhere else, and
 prediction rows are reduced to (row_id, text) before any arm runs. Only the validation stage is wired
