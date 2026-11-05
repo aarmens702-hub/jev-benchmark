@@ -17,7 +17,7 @@ At equal coverage, how many labels per class does a light classifier need to bea
 
 **Primary contrast.** D_s = mean over draws r=0..9 of acc@80(embedding LR, draw r, s) minus acc@80(zero-label Jev), in points. Grid: 1, 2, 3, 5, 8, 16, 35, all. A draw is one seeded nested ordering of the training pool. At s=all, all draws are identical.
 
-**Bootstrap.** B=10,000, seed 2026. In each replicate: (1) resample test rows with replacement within gold class, same rows for all arms; (2) resample the 10 draw indices with replacement, same indices at every s; (3) re-sort and recompute every arm's acc@80; (4) compute D_s. [L_s, U_s] = 2.5 and 97.5 percentiles.
+**Bootstrap.** B=10,000, seed 2026. In each replicate: (1) resample test rows with replacement within gold class, same rows for all arms; (2) resample the 10 draw indices with replacement, same indices at every s; (3) re-sort and recompute every arm's acc@80; (4) compute D_s. [L_s, U_s] = 2.5 and 97.5 percentiles. Percentiles use numpy's default linear interpolation. Gaps are rounded to 10 decimals of a point before any comparison, so an exact boundary is decided by the rule and not by float noise.
 
 **LR-ahead sequence.** Test s = all, 35, 16, 8, 5, 3, 2, 1 in that order. s passes if L_s > 0 and D_s >= 2. Stop at the first failure. s* = last s that passed, or "none" if s=all fails.
 
@@ -25,12 +25,12 @@ At equal coverage, how many labels per class does a light classifier need to bea
 
 Both sequences use the same 2-point margin, so neither side has an easier path to a claim. Each is a fixed-sequence procedure with family-wise one-sided error at most 2.5%. A dip breaks the run, so a non-monotone result cannot produce a low crossover. Report any s below s* that passed in isolation, labelled as not a claim. For each s, also report the range across draws and how many of the 10 beat Jev.
 
-**Secondary.** Risk-coverage curve. s* and s_J at 50, 70, 90 and 100% coverage; if the verdict row changes at 70 or 90, the headline says so. Realised coverage when each arm's threshold is the 80% quantile of its unlabelled validation scores. ECE with noise floor, NLL (clip all probabilities to [0.005, 1], since Jev rounds to 2 decimals and returns 0.0), Brier, cost and latency (no headline speed ratio). Chart labels "all" with real counts (129.9 per class on average on Banking77, imbalanced; 30,000 on AG News) and has a total-labels axis.
+**Secondary.** Risk-coverage curve. s* and s_J at 50, 70, 90 and 100% coverage; if the verdict row changes at 70 or 90, the headline says so. Realised coverage when each arm's threshold is the 80% quantile of its unlabelled validation scores. ECE with noise floor (15 equal-width bins closed on the right, with 0 in the first bin; the floor is the mean ECE over 1,000 outcome sets drawn as Bernoulli(confidence), seed 2026; a failed row counts as gold probability 0 in NLL and as all-zero probabilities in Brier, and is left out of ECE, with the number left out reported), NLL (clip all probabilities to [0.005, 1], since Jev rounds to 2 decimals and returns 0.0), Brier, cost and latency (no headline speed ratio). Chart labels "all" with real counts (129.9 per class on average on Banking77, imbalanced; 119,852 total on AG News, about 29,960 per class) and has a total-labels axis.
 
 ## Data
 - **Primary, sets the verdict:** Banking77 official test, 3,080 rows. `PolyAI/banking77` at `1846984189f2bc0ac51c6fc3a600fa9e1714e0c6`.
 - **Secondary check, not a replication:** AG News, `fancyzhx/ag_news` at `eb185aade064a813bc0b7f42de02595523103ca4`, official test 7,600 rows. It tests whether the pattern appears on an easy 4-way topic task and cannot confirm or overturn the Banking77 verdict. Same grid, same C=100 (not validated for AG News; disclose). No Jev + examples. No claim on out-of-scope messages.
-- Label text: Banking77 `prompts/banking77_intents.v1.json` from `Madheshvivekanandan/jev-vs-cosine` at `911e91b1093622c605c10067b960c0aff660fc1d`. AG News `labels/agnews.yaml` and its question from `zhuyansen/jev-zeroshot-vs-bert` at `edbf0713583644bd3f47299fd6b104a8b2073219`. Bare names: official Banking77 names; World, Sports, Business, Sci/Tech.
+- Label text: Banking77 `prompts/banking77_intents.v1.json` from `Madheshvivekanandan/jev-vs-cosine` at `911e91b1093622c605c10067b960c0aff660fc1d`. AG News `labels/agnews.yaml` and its question from `zhuyansen/jev-zeroshot-vs-bert` at `edbf0713583644bd3f47299fd6b104a8b2073219`. AG News descriptions are read as the literal text in the file, because a YAML flow mapping cuts each at its first comma; the upstream repo's loader does truncate them, so the post discloses this. Bare names: official Banking77 names; World, Sports, Business, Sci/Tech.
 - Splits and duplicates: see VALIDATION.md.
 
 ## Arms
@@ -41,20 +41,20 @@ Both sequences use the same 2-point margin, so neither side has an easier path t
 | Zero-shot NLI | `MoritzLaurer/deberta-v3-large-zeroshot-v2.0-c` at `b2730f16019076bb0009481121efbe4705e0e378` | Mac |
 | Embedding similarity | `BAAI/bge-small-en-v1.5` at `5c38ec7c405ec4b44b94cc5a9bb96e735b38267a` | Mac |
 | Embedding LR (primary) | Those embeddings, C=100, draws 0-9 | Mac |
-| Embedding LR-CV (secondary) | C from {1,10,100,1000}: leave-one-out inside the bank for s of 2-16, 5-fold for s of 35 and all, C=100 at s=1. No outside labels | Mac |
+| Embedding LR-CV (secondary) | C from {1,10,100,1000}: stratified k-fold inside the bank with k = min(s, 5), C=100 at s=1, ties toward 100 and then the smaller C. No outside labels | Mac |
 | TF-IDF + LR | Word 1-2 grams, lowercase, no stop list, min_df=1, C=100, max_iter=5000 | Mac |
 | Small LLM | `openai/gpt-oss-20b` or `z-ai/glm-5.3-flash`; integer option ids, enum schema, logprobs, `require_parameters: true`, no `:batch` | API |
 
 **Scores.**
 - Jev: returned probability of its choice.
-- NLI: HF zero-shot pipeline, multi_label=False, softmax across entailment logits, max_len 256. With descriptions, the hypothesis is the description sentence as written. With bare names, "This text is about {name}."
+- NLI: HF zero-shot semantics, multi_label=False, softmax across entailment logits, max_len 256, batch size 16. With descriptions, the hypothesis is the description sentence as written. With bare names, "This text is about {name}."
 - Embedding similarity: softmax of cosine similarity at temperature 0.05, fixed with no labels here. The value was used with bge-m3 in prior work, not bge-small, so also report acc@80 at temperatures 0.01 and 0.2 and ranked by raw top cosine. These are sensitivity rows and don't change any rule.
 - LR: predict_proba.
 - Small LLM: top probability = exp(sum of token logprobs along the chosen id). If a token has no logprob, or the provider cannot return logprobs under the schema, the arm is "not run". Its NLL and Brier are not reported.
 
 **Fixed settings.** Jev and small LLM option order randomized per row, seed 1105. Jev + examples: BM25Okapi k1=1.5, b=0.75 on words and adjacent word pairs; retrieve in score order, skip classes already at 4, ignore zero scores, up to 24, ties by hash; log the count per row. Require Jev's response `model` to match the 1.14 build seen in Stage 0 (`jev-1.14-20261014` at endpoint level); a change pauses the run.
 
-**Failures.** A row with no valid answer after retries is wrong and is kept in the covered set, ranked above all other rows. Report failures per arm. More than 1% (31 on Banking77, 76 on AG News) flags that arm in every table.
+**Failures.** A row with no valid answer after retries is wrong and is kept in the covered set, ranked above all other rows. Report failures per arm. 31 or more failures on Banking77, or 76 or more on AG News (about 1%), flags that arm in every table.
 
 **Small LLM selection uses no labels.** Candidates are model-and-provider pairs that list logprobs and structured outputs, tried cheapest first: gpt-oss-20b on Darkbloom ($0.018/$0.09 per M on 2026-11-04), then glm-5.3-flash on Wafer ($0.044/$0.20). Call each with one named provider and `allow_fallbacks: false`, so a run can't mix providers or precision levels. On 50 validation rows, a candidate passes if it returns valid schema output with usable logprobs for 49 or more. Pick the first that passes and freeze the model, provider and any tag. If none passes, the arm is not run, and the post says his "constrained output models" claim went untested. Accuracy is not computed.
 
@@ -76,10 +76,12 @@ Verdict, exactly one row applies:
 | 35, all, none | 3 or more | Jev leads when labels are scarce, through s_J labels per class. |
 | 35, all, none | none, 1, 2 | No clear winner when labels are scarce. If [L_s, U_s] is inside [-2, +2] at every s, say "equivalent within 2 points". |
 
+"Inside [-2, +2]" includes the endpoints.
+
 Additions, which never change the verdict:
-- **His claim.** For each of NLI, embeddings and small LLM, C = arm minus Jev, 98.33% CI (Bonferroni across 3). The arm "matches Jev" if the lower limit is above -2. Arms not run are reported as not run.
+- **His claim.** For each of NLI, embedding similarity (label descriptions, temperature 0.05) and small LLM, C = arm minus Jev (label descriptions), 98.33% CI (Bonferroni across 3, tails of 0.835% each). The arm "matches Jev" if the lower limit is above -2. Arms not run are reported as not run.
 - **Jev + examples.** E = Jev + examples minus LR, both on bank draw 0, s=8. Same-rows bootstrap, 95% CI. If the lower limit is above -2: "Given the same 8 labels per class, Jev using them is at least as good as LR using them (one draw of labels)". Show LR's range over all 10 draws.
-- **AG News.** Report s* and s_J by the same rules, as a check on an easy 4-way topic task. If its bin differs: "The Banking77 result does not carry to this task." If Jev's AG News acc@80 is 96 or higher: "ceiling-limited: a 2-point lead is hard or impossible." If not run: "not run".
+- **AG News.** Report s* and s_J by the same rules, as a check on an easy 4-way topic task. If its verdict table row differs from Banking77's: "The Banking77 result does not carry to this task." If Jev's AG News acc@80 is 96 or higher: "ceiling-limited: a 2-point lead is hard or impossible." If not run: "not run".
 - **Routing.** Claims below.
 - **Prediction on record.** True if and only if s* is 8 or lower on Banking77.
 - **Corrections to Aarmen's comment.** The "fixed labels" sentence is already conceded: he named zero-shot and embedding methods, which aren't fixed-label. The reply says so whatever the data shows. Also state a correction if any arm "matches Jev" or the routing test shows "Not unique to Jev". "Most agent stacks" has no evidence here and is withdrawn or sourced.
@@ -119,7 +121,7 @@ MIT, copy named files at pinned SHAs with notice and credit, never clone into th
 - Madheshvivekanandan/jev-vs-cosine at `911e91b`: label descriptions, LR, embedder, Jev client. Its committed `.cache/jev_decisions.jsonl` must not be copied or published.
 - zhuyansen/jev-zeroshot-vs-bert at `edbf071`: NLI and embedding arms, curves, metrics, AG News labels.
 - ickma2311/jev-baselines-eval at `3b828cb68992c00835b3f126a3d13534da875277`: latency scripts.
-- tapesymbolstate/jev-calibration-audit at `daab9e2c2d5d5683bf07f3482deb653c26856219` (`jujumilk3` redirects here): calibration metrics, if they hold up.
+- tapesymbolstate/jev-calibration-audit at `daab9e2c2d5d5683bf07f3482deb653c26856219` (`jujumilk3` redirects here): calibration metrics reviewed as prior work; none copied, ECE, NLL and Brier are in `src/metrics.py`.
 
 No license, method and citation only, and do not clone: simonmesmith/jev-banking77-experiment (it holds test labels and predictions), 4esv/jev-eval, mAliAytekin/banking77.
 
