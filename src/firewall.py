@@ -79,25 +79,24 @@ def _check_conditions(token, repo_dir: Path, manifest_path: Path, freeze_tag: st
 
 
 def _hub_download(repo_id: str, filename: str, revision: str) -> str:
+    """Fetch one named pinned test file. Refuses anything else; reached only through `_load_test`."""
+    if PINNED_TEST_FILES.get(repo_id, {}).get("filename") != filename or PINNED_TEST_FILES[repo_id]["revision"] != revision:
+        raise FirewallError(f"refusing to fetch {repo_id}/{filename}@{revision}: not a pinned test file")
     import huggingface_hub
 
     return huggingface_hub.hf_hub_download(repo_id=repo_id, filename=filename, repo_type="dataset", revision=revision)
 
 
-def load_test(
+def _load_test(
     dataset: str,
     token: str,
     *,
-    repo_dir: Path = REPO_ROOT,
+    repo_dir: Path,
     manifest_path: Path | None = None,
     freeze_tag: str = FREEZE_TAG,
     downloader=None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Return (row_id, text) and (row_id, label) for the official test split, as separate frames.
-
-    row_id is the row's position in the official file. `downloader(repo_id, filename, revision)`
-    returns a local parquet path; it defaults to hf_hub_download and exists so tests can inject a fake.
-    """
+    """Parameterised core of `load_test`. Private: tests call it with a temp repo and a fake downloader."""
     repo_id = _ALIASES.get(dataset, dataset)
     spec = PINNED_TEST_FILES.get(repo_id)
     if spec is None:
@@ -112,3 +111,12 @@ def load_test(
     texts = pd.DataFrame({"row_id": row_id, "text": frame["text"].to_numpy()})
     gold = pd.DataFrame({"row_id": row_id, "label": frame["label"].to_numpy()})
     return texts, gold
+
+
+def load_test(dataset: str, token: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return (row_id, text) and (row_id, label) for the official test split, as separate frames.
+
+    Always checks this repo, its manifest.json and the freeze tag; none of that can be redirected.
+    row_id is the row's position in the official file.
+    """
+    return _load_test(dataset, token, repo_dir=REPO_ROOT, manifest_path=REPO_ROOT / "manifest.json", freeze_tag=FREEZE_TAG)

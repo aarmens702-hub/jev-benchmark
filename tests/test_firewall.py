@@ -4,6 +4,7 @@ This file is allowed to contain the forbidden strings because it defines them.
 """
 import ast
 import hashlib
+import inspect
 import json
 import re
 import subprocess
@@ -14,7 +15,7 @@ import pytest
 from huggingface_hub import constants as hf_constants
 
 import firewall
-from firewall import FirewallError, freeze_token, load_test
+from firewall import FirewallError, _hub_download, _load_test, freeze_token, load_test
 
 REPO = Path(__file__).resolve().parents[1]
 PINNED = ("PolyAI/banking77", "fancyzhx/ag_news")
@@ -296,11 +297,38 @@ def test_load_test_on_real_repo_refuses_before_freeze():
         load_test(PINNED[0], "0" * 64)
 
 
+def test_public_load_test_signature_is_dataset_and_token_only():
+    assert list(inspect.signature(load_test).parameters) == ["dataset", "token"]
+    for kwargs in ({"repo_dir": "x"}, {"manifest_path": "x"}, {"freeze_tag": "x"}, {"downloader": print}):
+        with pytest.raises(TypeError):
+            load_test(PINNED[0], "0" * 64, **kwargs)
+
+
+def test_load_test_ignores_a_throwaway_frozen_repo(tmp_path):
+    # The bypass from review: a temp repo with its own manifest and tag cannot satisfy the public function.
+    repo = make_repo(tmp_path)
+    with pytest.raises(FirewallError):
+        load_test(PINNED[0], token_for(repo))
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("PolyAI/banking77", "data/train-00000-of-00001.parquet", "1846984189f2bc0ac51c6fc3a600fa9e1714e0c6"),
+        ("PolyAI/banking77", "data/test-00000-of-00001.parquet", "main"),
+        ("someone/else", "data/test-00000-of-00001.parquet", "1846984189f2bc0ac51c6fc3a600fa9e1714e0c6"),
+    ],
+)
+def test_hub_download_refuses_anything_but_pinned_test_files(args):
+    with pytest.raises(FirewallError, match="not a pinned test file"):
+        _hub_download(*args)
+
+
 def test_load_test_rejects_wrong_token(tmp_path):
     repo = make_repo(tmp_path)
     dl = FakeDownloader(tmp_path)
     with pytest.raises(FirewallError, match="token"):
-        load_test(PINNED[0], "0" * 64, repo_dir=repo, downloader=dl)
+        _load_test(PINNED[0], "0" * 64, repo_dir=repo, downloader=dl)
     assert dl.calls == []
 
 
@@ -309,7 +337,7 @@ def test_load_test_rejects_manifest_without_osf_id(tmp_path):
         repo = make_repo(tmp_path / str(i), manifest=manifest)
         dl = FakeDownloader(tmp_path)
         with pytest.raises(FirewallError, match="OSF"):
-            load_test(PINNED[0], token_for(repo), repo_dir=repo, downloader=dl)
+            _load_test(PINNED[0], token_for(repo), repo_dir=repo, downloader=dl)
         assert dl.calls == []
 
 
@@ -318,7 +346,7 @@ def test_load_test_rejects_dirty_tree(tmp_path):
     (repo / "scratch.txt").write_text("untracked change")
     dl = FakeDownloader(tmp_path)
     with pytest.raises(FirewallError, match="dirty|clean"):
-        load_test(PINNED[0], token_for(repo), repo_dir=repo, downloader=dl)
+        _load_test(PINNED[0], token_for(repo), repo_dir=repo, downloader=dl)
     assert dl.calls == []
 
 
@@ -329,7 +357,7 @@ def test_load_test_rejects_head_not_at_freeze_tag(tmp_path):
     git(repo, "commit", "-q", "-m", "after freeze")
     dl = FakeDownloader(tmp_path)
     with pytest.raises(FirewallError, match="tag"):
-        load_test(PINNED[0], token_for(repo), repo_dir=repo, downloader=dl)
+        _load_test(PINNED[0], token_for(repo), repo_dir=repo, downloader=dl)
     assert dl.calls == []
 
 
@@ -337,7 +365,7 @@ def test_load_test_rejects_missing_freeze_tag(tmp_path):
     repo = make_repo(tmp_path, tag=False)
     dl = FakeDownloader(tmp_path)
     with pytest.raises(FirewallError, match="tag"):
-        load_test(PINNED[0], token_for(repo), repo_dir=repo, downloader=dl)
+        _load_test(PINNED[0], token_for(repo), repo_dir=repo, downloader=dl)
     assert dl.calls == []
 
 
@@ -345,7 +373,7 @@ def test_load_test_rejects_unknown_dataset(tmp_path):
     repo = make_repo(tmp_path)
     dl = FakeDownloader(tmp_path)
     with pytest.raises(FirewallError, match="dataset"):
-        load_test("someone/else", token_for(repo), repo_dir=repo, downloader=dl)
+        _load_test("someone/else", token_for(repo), repo_dir=repo, downloader=dl)
     assert dl.calls == []
 
 
@@ -353,14 +381,14 @@ def test_load_test_default_downloader_cannot_run_in_tests(tmp_path):
     # All four conditions hold, no downloader injected: the conftest guard stops the real fetch.
     repo = make_repo(tmp_path)
     with pytest.raises(RuntimeError, match="blocked"):
-        load_test(PINNED[0], token_for(repo), repo_dir=repo)
+        _load_test(PINNED[0], token_for(repo), repo_dir=repo)
 
 
 @pytest.mark.parametrize("dataset", PINNED)
 def test_load_test_success_splits_text_from_gold(tmp_path, dataset):
     repo = make_repo(tmp_path)
     dl = FakeDownloader(tmp_path)
-    texts, gold = load_test(dataset, token_for(repo), repo_dir=repo, downloader=dl)
+    texts, gold = _load_test(dataset, token_for(repo), repo_dir=repo, downloader=dl)
     assert list(texts.columns) == ["row_id", "text"]
     assert list(gold.columns) == ["row_id", "label"]
     assert texts["row_id"].tolist() == gold["row_id"].tolist() == [0, 1, 2]
@@ -373,7 +401,7 @@ def test_load_test_success_splits_text_from_gold(tmp_path, dataset):
 def test_load_test_accepts_short_dataset_names(tmp_path, short, full):
     repo = make_repo(tmp_path)
     dl = FakeDownloader(tmp_path)
-    load_test(short, token_for(repo), repo_dir=repo, downloader=dl)
+    _load_test(short, token_for(repo), repo_dir=repo, downloader=dl)
     assert dl.calls[0][0] == full
 
 
