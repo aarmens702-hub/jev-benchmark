@@ -15,16 +15,22 @@ from openrouter import (
     ArmNotRun,
     Client,
     Decision,
+    HiddenReasoning,
     MalformedResponse,
+    ModelChanged,
     _is_number,
     check_provider,
     int_field,
     normalize_options,
     option_order,
     pinned_provider,
+    safe_name,
 )
 
 MAX_TOKENS = 16
+# Frozen setting, to confirm in Stage 0: what may follow the requested name in a reply's model. The
+# docs don't state it, so only a dated build is allowed. Requested tags may be echoed or dropped.
+MODEL_SUFFIX = r"(?:-\d{8})?"
 # Placeholder until the frozen prompt text is passed in; the prompt is part of the freeze.
 DEFAULT_INSTRUCTIONS = "Which option best fits the text? Answer with the id of one option."
 _ID_SPAN = re.compile(r'\s*\{\s*"id"\s*:\s*(\d+)\s*\}\s*')
@@ -90,17 +96,33 @@ def top_prob_from_logprobs(content: str, logprobs, row_id) -> float:
     return min(1.0, math.exp(total))
 
 
-def parse_answer(data: dict, id_to_label: dict, provider: str, client: Client, row_id) -> Answer:
-    usage = data["usage"]
-    tokens = int_field(usage, "completion_tokens")
+def _reasoning_tokens(usage: dict, client: Client) -> int:
+    """The schema allows null or absent here. Anything else that isn't an integer can't be trusted, so it stops."""
     details = usage.get("completion_tokens_details")
     reasoning = details.get("reasoning_tokens") if isinstance(details, dict) else None
-    # Before anything can reject the reply: billed tokens count even when the answer is unusable.
-    client.track_output(tokens, reasoning if isinstance(reasoning, int) else 0)
+    if details is not None and not isinstance(details, dict) or (
+        reasoning is not None and (not isinstance(reasoning, int) or isinstance(reasoning, bool))
+    ):
+        client.latch(HiddenReasoning("usage reports reasoning tokens as something other than an integer"))
+        return 0
+    return reasoning or 0
 
-    model = data.get("model")
-    if not isinstance(model, str):
-        raise MalformedResponse("no model")
+
+def reply_matches_request(reply: str, requested: str) -> bool:
+    base, has_tag, tag = requested.partition(":")
+    optional_tag = f"(?::{re.escape(tag)})?" if has_tag else ""
+    return re.fullmatch(re.escape(base) + MODEL_SUFFIX + optional_tag, reply) is not None
+
+
+def parse_answer(data: dict, id_to_label: dict, requested: str, provider: str, client: Client, row_id) -> Answer:
+    usage = data["usage"]
+    tokens = int_field(usage, "completion_tokens")
+    # Before anything can reject the reply: billed tokens count even when the answer is unusable.
+    client.track_output(tokens, _reasoning_tokens(usage, client))
+
+    model = safe_name(data.get("model"), "model")
+    if not reply_matches_request(model, requested):
+        raise ModelChanged(f"requested {requested}, reply came from {model}; paused")
     client.pin_model(model)
     check_provider(data, provider)
 
@@ -149,4 +171,4 @@ def llm_pick(
     ordered = option_order(row_id, options, order_seed)
     id_to_label = dict(enumerate(ordered, start=1))
     body = build_request(text, ordered, options, model, provider, instructions)
-    return client.call(row_id, CHAT_URL, body, lambda data: parse_answer(data, id_to_label, provider, client, row_id))
+    return client.call(row_id, CHAT_URL, body, lambda data: parse_answer(data, id_to_label, model, provider, client, row_id))

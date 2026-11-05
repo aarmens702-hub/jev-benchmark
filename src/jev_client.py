@@ -26,10 +26,14 @@ from openrouter import (
     option_order,
     pinned_provider,
     require_private_path,
+    safe_name,
 )
 
 JEV_MODEL = "typesafe/jev-1.14"
 JEV_PROVIDER = "TypeSafe"
+JEV_MAKER_PREFIX = "typesafe/"
+# Jev rounds to 2 decimals, and TypeSafe calls the choice the top option, so it may trail by rounding only.
+ROUNDING_TOLERANCE = 0.011
 # DESIGN.md: the 1.14 build seen in Stage 0. Replies carry it with a maker prefix, which is dropped to compare.
 EXPECTED_JEV_BUILD = "jev-1.14-20261014"
 QUESTION = "label"
@@ -96,13 +100,12 @@ def cache_key(build: str, body: dict) -> str:
     return hashlib.sha256(json.dumps(material, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
-def parse_answer(data: dict, options: dict, expected_build: str) -> Answer:
+def parse_answer(data: dict, options: dict, expected_build: str, client: Client) -> Answer:
     """Strict on every field the score depends on. Each MalformedResponse names what was wrong."""
-    model = data.get("model")
-    if not isinstance(model, str):
-        raise MalformedResponse("no model")
-    if build_id(model) != expected_build:
-        raise ModelChanged(f"expected Jev build {expected_build}, reply came from {model[:80]}; paused")
+    model = safe_name(data.get("model"), "model")
+    if not model.startswith(JEV_MAKER_PREFIX) or build_id(model) != expected_build:
+        raise ModelChanged(f"expected Jev build {JEV_MAKER_PREFIX}{expected_build}, reply came from {model}; paused")
+    client.pin_model(model)
     check_provider(data, JEV_PROVIDER)
 
     answers = data.get("answers")
@@ -124,7 +127,7 @@ def parse_answer(data: dict, options: dict, expected_build: str) -> Answer:
         raise MalformedResponse("probabilities do not cover exactly the options")
     if not all(_is_number(p) and 0 <= p <= 1 for p in probabilities.values()):
         raise MalformedResponse("a probability is not a number from 0 to 1")
-    if probabilities[choice] < max(probabilities.values()):
+    if probabilities[choice] < max(probabilities.values()) - ROUNDING_TOLERANCE:
         raise MalformedResponse("choice is not the top option")
 
     usage = data["usage"]
@@ -156,9 +159,10 @@ def jev_decide(
 
     key = cache_key(expected_build, body) if cache is not None else None
     if key is not None and (hit := cache.get(key)) is not None:
+        client.pin_model(hit["model"])
         return Decision(cost=0.0, failed=False, attempts=0, cached=True, n_examples=n_examples, **hit)
 
-    decision = client.call(row_id, DECISIONS_URL, body, lambda data: parse_answer(data, options, expected_build))
+    decision = client.call(row_id, DECISIONS_URL, body, lambda data: parse_answer(data, options, expected_build, client))
     decision = replace(decision, n_examples=n_examples)
     if key is not None and not decision.failed:
         cache.put(

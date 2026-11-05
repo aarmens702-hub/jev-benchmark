@@ -9,6 +9,9 @@ import subprocess
 import sys
 
 SERVICE = "jev-benchmark-openrouter"
+# The full path, so a `security` earlier on PATH cannot be handed the job of reading the key.
+SECURITY_PATH = "/usr/bin/security"
+SECURITY_TIMEOUT_SECONDS = 60
 
 
 class KeyUnavailable(RuntimeError):
@@ -16,7 +19,7 @@ class KeyUnavailable(RuntimeError):
 
 
 def keychain_command(user: str) -> list[str]:
-    return ["security", "find-generic-password", "-a", user, "-s", SERVICE, "-w"]
+    return [SECURITY_PATH, "find-generic-password", "-a", user, "-s", SERVICE, "-w"]
 
 
 def _under_pytest() -> bool:
@@ -25,10 +28,16 @@ def _under_pytest() -> bool:
 
 def _read_with_runner(runner, user: str) -> str:
     """Run the command through `runner`. Tests pass a fake here; only read_key passes subprocess.run."""
+    failure = None
     try:
-        result = runner(keychain_command(user), capture_output=True, text=True, check=False)
+        result = runner(keychain_command(user), capture_output=True, text=True, check=False, timeout=SECURITY_TIMEOUT_SECONDS)
     except OSError:
-        raise KeyUnavailable("could not run the macOS `security` tool") from None
+        failure = KeyUnavailable("could not run the macOS `security` tool")
+    except subprocess.TimeoutExpired:
+        failure = KeyUnavailable(f"`security` did not finish in {SECURITY_TIMEOUT_SECONDS} seconds")
+    if failure is not None:
+        # Raised out here: a TimeoutExpired can hold the tool's output, so it must not stay attached.
+        raise failure
     if result.returncode != 0:
         raise KeyUnavailable(f"no key in the Keychain under service {SERVICE}; run scripts/set_key.command")
     key = (result.stdout or "").strip()

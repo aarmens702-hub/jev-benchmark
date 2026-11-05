@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -197,9 +198,12 @@ def test_no_paid_flag_means_fake_transport_only(tmp_path):
     # A bad stage is refused before the key is touched.
     with pytest.raises(PaidFlagRequired):
         build_client("stage9", ledger_path=ledger_path)
+    # The paid route takes no ledger path at all (ruling R1).
+    with pytest.raises(ValueError, match="ledger"):
+        build_client("stage0", ledger_path=ledger_path)
     # The flag alone reaches for the key, and read_key refuses under pytest.
     with pytest.raises(KeyUnavailable):
-        build_client("stage0", ledger_path=ledger_path)
+        build_client("stage0")
 
 
 def test_read_key_raises_under_pytest(monkeypatch):
@@ -218,7 +222,7 @@ def test_read_key_raises_under_pytest(monkeypatch):
 def test_keychain_command_is_exact_and_holds_no_secret():
     assert secrets_mac.SERVICE == "jev-benchmark-openrouter"
     assert keychain_command("aarmen") == [
-        "security", "find-generic-password", "-a", "aarmen", "-s", "jev-benchmark-openrouter", "-w",
+        "/usr/bin/security", "find-generic-password", "-a", "aarmen", "-s", "jev-benchmark-openrouter", "-w",
     ]
 
 
@@ -232,6 +236,14 @@ def test_key_reader_with_fake_runner_parses_and_never_echoes():
     assert secrets_mac._read_with_runner(good, "aarmen") == FAKE_KEY
     assert seen[0][0] == keychain_command("aarmen")
     assert seen[0][1].get("capture_output") is True and not seen[0][1].get("shell")
+    assert seen[0][1].get("timeout") == secrets_mac.SECURITY_TIMEOUT_SECONDS > 0
+
+    def hung(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"], output=FAKE_KEY)
+
+    with pytest.raises(KeyUnavailable) as err:
+        secrets_mac._read_with_runner(hung, "aarmen")
+    assert FAKE_KEY not in "".join(traceback.format_exception(err.value))
 
     def missing(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 44, stdout="", stderr=f"leaky stderr {FAKE_KEY}")
@@ -266,7 +278,7 @@ def test_key_never_appears_in_repr_logs_exceptions_or_ledger(tmp_path, caplog):
     client = Client(transport, ledger, lambda: 0.0, sleep=lambda s: None)
     path = results_path(tmp_path)
 
-    report = run_arm(rows(3), jev_decider(client), client=client, results_path=path)
+    report = run_arm(rows(3), jev_decider(client), client=client, results_path=path, expected_per_row=0.0001)
 
     assert seen_headers == [f"Bearer {FAKE_KEY}"]  # the key is really used, once, in the header only
     assert report.status == "stopped"
@@ -357,6 +369,20 @@ def test_ledger_caps_cannot_be_raised(tmp_path):
         Ledger(path, cap_usd=7.16)
     with pytest.raises(ValueError):
         Ledger(path, stage="stage0", stage_cap_usd=0.51)
+    # A NaN cap compares false with everything, so it used to allow any spend.
+    for bad in (float("nan"), float("inf"), -1.0):
+        with pytest.raises(ValueError):
+            Ledger(path, cap_usd=bad)
+        with pytest.raises(ValueError):
+            Ledger(path, stage_cap_usd=bad)
+        with pytest.raises(ValueError):
+            Ledger(path, stage="stage0", stage_cap_usd=bad)
+    with pytest.raises(ValueError):
+        Ledger(path, stage_cap_usd=7.16)
+    # A misspelt stage used to get no stage limit at all.
+    for bad in ("stage_0", "Stage0", "stage2", ""):
+        with pytest.raises(ValueError):
+            Ledger(path, stage=bad)
 
 
 def test_ledger_charge_records_then_raises_past_cap(tmp_path):
@@ -676,7 +702,7 @@ def test_reconciliation_runs_every_100_calls_and_passes_when_books_agree(tmp_pat
     holder.update(t=transport, l=ledger)
     report = run_arm(rows(250), jev_decider(client), client=client, results_path=results_path(tmp_path))
     assert report.status == "complete"
-    assert reads == [0, 100, 200]  # baseline, then each 100 calls
+    assert reads == [0, 100, 200, 250]  # baseline, each 100 calls, and the end of the arm
 
 
 def test_reconciliation_counts_only_this_runs_spend(tmp_path):
@@ -1056,6 +1082,7 @@ def test_llm_id_not_in_options_retries_then_marks_failed(tmp_path):
         {"card_arrival": "0.9", "lost_card": 0, "top_up_failed": 0},
         {"card_arrival": True, "lost_card": 0, "top_up_failed": 0},
         {"card_arrival": 0.1, "lost_card": 0.9, "top_up_failed": 0},  # the choice is not the top option
+        {"card_arrival": 0.48, "lost_card": 0.5, "top_up_failed": 0.02},  # 0.02 under the top is more than rounding
     ],
 )
 def test_jev_parser_is_strict_about_probabilities(tmp_path, probabilities):
@@ -1070,6 +1097,17 @@ def test_jev_parser_is_strict_about_probabilities(tmp_path, probabilities):
     client, transport, _, _ = make_client(tmp_path, handler, max_concurrency=1)
     decision = jev_decide("r0", "text", OPTIONS, client=client)
     assert decision.failed is True and decision.reason.startswith("malformed") and len(transport.calls) == 4
+
+
+def test_choice_may_trail_the_top_option_only_by_rounding(tmp_path):
+    def handler(body, n):
+        reply = json.loads(jev_ok(body, choice="card_arrival").body)
+        reply["answers"]["label"]["probabilities"] = {"card_arrival": 0.5, "lost_card": 0.51, "top_up_failed": 0}
+        return ok(reply)
+
+    client, _, _, _ = make_client(tmp_path, handler)
+    decision = jev_decide("r0", "text", OPTIONS, client=client)
+    assert decision.failed is False and decision.pred == "card_arrival" and decision.top_prob == 0.5
 
 
 def test_jev_uses_the_probability_of_its_choice_not_confidence(tmp_path):
@@ -1178,7 +1216,7 @@ def test_resume_does_not_pay_twice(tmp_path):
         if n < 7:
             return jev_ok(body, cost=0.001)
         if n < 11:
-            return status(529)  # row 8 fails for good: finished, scored wrong, never re-bought
+            return jev_ok(body, choice="not_an_option", cost=0.001)  # answered but invalid: final, never re-bought
         return status(402)
 
     first_ledger = Ledger(ledger_path)
@@ -1549,3 +1587,701 @@ def test_retrieval_uses_okapi_1_5_0_75_on_words_and_adjacent_pairs(monkeypatch):
     # An adjacent pair outranks the same words apart, at equal length.
     pair = [Example("lost card here now", "pair"), Example("lost here card now", "apart")] + FILLER
     assert [e.label for e in retrieve("lost card", pair)] == ["pair", "apart"]
+
+
+# ------------------------------------------------------------------ fix round 1: the paid route
+
+
+LONG_KEY = "sk-or-v1-" + "ab" * 32
+
+
+@pytest.fixture
+def paid(tmp_path, monkeypatch):
+    """The real paid route over httpx.MockTransport, with read_key stubbed. Nothing leaves the process."""
+    ledger_path = tmp_path / "home" / ".jev-benchmark" / "ledger.jsonl"
+    monkeypatch.setenv(openrouter.TEST_LEDGER_ENV, str(ledger_path))
+    monkeypatch.setattr(secrets_mac, "read_key", lambda: FAKE_KEY)
+    state = {"usage": 0.0, "posts": [], "gets": 0, "headers": [], "path": ledger_path, "cost": 0.0001}
+
+    def handler(request):
+        state["headers"].append(request.headers.get("authorization"))
+        if request.method == "GET":
+            state["gets"] += 1
+            return httpx.Response(200, json={"data": {"usage": state["usage"]}})
+        body = json.loads(request.content)
+        state["posts"].append(body)
+        state["usage"] += state["cost"]
+        return httpx.Response(200, content=jev_ok(body, cost=state["cost"]).body)
+
+    real_client = httpx.Client
+    monkeypatch.setattr(httpx, "Client", lambda **kw: real_client(**{**kw, "transport": httpx.MockTransport(handler)}))
+    return state
+
+
+def no_sleep(seconds):
+    pass
+
+
+def test_paid_ledger_path_is_fixed_and_outside_any_checkout(tmp_path, monkeypatch):
+    assert openrouter.PAID_LEDGER_PATH == Path.home() / ".jev-benchmark" / "ledger.jsonl"
+    repo = Path(__file__).resolve().parents[1]
+    assert repo not in openrouter.PAID_LEDGER_PATH.parents
+
+    # Under pytest the path must be overridden, so a test can never touch the real ledger.
+    monkeypatch.delenv(openrouter.TEST_LEDGER_ENV, raising=False)
+    with pytest.raises(RuntimeError, match=openrouter.TEST_LEDGER_ENV):
+        openrouter.paid_ledger_path()
+    other = tmp_path / "x.jsonl"
+    monkeypatch.setenv(openrouter.TEST_LEDGER_ENV, str(other))
+    assert openrouter.paid_ledger_path() == other
+
+    # Outside pytest the override is ignored. subprocess is blocked in this file and no key is read here.
+    monkeypatch.setattr(secrets_mac, "_under_pytest", lambda: False)
+    assert openrouter.paid_ledger_path() == openrouter.PAID_LEDGER_PATH
+
+
+def test_fake_run_cannot_write_to_the_real_ledger():
+    with pytest.raises(ValueError, match="real ledger"):
+        build_client(None, ledger_path=openrouter.PAID_LEDGER_PATH, fake_transport=FakeTransport(None), reported_usage=lambda: 0.0)
+
+
+def test_paid_wiring_gives_stage_cap_fixed_ledger_and_usage_reader(paid):
+    client = build_client("stage0", sleep=no_sleep)
+    assert isinstance(client.transport, RealTransport) and client.transport.stage == "stage0"
+    assert client.ledger.path == paid["path"]
+    assert client.ledger.stage == "stage0"
+    assert client.ledger.stage_cap_usd == 0.50
+    assert client.ledger.cap_usd == 7.15
+    assert paid["gets"] == 1  # the usage reader really is key_usage over the real transport
+    paid["usage"] = 0.123
+    assert client.reported_usage() == 0.123
+    paid["usage"] = 0.0
+
+    report = run_arm(rows(3), jev_decider(client), client=client, results_path=paid["path"].parent / "runs" / "private" / "a.jsonl", expected_per_row=0.0001)
+    assert report.status == "complete" and len(paid["posts"]) == 3
+    assert set(paid["headers"]) == {f"Bearer {FAKE_KEY}"}
+    assert client.ledger.spent() == pytest.approx(0.0003)
+
+    # Stage 1 has no stage limit, the same file, and counts stage 0's spend.
+    later = build_client("stage1", sleep=no_sleep)
+    assert later.ledger.stage == "stage1" and later.ledger.stage_cap_usd is None and later.ledger.path == paid["path"]
+    assert later.ledger.spent() == pytest.approx(0.0003)
+
+
+def test_paid_stage_cap_really_stops_sending(paid):
+    paid["cost"] = 0.2
+    client = build_client("stage0", sleep=no_sleep)
+    report = run_arm(rows(5), jev_decider(client), client=client, results_path=paid["path"].parent / "runs" / "private" / "a.jsonl", expected_per_row=0.0001)
+    assert report.stop_type == "BudgetExceeded"
+    assert len(paid["posts"]) == 1  # one measured row at 0.20, and 4 more would not fit in 0.50
+    assert client.ledger.spent() == pytest.approx(0.2)
+
+
+def test_client_refuses_real_transport_on_a_different_stage(tmp_path):
+    mock = httpx.MockTransport(lambda r: httpx.Response(200, json={}))
+    transport = RealTransport("stage1", key_reader=lambda: FAKE_KEY, httpx_transport=mock)
+    for ledger in (Ledger(tmp_path / "a.jsonl", stage="stage0"), Ledger(tmp_path / "b.jsonl")):
+        with pytest.raises(ValueError, match="stage"):
+            Client(transport, ledger, lambda: 0.0)
+    Client(transport, Ledger(tmp_path / "c.jsonl", stage="stage1"), lambda: 0.0)
+
+
+def test_empty_ledger_records_an_explicit_baseline(paid):
+    build_client("stage0", sleep=no_sleep)
+    entries = [json.loads(line) for line in paid["path"].read_text().splitlines()]
+    assert [e["kind"] for e in entries] == ["baseline"]
+    assert entries[0]["usage"] == 0.0
+
+
+def test_fresh_ledger_with_key_usage_above_baseline_refuses_to_send(paid):
+    """Critical 1: 0.49 was spent, then the ledger file changed. The key's usage gives it away."""
+    paid["usage"] = 0.49
+    with pytest.raises(openrouter.LedgerMismatch, match="0.49"):
+        build_client("stage0", sleep=no_sleep)
+    assert paid["posts"] == []
+    assert Ledger(paid["path"], stage="stage0").baseline() is None  # nothing was accepted
+
+
+def test_lost_ledger_is_caught_after_real_spend(paid):
+    client = build_client("stage0", sleep=no_sleep)
+    run_arm(rows(3), jev_decider(client), client=client, results_path=paid["path"].parent / "runs" / "private" / "a.jsonl", expected_per_row=0.0001)
+    paid["usage"] = 0.49
+    paid["path"].unlink()
+    with pytest.raises(openrouter.LedgerMismatch):
+        build_client("stage0", sleep=no_sleep)
+    assert len(paid["posts"]) == 3
+
+
+def test_starting_key_usage_can_only_be_accepted_explicitly_and_by_amount(paid):
+    paid["usage"] = 0.49
+    with pytest.raises(openrouter.LedgerMismatch):
+        build_client("stage0", sleep=no_sleep, accept_key_usage_usd=0.10)  # too small to cover it
+    client = build_client("stage0", sleep=no_sleep, accept_key_usage_usd=0.49)
+    assert client.ledger.baseline() == 0.49
+    assert client.ledger.remaining() == pytest.approx(0.50)
+    entries = [json.loads(line) for line in paid["path"].read_text().splitlines()]
+    assert entries[0]["meta"]["accepted_usd"] == 0.49
+    # Once a baseline exists there is nothing left to accept.
+    with pytest.raises(ValueError, match="baseline"):
+        build_client("stage0", sleep=no_sleep, accept_key_usage_usd=0.49)
+
+
+def test_usage_since_baseline_beyond_ledger_spend_refuses_on_restart(paid):
+    build_client("stage0", sleep=no_sleep)
+    paid["usage"] = 0.20  # spend outside the ledger
+    with pytest.raises(openrouter.LedgerMismatch):
+        build_client("stage0", sleep=no_sleep)
+    assert paid["posts"] == []
+
+
+def test_normal_restart_passes_and_late_usage_is_not_a_mismatch(paid):
+    client = build_client("stage0", sleep=no_sleep)
+    run_arm(rows(3), jev_decider(client), client=client, results_path=paid["path"].parent / "runs" / "private" / "a.jsonl", expected_per_row=0.0001)
+    build_client("stage0", sleep=no_sleep)
+    paid["usage"] = 0.0  # usage not posted yet: the ledger holds more than reported, which is safe at the start
+    build_client("stage0", sleep=no_sleep)
+    paid["usage"] = 0.009  # under the floor
+    build_client("stage0", sleep=no_sleep)
+
+
+def test_key_usage_below_baseline_means_a_different_key(paid):
+    paid["usage"] = 0.30
+    build_client("stage0", sleep=no_sleep, accept_key_usage_usd=0.30)
+    paid["usage"] = 0.10  # all-time usage cannot fall
+    with pytest.raises(openrouter.LedgerMismatch, match="different key"):
+        build_client("stage0", sleep=no_sleep)
+
+
+def test_paid_ledger_with_spend_but_no_baseline_refuses(paid):
+    Ledger(paid["path"], stage="stage0").charge(0.1, {"note": "hand edited"})
+    with pytest.raises(openrouter.LedgerMismatch, match="no baseline"):
+        build_client("stage0", sleep=no_sleep)
+    assert paid["posts"] == []
+
+
+def test_ledger_baseline_cannot_be_recorded_twice(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    ledger = Ledger(path)
+    assert ledger.baseline() is None and ledger.is_empty()
+    ledger.record_baseline(0.25, {})
+    assert ledger.baseline() == 0.25 and not ledger.is_empty()
+    assert ledger.spent() == 0.0  # a baseline is not spend
+    with pytest.raises(ValueError, match="baseline"):
+        ledger.record_baseline(0.0, {})
+    assert Ledger(path).baseline() == 0.25
+
+
+# ------------------------------------------------------------------ R6l, R6k: run_arm is the only paid path
+
+
+def test_paid_calls_outside_run_arm_are_refused(paid):
+    client = build_client("stage0", sleep=no_sleep)
+    with pytest.raises(openrouter.PaidOutsideArm):
+        jev_decide("r0", "text", OPTIONS, client=client)
+    with pytest.raises(openrouter.PaidOutsideArm):
+        llm_pick("r0", "text", OPTIONS, "openai/gpt-oss-20b", "Darkbloom", client=client)
+    assert paid["posts"] == []
+    assert client.ledger.spent() == 0.0
+
+
+def test_paid_arm_without_expected_cost_is_refused(paid):
+    client = build_client("stage0", sleep=no_sleep)
+    with pytest.raises(ValueError, match="expected_per_row"):
+        run_arm(rows(3), jev_decider(client), client=client, results_path=paid["path"].parent / "runs" / "private" / "a.jsonl")
+    assert paid["posts"] == []
+
+
+def llm_with_missing_logprobs(miss_rows):
+    def handler(body, n):
+        reply = json.loads(llm_ok(body).body)
+        if n in miss_rows:
+            reply["choices"][0]["logprobs"] = None
+        return ok(reply)
+
+    return handler
+
+
+def test_selection_runs_a_ladder_past_one_missing_logprob_and_charges_it(tmp_path):
+    client, transport, ledger, _ = make_client(tmp_path, llm_with_missing_logprobs({7}), max_concurrency=1)
+    report = run_arm(rows(50), llm_decider(client), client=client, results_path=results_path(tmp_path), allowed_arm_not_run=1)
+    assert report.status == "complete"
+    assert sum(not d.failed for d in report.decisions.values()) == 49
+    assert report.decisions["r7"].failed is True and report.decisions["r7"].reason == "no_usable_logprobs"
+    assert report.decisions["r7"].cost == pytest.approx(0.00003)
+    assert len(transport.calls) == 50
+    assert ledger.spent() == pytest.approx(50 * 0.00003)
+    assert report.projections[0]["rows"] == 20  # the ladder still ran
+
+
+def test_selection_stops_when_too_many_rows_lack_logprobs(tmp_path):
+    client, transport, _, _ = make_client(tmp_path, llm_with_missing_logprobs({3, 8}), max_concurrency=1)
+    report = run_arm(rows(50), llm_decider(client), client=client, results_path=results_path(tmp_path), allowed_arm_not_run=1)
+    assert report.status == "arm_not_run" and len(transport.calls) == 9
+
+
+# ------------------------------------------------------------------ R2: outage rows
+
+
+def run_jev(tmp_path, handler, n=30, ledger=None, **kwargs):
+    client, transport, ledger, _ = make_client(tmp_path, handler, ledger=ledger, max_concurrency=1, **kwargs)
+    report = run_arm(rows(n), jev_decider(client), client=client, results_path=results_path(tmp_path))
+    return report, transport, ledger
+
+
+@pytest.mark.parametrize(
+    "outage, reason",
+    [
+        (TransportFailure("down"), "network"),
+        (status(529), "http_529"),
+        (status(429), "http_429"),
+        (status(400), "http_400"),
+        (status(404), "http_404"),
+    ],
+)
+def test_outage_rows_are_retried_on_resume_and_can_recover(tmp_path, outage, reason):
+    first, _, ledger = run_jev(tmp_path, lambda body, n: outage)
+    assert first.stop_type == "ConsecutiveFailures"
+    failed = sorted(k for k, d in first.decisions.items() if d.failed)
+    assert len(failed) == 10 and first.decisions[failed[0]].reason == reason
+    assert sorted(first.retriable) == failed
+
+    second, transport, _ = run_jev(tmp_path, lambda body, n: jev_ok(body), ledger=ledger)
+    assert second.status == "complete"
+    assert len(transport.calls) == 30  # the 10 outage rows and the 20 never tried
+    assert not any(d.failed for d in second.decisions.values())
+    assert second.retriable == []
+
+
+def test_outage_retry_is_bounded_across_reruns_and_the_count_persists(tmp_path):
+    outage = lambda body, n: status(529)
+    first, _, ledger = run_jev(tmp_path, outage, n=5)
+    assert first.status == "complete" and sorted(first.retriable) == [f"r{i}" for i in range(5)]
+
+    # Second pass fails too, from a new process: the rows are now final and failed.
+    second, transport, _ = run_jev(tmp_path, outage, n=5, ledger=Ledger(tmp_path / "ledger.jsonl"))
+    assert len(transport.calls) == 20 and second.retriable == []
+    assert all(d.failed for d in second.decisions.values())
+
+    # Third run: nothing is sent, even with the service healthy.
+    third, transport, _ = run_jev(tmp_path, lambda body, n: jev_ok(body), n=5, ledger=Ledger(tmp_path / "ledger.jsonl"))
+    assert transport.calls == [] and third.status == "complete"
+    assert all(d.failed and d.reason == "http_529" for d in third.decisions.values())
+
+
+def test_usage_unavailable_row_is_an_outage_row(tmp_path):
+    def no_cost(body, n):
+        reply = json.loads(jev_ok(body).body)
+        del reply["usage"]["cost"]
+        return ok(reply)
+
+    first, _, ledger = run_jev(tmp_path, no_cost, n=3)
+    assert all(d.reason == "usage_unavailable" for d in first.decisions.values())
+    assert sorted(first.retriable) == ["r0", "r1", "r2"]
+    second, transport, _ = run_jev(tmp_path, lambda body, n: jev_ok(body), n=3, ledger=ledger)
+    assert len(transport.calls) == 3 and not any(d.failed for d in second.decisions.values())
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        lambda body: jev_ok(body, choice="not_an_option"),
+        lambda body: ok(fixture("decisions_refusal_response.json")),
+        lambda body: FakeResponse(200, {}, b"not json"),
+    ],
+)
+def test_answered_but_invalid_rows_stay_final(tmp_path, invalid):
+    first, _, ledger = run_jev(tmp_path, lambda body, n: invalid(body), n=3)
+    assert first.retriable == [] and all(d.reason.startswith("malformed") for d in first.decisions.values())
+    second, transport, _ = run_jev(tmp_path, lambda body, n: jev_ok(body), n=3, ledger=ledger)
+    assert transport.calls == [] and all(d.failed for d in second.decisions.values())
+
+
+def test_outage_row_stays_listed_when_a_stop_prevents_its_retry(tmp_path):
+    first, _, ledger = run_jev(tmp_path, lambda body, n: status(529), n=3)
+    second, transport, _ = run_jev(tmp_path, lambda body, n: status(401), n=3, ledger=ledger)
+    assert len(transport.calls) == 1
+    assert second.stop_type == "KeyOrCreditsStop"
+    # The stop was on r0, so r0's second pass did not happen, and all three can still be retried.
+    assert sorted(second.retriable) == ["r0", "r1", "r2"]
+    third, transport, _ = run_jev(tmp_path, lambda body, n: jev_ok(body), n=3, ledger=ledger)
+    assert len(transport.calls) == 3 and not any(d.failed for d in third.decisions.values())
+
+
+# ------------------------------------------------------------------ R3: zero cost, end-of-arm check
+
+
+@pytest.mark.parametrize("cost", [0, 0.0, -0.0])
+def test_zero_cost_with_tokens_counts_as_unreported(tmp_path, cost):
+    client, transport, ledger, _ = make_client(tmp_path, lambda body, n: jev_ok(body, cost=cost), reserve_usd=0.001, reported=lambda: 0.0, max_concurrency=1)
+    decision = jev_decide("r0", "text", OPTIONS, client=client)
+    assert decision.failed is True and decision.reason == "usage_unavailable" and len(transport.calls) == 4
+    assert ledger.spent() == pytest.approx(0.004)
+    assert ledger.confirmed() == 0.0
+
+
+def test_zero_cost_on_every_paid_reply_stops_rather_than_running_free(tmp_path):
+    """Important 3: 99 calls at cost 0 used to finish with a ledger of 0.0 and projections of US$0."""
+    client, transport, ledger, _ = make_client(tmp_path, lambda body, n: jev_ok(body, cost=0), reserve_usd=0.001, reported=lambda: 0.0, max_concurrency=1)
+    report = run_arm(rows(99), jev_decider(client), client=client, results_path=results_path(tmp_path))
+    assert report.stop_type == "ConsecutiveFailures"
+    assert ledger.spent() == pytest.approx(len(transport.calls) * 0.001)
+    assert report.projections[0]["per_row"] == pytest.approx(0.004)
+
+
+def test_zero_cost_with_no_tokens_is_a_real_zero(tmp_path):
+    def handler(body, n):
+        reply = json.loads(jev_ok(body, cost=0).body)
+        reply["usage"].update(input_tokens=0, output_tokens=0)
+        return ok(reply)
+
+    client, _, ledger, _ = make_client(tmp_path, handler)
+    assert jev_decide("r0", "text", OPTIONS, client=client).failed is False
+    assert ledger.spent() == 0.0
+
+
+def test_short_run_reconciles_at_the_end(tmp_path):
+    """Under 100 calls there is no periodic read, so only the end-of-arm check can see this."""
+    reads = []
+
+    def reported():
+        reads.append(1)
+        return 0.0
+
+    client, transport, _, sleeps = make_client(tmp_path, lambda body, n: jev_ok(body, cost=0.001), reported=reported, max_concurrency=1, reconcile_grace_seconds=45)
+    report = run_arm(rows(99), jev_decider(client), client=client, results_path=results_path(tmp_path))
+    assert report.status == "stopped" and report.stop_type == "ReconciliationGap"
+    assert len(report.decisions) == 99 and report.not_run == []  # every row is still kept
+    assert len(reads) == 3  # baseline, first end read, read after the grace
+    assert sleeps == [45]
+
+
+def test_end_of_arm_grace_allows_for_usage_posting_late(tmp_path):
+    holder = {"posted": False}
+    ledger = Ledger(tmp_path / "ledger.jsonl")
+
+    def reported():
+        return ledger.confirmed() if holder["posted"] else 0.0
+
+    client, _, _, _ = make_client(tmp_path, lambda body, n: jev_ok(body, cost=0.001), ledger=ledger, reported=reported, max_concurrency=1, reconcile_grace_seconds=30)
+    client._sleep = lambda seconds: holder.update(posted=True, waited=seconds)
+    report = run_arm(rows(50), jev_decider(client), client=client, results_path=results_path(tmp_path))
+    assert report.status == "complete" and holder["waited"] == 30
+
+
+def test_grace_is_configurable_and_not_used_when_billed_above_the_ledger(tmp_path):
+    ledger = Ledger(tmp_path / "ledger.jsonl")
+    client, _, _, sleeps = make_client(tmp_path, lambda body, n: jev_ok(body, cost=0.001), ledger=ledger, reported=lambda: 5.0 if ledger.spent() else 0.0, max_concurrency=1, reconcile_grace_seconds=30)
+    report = run_arm(rows(20), jev_decider(client), client=client, results_path=results_path(tmp_path))
+    assert report.stop_type == "ReconciliationGap" and sleeps == []  # lag cannot explain being billed more
+
+
+def test_no_end_read_when_nothing_was_sent(tmp_path):
+    reads = []
+    client, _, _, _ = make_client(tmp_path, lambda body, n: jev_ok(body), reported=lambda: (reads.append(1), 0.0)[1])
+    client.reconcile_final()
+    assert len(reads) == 1  # the baseline only
+
+
+def test_short_client_can_reconcile_directly(tmp_path):
+    client, _, _, _ = make_client(tmp_path, lambda body, n: jev_ok(body, cost=0.02), reported=lambda: 0.0)
+    jev_decide("r0", "text", OPTIONS, client=client)
+    assert client.stop is None
+    client.reconcile_final()
+    assert isinstance(client.stop, openrouter.ReconciliationGap)
+
+
+# ------------------------------------------------------------------ R6e: the cap uses the larger figure
+
+
+def test_cap_uses_reported_spend_when_it_is_above_the_ledger(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    ledger = Ledger(path, cap_usd=1.0)
+    ledger.charge(0.90, {})
+    ledger.note_reported(0.99)
+    assert ledger.spent() == pytest.approx(0.90)  # the ledger's own figure is unchanged
+    assert ledger.remaining() == pytest.approx(0.01)
+    with pytest.raises(BudgetExceeded):
+        ledger.reserve(0.02, {})
+    with pytest.raises(BudgetExceeded):
+        ledger.projected(2, 0.01)
+    # It persists across a restart.
+    assert Ledger(path, cap_usd=1.0).remaining() == pytest.approx(0.01)
+    # A lower report never gives room back.
+    ledger.note_reported(0.5)
+    assert ledger.remaining() == pytest.approx(0.01)
+
+
+def test_excess_reported_spend_counts_against_the_stage_limit_too(tmp_path):
+    ledger = Ledger(tmp_path / "ledger.jsonl", stage="stage0")
+    ledger.charge(0.40, {})
+    ledger.note_reported(0.49)
+    assert ledger.remaining() == pytest.approx(0.01)
+    with pytest.raises(BudgetExceeded):
+        ledger.reserve(0.02, {})
+
+
+def test_gap_under_10_percent_still_tightens_the_cap(tmp_path):
+    """A 7% gap passes reconciliation, but the extra spend must still count against the cap."""
+    ledger = Ledger(tmp_path / "ledger.jsonl", cap_usd=0.25)
+    client, transport, _, _ = make_client(
+        tmp_path, lambda body, n: jev_ok(body, cost=0.002), ledger=ledger,
+        reported=lambda: ledger.confirmed() * 1.07, max_concurrency=1,
+    )
+    report = run_arm(rows(120), jev_decider(client), client=client, results_path=results_path(tmp_path))
+    # By the ledger alone 0.25 allows 125 calls, so all 120 would finish. At call 100 the report says
+    # 0.214 against 0.200: that 0.014 stays counted as the ledger grows, leaving room for 118 calls.
+    assert report.stop_type == "BudgetExceeded"
+    assert 117 <= len(transport.calls) <= 118
+
+
+# ------------------------------------------------------------------ R4: model pin
+
+
+def test_llm_first_reply_must_match_the_requested_model(tmp_path):
+    client, _, _, _ = make_client(tmp_path, lambda body, n: llm_ok(body, model="other/totally-different-model"))
+    with pytest.raises(ModelChanged):
+        llm_pick("r0", "text", OPTIONS, "openai/gpt-oss-20b", "Darkbloom", client=client)
+
+
+@pytest.mark.parametrize(
+    "reply, allowed",
+    [
+        ("openai/gpt-oss-20b", True),
+        ("openai/gpt-oss-20b-20261014", True),
+        ("openai/gpt-oss-20b-v1", False),
+        ("openai/gpt-oss-20b-2026", False),
+        ("openai/gpt-oss-20", False),
+        ("openai/gpt-oss-20bx", False),
+        ("anthropic/gpt-oss-20b", False),
+        ("gpt-oss-20b", False),
+    ],
+)
+def test_llm_model_suffix_pattern_is_exact(tmp_path, reply, allowed):
+    client, _, _, _ = make_client(tmp_path, lambda body, n: llm_ok(body, model=reply))
+    if allowed:
+        assert llm_pick("r0", "t", OPTIONS, "openai/gpt-oss-20b", "Darkbloom", client=client).model == reply
+    else:
+        with pytest.raises(ModelChanged):
+            llm_pick("r0", "t", OPTIONS, "openai/gpt-oss-20b", "Darkbloom", client=client)
+
+
+def test_llm_tagged_request_matches_reply_with_or_without_the_tag(tmp_path):
+    for reply in ("z-ai/glm-5.3-flash", "z-ai/glm-5.3-flash:nitro", "z-ai/glm-5.3-flash-20261001"):
+        client, _, _, _ = make_client(tmp_path, lambda body, n, r=reply: llm_ok(body, model=r))
+        assert llm_pick("r0", "t", OPTIONS, "z-ai/glm-5.3-flash:nitro", "Wafer", client=client).failed is False
+
+
+def test_mixed_builds_in_one_arm_stop(tmp_path):
+    def handler(body, n):
+        return llm_ok(body, model="openai/gpt-oss-20b-20261014" if n < 3 else "openai/gpt-oss-20b-20270101")
+
+    client, transport, _, _ = make_client(tmp_path, handler, max_concurrency=1)
+    report = run_arm(rows(10), llm_decider(client), client=client, results_path=results_path(tmp_path))
+    assert report.stop_type == "ModelChanged" and len(report.decisions) == 3 and len(transport.calls) == 4
+
+
+def test_resume_with_a_changed_build_stops(tmp_path):
+    client, _, ledger, _ = make_client(tmp_path, lambda b, n: llm_ok(b, model="openai/gpt-oss-20b-20261014"), max_concurrency=1)
+    run_arm(rows(5), llm_decider(client), client=client, results_path=results_path(tmp_path))
+    client, transport, _, _ = make_client(tmp_path, lambda b, n: llm_ok(b, model="openai/gpt-oss-20b-20270101"), ledger=ledger, max_concurrency=1)
+    report = run_arm(rows(10), llm_decider(client), client=client, results_path=results_path(tmp_path))
+    assert report.stop_type == "ModelChanged"
+    assert {d.model for d in report.decisions.values()} == {"openai/gpt-oss-20b-20261014"}
+    assert len(report.decisions) == 5 and len(transport.calls) == 1
+
+
+def test_resume_with_a_changed_jev_build_stops(tmp_path):
+    client, _, ledger, _ = make_client(tmp_path, lambda b, n: jev_ok(b), max_concurrency=1)
+    run_arm(rows(5), jev_decider(client), client=client, results_path=results_path(tmp_path))
+    other = "jev-1.14-20270101"
+    client, _, _, _ = make_client(tmp_path, lambda b, n: jev_ok(b, model="typesafe/" + other), ledger=ledger, max_concurrency=1)
+    report = run_arm(rows(10), jev_decider(client, expected_build=other), client=client, results_path=results_path(tmp_path))
+    assert report.stop_type == "ModelChanged"
+    assert {d.model for d in report.decisions.values()} == {BUILD}
+
+
+def test_saved_rows_that_already_mix_builds_stop_before_sending(tmp_path):
+    client, _, ledger, _ = make_client(tmp_path, lambda b, n: llm_ok(b, model="openai/gpt-oss-20b-20261014"), max_concurrency=1)
+    path = results_path(tmp_path)
+    run_arm(rows(2), llm_decider(client), client=client, results_path=path)
+    with open(path, "ab") as handle:
+        record = {"row_id": "r2", "status": "done", "pred": "a", "top_prob": 0.5, "probs": {"a": 0.5}, "model": "openai/gpt-oss-20b-20270101", "cost": 0.1, "failed": False}
+        handle.write(json.dumps(record).encode() + b"\n")
+    client, transport, _, _ = make_client(tmp_path, lambda b, n: llm_ok(b), ledger=ledger, max_concurrency=1)
+    report = run_arm(rows(5), llm_decider(client), client=client, results_path=path)
+    assert report.stop_type == "ModelChanged" and transport.calls == []
+
+
+def test_jev_model_must_start_with_typesafe(tmp_path):
+    for bad in ("anything/jev-1.14-20261014", "jev-1.14-20261014"):
+        client, _, _, _ = make_client(tmp_path, lambda b, n, m=bad: jev_ok(b, model=m))
+        with pytest.raises(ModelChanged):
+            jev_decide("r0", "text", OPTIONS, client=client)
+
+
+# ------------------------------------------------------------------ R6a: the key echoed in reply fields
+
+
+def _jev_echo(field, value):
+    def handler(body, n):
+        reply = json.loads(jev_ok(body).body)
+        reply[field] = value
+        return ok(reply)
+
+    return handler
+
+
+def _llm_echo(field, value):
+    def handler(body, n):
+        reply = json.loads(llm_ok(body).body)
+        reply[field] = value
+        return ok(reply)
+
+    return handler
+
+
+@pytest.mark.parametrize(
+    "make_handler, field, value",
+    [
+        (_jev_echo, "model", LONG_KEY),
+        (_jev_echo, "model", "typesafe/" + LONG_KEY),
+        (_jev_echo, "provider", LONG_KEY),
+        (_jev_echo, "provider", "x/" + LONG_KEY),
+        (_llm_echo, "model", LONG_KEY),
+        (_llm_echo, "model", "openai/" + LONG_KEY),
+        (_llm_echo, "provider", LONG_KEY),
+        (_llm_echo, "provider", "SK-" + LONG_KEY[3:]),
+    ],
+)
+def test_key_echoed_in_reply_fields_reaches_no_output(tmp_path, caplog, make_handler, field, value):
+    caplog.set_level(logging.DEBUG)
+    client, transport, ledger, _ = make_client(tmp_path, make_handler(field, value), max_concurrency=1)
+    decide = jev_decider(client) if make_handler is _jev_echo else llm_decider(client)
+    path = results_path(tmp_path)
+    report = run_arm(rows(2), decide, client=client, results_path=path)
+    surfaces = [repr(report), report.reason or "", caplog.text, path.read_text(), (tmp_path / "ledger.jsonl").read_text()]
+    needle = value.split("/")[-1][3:]
+    assert not [s for s in surfaces if needle in s]
+    assert all(d.failed and d.reason.startswith("malformed") for d in report.decisions.values())
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "", "x" * 81, "has space", "new\nline", "quote\"", "sk-abc", "SK-abc", "a/sk-abc", "a:sk-abc", "a.sk-abc", 7, None, ["a"],
+    ],
+)
+def test_safe_name_refuses(bad):
+    with pytest.raises(openrouter.MalformedResponse):
+        openrouter.safe_name(bad, "model")
+
+
+@pytest.mark.parametrize("good", ["typesafe/jev-1.14-20261014", "TypeSafe", "z-ai/glm-5.3-flash:nitro", "task-model", "x" * 80])
+def test_safe_name_allows(good):
+    assert openrouter.safe_name(good, "model") == good
+
+
+# ------------------------------------------------------------------ R6c, d, f: the real transport
+
+
+def test_real_client_has_timeouts_ignores_env_and_refuses_redirects():
+    transport = RealTransport("stage0", key_reader=lambda: FAKE_KEY, httpx_transport=httpx.MockTransport(lambda r: httpx.Response(200)))
+    timeout = transport._http.timeout
+    assert all(value is not None and value > 0 for value in (timeout.connect, timeout.read, timeout.write, timeout.pool))
+    assert transport._http.trust_env is False
+    assert transport._http.follow_redirects is False
+    assert 0 < openrouter.REQUEST_DEADLINE_SECONDS <= 120
+
+
+def test_overall_wall_clock_limit_stops_a_slow_drip_reply():
+    clock = {"now": 0.0}
+
+    class Drip(httpx.SyncByteStream):
+        def __iter__(self):
+            for _ in range(1000):
+                clock["now"] += 10  # each chunk arrives inside the read timeout, so httpx alone never fires
+                yield b"x"
+
+    transport = RealTransport(
+        "stage0", key_reader=lambda: FAKE_KEY, clock=lambda: clock["now"],
+        httpx_transport=httpx.MockTransport(lambda r: httpx.Response(200, stream=Drip())),
+    )
+    with pytest.raises(TransportFailure, match="RequestDeadlineExceeded"):
+        transport.send("POST", openrouter.DECISIONS_URL, b"{}")
+    assert clock["now"] <= openrouter.REQUEST_DEADLINE_SECONDS + 10
+
+
+def test_reply_within_the_deadline_is_read_whole():
+    transport = RealTransport("stage0", key_reader=lambda: FAKE_KEY, httpx_transport=httpx.MockTransport(lambda r: httpx.Response(201, content=b"abc", headers={"Retry-After": "3"})))
+    reply = transport.send("POST", openrouter.DECISIONS_URL, b"{}")
+    assert (reply.status, reply.body, reply.headers["retry-after"]) == (201, b"abc", "3")
+
+
+def test_no_frame_local_in_send_holds_the_key():
+    seen = {}
+
+    def inspecting(request):
+        frame = sys._getframe()
+        while frame is not None:
+            if frame.f_code.co_name == "send" and frame.f_code.co_filename.endswith("openrouter.py"):
+                seen["locals"] = {name: repr(value) for name, value in frame.f_locals.items()}
+            frame = frame.f_back
+        return httpx.Response(200)
+
+    transport = RealTransport("stage0", key_reader=lambda: FAKE_KEY, httpx_transport=httpx.MockTransport(inspecting))
+    transport.send("POST", openrouter.DECISIONS_URL, b"{}")
+    assert seen["locals"] and not [v for v in seen["locals"].values() if FAKE_KEY in v]
+
+
+# ------------------------------------------------------------------ R6g, h
+
+
+def test_retrieve_raises_on_the_querys_own_text_in_the_bank():
+    bank = [Example("my card never arrived", "card_arrival")] + FILLER
+    for query in ("my card never arrived", "  MY  card\tnever ARRIVED ", "my card never arrived\u00a0"):
+        with pytest.raises(retrieval.QueryInBank):
+            retrieve(query, bank)
+    assert retrieve("my card has never arrived", bank)
+
+
+def test_results_path_is_resolved_before_the_check(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    for bad in ("runs/private/../../published/out.jsonl", tmp_path / "runs" / "private" / ".." / ".." / "out.jsonl"):
+        with pytest.raises(ValueError, match="runs/private"):
+            openrouter.require_private_path(bad)
+    # A link inside runs/private that points out is caught too.
+    (tmp_path / "runs" / "private").mkdir(parents=True)
+    (tmp_path / "public").mkdir()
+    (tmp_path / "runs" / "private" / "link").symlink_to(tmp_path / "public")
+    with pytest.raises(ValueError, match="runs/private"):
+        openrouter.require_private_path("runs/private/link/out.jsonl")
+    assert openrouter.require_private_path("runs/private/ok.jsonl") == (tmp_path / "runs" / "private" / "ok.jsonl").resolve()
+
+
+# ------------------------------------------------------------------ R6i
+
+
+@pytest.mark.parametrize("value", ["3", 1.5, True, [1], {"a": 1}])
+def test_non_integer_reasoning_tokens_fail_closed(tmp_path, value):
+    def handler(body, n):
+        reply = json.loads(llm_ok(body).body)
+        reply["usage"]["completion_tokens_details"]["reasoning_tokens"] = value
+        return ok(reply)
+
+    client, transport, _, _ = make_client(tmp_path, handler, max_concurrency=1)
+    with pytest.raises(HiddenReasoning):
+        llm_pick("r0", "t", OPTIONS, "openai/gpt-oss-20b", "Darkbloom", client=client)
+        llm_pick("r1", "t", OPTIONS, "openai/gpt-oss-20b", "Darkbloom", client=client)
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.parametrize("details", [None, {}, {"reasoning_tokens": None}, {"reasoning_tokens": 0}])
+def test_documented_empty_reasoning_fields_are_allowed(tmp_path, details):
+    def handler(body, n):
+        reply = json.loads(llm_ok(body).body)
+        reply["usage"]["completion_tokens_details"] = details
+        return ok(reply)
+
+    client, _, _, _ = make_client(tmp_path, handler)
+    assert llm_pick("r0", "t", OPTIONS, "openai/gpt-oss-20b", "Darkbloom", client=client).failed is False
+    assert client.stop is None
