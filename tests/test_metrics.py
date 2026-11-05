@@ -59,17 +59,23 @@ def test_sorts_high_to_low_regardless_of_input_order():
 
 
 def test_tie_rule_equals_expectation_over_all_random_tie_breaks():
-    # DESIGN: "This equals the expectation over random tie-breaks". Enumerate every break.
-    conf = np.array([0.9, 0.7, 0.7, 0.7, 0.7, 0.2, 0.2, 0.2, 0.1, 0.1])
-    correct = np.array([1, 1, 0, 0, 1, 1, 0, 1, 0, 1], dtype=bool)
+    # DESIGN: "This equals the expectation over random tie-breaks". Enumerate every break: 5! x 4!.
+    # Keep 8 of 10. Row 0 is correct. All five rows at 0.7 are kept, and 2 of them are correct.
+    # Then 2 of the 4 rows at 0.2 are needed, and 2 of those 4 are correct, so a break can add
+    # 0, 1 or 2 correct. The rule adds 2*2/4 = 1: correct = 1 + 2 + 1 = 4, so acc = 4/8 = 0.5.
+    conf = np.array([0.9, 0.7, 0.7, 0.7, 0.7, 0.7, 0.2, 0.2, 0.2, 0.2])
+    correct = np.array([1, 1, 0, 0, 1, 0, 1, 0, 0, 1], dtype=bool)
     failed = np.zeros(10, dtype=bool)
     keep = 8
     results = []
-    for tie_a in itertools.permutations(range(1, 5)):
-        for tie_b in itertools.permutations(range(5, 8)):
-            order = [0, *tie_a, *tie_b, 8, 9]
+    for tie_a in itertools.permutations(range(1, 6)):
+        for tie_b in itertools.permutations(range(6, 10)):
+            order = [0, *tie_a, *tie_b]
             results.append(correct[order[:keep]].mean())
-    assert acc_at(conf, correct, failed) == pytest.approx(np.mean(results))
+    assert len(results) == 120 * 24
+    assert sorted(set(results)) == [3 / 8, 4 / 8, 5 / 8]  # the tie break really changes the answer
+    assert np.mean(results) == pytest.approx(0.5)
+    assert acc_at(conf, correct, failed) == pytest.approx(0.5)
 
 
 def test_failed_rows_rank_first_and_count_wrong():
@@ -169,6 +175,32 @@ def test_bootstrap_point_estimate_hand_worked():
         assert ds.d[s] == pytest.approx(25.0)
         assert ds.draws_beating_jev[s] == 10
         assert ds.draw_range[s] == (pytest.approx(25.0), pytest.approx(25.0))
+
+
+def test_d_s_is_the_mean_over_draws_not_another_summary():
+    # 100 one-row classes, so resampling rows changes nothing. Nine draws at 0.1 and one at 1.0:
+    # the mean is 0.19 (the median would be 0.1). Jev is 0, so D_s = 19 points.
+    n = 100
+    skewed = np.stack([tied_arm(np.arange(n) < (100 if r == 9 else 10)) for r in range(10)])
+    lr = {s: skewed for s in GRID}
+    lr["all"] = repeat_draws(tied_arm(np.arange(n) < 19))
+    ds = bootstrap_ds(lr, tied_arm(np.zeros(n)), np.arange(n), b=300)
+    for s in GRID:
+        assert ds.d[s] == 19.0
+    assert ds.draw_range[1] == (10.0, 100.0)
+
+    # Each replicate is the mean of its own 10 draw indices too. With k picks of the 1.0 draw,
+    # that is, in points, ((10 - k) * 10 + k * 100) / 10 = 10 + 9k.
+    possible = {10.0 + 9 * k for k in range(11)}
+    assert set(ds.replicates[GRID.index(1)]) <= possible
+    # Most replicates hold at least one pick of the 1.0 draw (1 - 0.9^10 = 65%). A median over the
+    # 10 indices would put almost all of them at 10.
+    assert np.mean(ds.replicates[GRID.index(1)] > 10.0) == pytest.approx(0.65, abs=0.1)
+
+    # A Jev at 19 ties the mean exactly, though only 1 of the 10 draws beats it.
+    ds = bootstrap_ds(lr, tied_arm(np.arange(n) < 19), np.arange(n), b=20)
+    assert ds.d[1] == 0.0
+    assert ds.draws_beating_jev[1] == 1
 
 
 def test_bootstrap_resamples_within_class_and_reuses_rows_and_draws_across_s():

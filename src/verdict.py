@@ -29,13 +29,13 @@ VERDICT_ROWS = {
     5: f'{_ROW_5_CLAIM} If [L_s, U_s] is inside [-2, +2] at every s, say "{_EQUIVALENT}".',
 }
 
-CLAIM_LEVEL = 98.33  # Bonferroni across 3
-CLAIM_ARMS = ("NLI", "embeddings", "small LLM")
+CLAIM_LEVEL = 98.33  # Bonferroni across 3, tails of 0.835% each
+CLAIM_ARMS = ("NLI", "embedding similarity", "small LLM")
 MATCH_LIMIT = -2  # the arm "matches Jev" if the lower limit is above this
 EXAMPLES_LEVEL = 95.0
 EXAMPLES_TEXT = "Given the same 8 labels per class, Jev using them is at least as good as LR using them (one draw of labels)"
 EXAMPLES_LIMIT = -2
-AG_DIFFERENT_BIN = "The Banking77 result does not carry to this task."
+AG_DIFFERENT_ROW = "The Banking77 result does not carry to this task."
 AG_CEILING = "ceiling-limited: a 2-point lead is hard or impossible."
 AG_CEILING_AT = 96
 NOT_RUN = "not run"
@@ -163,14 +163,14 @@ def _ag_news(ag: DsResult | None, banking_s_star, banking_s_j) -> dict:
     differs = verdict_row(s_star, s_j) != verdict_row(banking_s_star, banking_s_j)
     texts = []
     if differs:
-        texts.append(AG_DIFFERENT_BIN)
+        texts.append(AG_DIFFERENT_ROW)
     if ag.jev_acc >= AG_CEILING_AT:
         texts.append(AG_CEILING)
     return {
         "status": "run",
         "s_star": s_star,
         "s_j": s_j,
-        "bin_differs": differs,
+        "row_differs": differs,
         "jev_acc": ag.jev_acc,
         "texts": texts,
     }
@@ -192,9 +192,11 @@ def additions(
 ) -> dict:
     """The additions in DESIGN.md's outcome rules, other than routing. These never change the verdict.
 
-    All arrays are Banking77. `lr_s8` is LR at s=8, (draws, rows, 2 or 3); Jev + examples is compared
-    with its draw 0. `his_claim_arms` names NLI, embeddings and small LLM, with None for an arm not run.
-    `ag_news` is the AG News DsResult, or None if not run.
+    All arrays are Banking77. `jev` and each arm in `his_claim_arms` are label-description runs.
+    `his_claim_arms` names NLI, embedding similarity (temperature 0.05) and small LLM, with None for
+    an arm not run. `lr_s8` is LR at s=8, (draws, rows, 2 or 3); Jev + examples is compared with its
+    draw 0. `ag_news` is the AG News DsResult, or None if not run. Its "does not carry" text prints
+    when its verdict table row differs from Banking77's, even if only s_J differs.
     """
     verdict_row(banking_s_star, banking_s_j)  # refuses values off the grid
     if len(lr_s8) != N_DRAWS:

@@ -6,6 +6,9 @@ import pytest
 
 from metrics import GRID, DsResult, bootstrap_contrasts
 from verdict import (
+    CLAIM_ARMS,
+    JEV_SEQUENCE,
+    LR_SEQUENCE,
     NOT_A_CLAIM,
     VERDICT_ROWS,
     additions,
@@ -47,6 +50,22 @@ def test_lr_ahead_tests_all_first_and_walks_down():
     assert lr_ahead(ds_from({s: PASS_LR for s in GRID})) == 1
 
 
+def test_sequence_order_is_the_frozen_one():
+    assert LR_SEQUENCE == ("all", 35, 16, 8, 5, 3, 2, 1)
+    assert JEV_SEQUENCE == (1, 2, 3, 5, 8, 16, 35, "all")
+
+
+@pytest.mark.parametrize(
+    "fails_at,s_star",
+    [("all", "none"), (35, "all"), (16, 35), (8, 16), (5, 8), (3, 5), (2, 3), (1, 2)],
+)
+def test_lr_ahead_stops_at_each_position(fails_at, s_star):
+    # Every other s passes, so anything past the failure would be picked up if the walk continued.
+    values = {s: PASS_LR for s in GRID}
+    values[fails_at] = (0.0, -1.0, 1.0)
+    assert lr_ahead(ds_from(values)) == s_star
+
+
 def test_lr_ahead_is_none_if_all_fails():
     assert lr_ahead(ds_from({})) == "none"
 
@@ -79,6 +98,16 @@ def test_jev_ahead_tests_1_first_and_walks_up():
     assert jev_ahead(ds_from({1: PASS_JEV})) == 1
     assert jev_ahead(ds_from({1: PASS_JEV, 2: PASS_JEV, 3: PASS_JEV})) == 3
     assert jev_ahead(ds_from({s: PASS_JEV for s in GRID})) == "all"
+
+
+@pytest.mark.parametrize(
+    "fails_at,s_j",
+    [(1, "none"), (2, 1), (3, 2), (5, 3), (8, 5), (16, 8), (35, 16), ("all", 35)],
+)
+def test_jev_ahead_stops_at_each_position(fails_at, s_j):
+    values = {s: PASS_JEV for s in GRID}
+    values[fails_at] = (0.0, -1.0, 1.0)
+    assert jev_ahead(ds_from(values)) == s_j
 
 
 def test_jev_ahead_is_none_if_1_fails():
@@ -138,25 +167,50 @@ def test_verdict_rows_are_verbatim_from_design():
         assert f"| {row} |" in DESIGN
 
 
-def expected_row(s_star, s_j):
-    if s_star in (1, 2, 3):
-        return 1
-    if s_star in (5, 8, 16):
-        return 3 if s_j == "none" else 2
-    return 4 if s_j in (3, 5, 8, 16, 35, "all") else 5
+def design_table():
+    """DESIGN.md's verdict table as (s* values, s_J values, verdict text), read from the file."""
+    lines = DESIGN.split("Verdict, exactly one row applies:\n", 1)[1].splitlines()
+    rows = []
+    for line in lines[2:]:  # the header and the divider
+        if not line.startswith("|"):
+            break
+        rows.append([cell.strip() for cell in line.strip("|").split(" | ")])
+
+    def values(cell):
+        if cell == "any":
+            return set(ALL_S)
+        if cell.endswith(" or more"):
+            return set(GRID[GRID.index(int(cell.split()[0])) :])
+        return {v if v in ("all", "none") else int(v) for v in cell.split(", ")}
+
+    return [(values(a), values(b), text.strip()) for a, b, text in rows]
+
+
+def test_design_table_is_read_as_five_rows():
+    # So a parsing slip can't empty the check below.
+    table = design_table()
+    assert [(len(a), len(b)) for a, b, _ in table] == [(3, 9), (3, 8), (3, 1), (3, 6), (3, 3)]
+    assert table[1][1] == {1, 2, 3, 5, 8, 16, 35, "all"}
+    assert table[3][1] == {3, 5, 8, 16, 35, "all"}
+    assert table[4][1] == {"none", 1, 2}
+    assert [row[2] for row in table] == [ROW_1, ROW_2, ROW_3, ROW_4, ROW_5]
 
 
 def test_verdict_covers_every_s_star_s_j_pair_with_exactly_one_row():
-    seen = set()
+    # Expected rows come from DESIGN.md's table, not from a copy of verdict_row.
+    table = design_table()
+    per_row = dict.fromkeys(range(1, 6), 0)
     for s_star in ALL_S:
         for s_j in ALL_S:
-            row = verdict_row(s_star, s_j)
-            assert row == expected_row(s_star, s_j), (s_star, s_j)
-            seen.add(row)
-            text = verdict(s_star, s_j)
-            assert text == VERDICT_ROWS[row].replace("s*", str(s_star)).replace("s_J", str(s_j))
-    assert seen == {1, 2, 3, 4, 5}
-    assert len(ALL_S) ** 2 == 81
+            matching = [i for i, (a, b, _) in enumerate(table, start=1) if s_star in a and s_j in b]
+            assert len(matching) == 1, (s_star, s_j)
+            row = matching[0]
+            assert verdict_row(s_star, s_j) == row, (s_star, s_j)
+            filled = table[row - 1][2].replace("s*", str(s_star)).replace("s_J", str(s_j))
+            assert verdict(s_star, s_j) == filled
+            per_row[row] += 1
+    assert per_row == {1: 27, 2: 24, 3: 3, 4: 18, 5: 9}
+    assert sum(per_row.values()) == 81
 
 
 @pytest.mark.parametrize(
@@ -216,7 +270,7 @@ def base_kwargs(**over):
         jev=jev,
         classes=np.arange(n),
         lr_s8=np.stack([tied(40 + r) for r in range(10)]),
-        his_claim_arms={"NLI": None, "embeddings": None, "small LLM": None},
+        his_claim_arms={"NLI": None, "embedding similarity": None, "small LLM": None},
         jev_examples=None,
         banking_s_star=8,
         banking_s_j="none",
@@ -229,21 +283,21 @@ def base_kwargs(**over):
 
 def test_his_claim_matches_jev_only_if_lower_limit_above_minus_2():
     # Jev 50%. NLI 49%: C = -1, above -2. Embeddings 48%: C = -2 exactly, not above. LLM not run.
-    out = additions(**base_kwargs(his_claim_arms={"NLI": tied(49), "embeddings": tied(48), "small LLM": None}))
+    out = additions(**base_kwargs(his_claim_arms={"NLI": tied(49), "embedding similarity": tied(48), "small LLM": None}))
     claim = out["his_claim"]
     assert claim["NLI"]["status"] == "run"
     assert claim["NLI"]["C"] == -1.0
     assert claim["NLI"]["lower"] == -1.0
     assert claim["NLI"]["level"] == 98.33
     assert claim["NLI"]["matches_jev"] is True
-    assert claim["embeddings"]["C"] == -2.0
-    assert claim["embeddings"]["matches_jev"] is False
+    assert claim["embedding similarity"]["C"] == -2.0
+    assert claim["embedding similarity"]["matches_jev"] is False
     assert claim["small LLM"] == {"status": "not run"}
     assert out["any_arm_matches_jev"] is True
 
 
 def test_no_arm_matching_is_recorded():
-    out = additions(**base_kwargs(his_claim_arms={"NLI": tied(40), "embeddings": None, "small LLM": None}))
+    out = additions(**base_kwargs(his_claim_arms={"NLI": tied(40), "embedding similarity": None, "small LLM": None}))
     assert out["any_arm_matches_jev"] is False
 
 
@@ -258,7 +312,7 @@ def test_his_claim_uses_the_98_33_interval_on_the_shared_rows():
             jev=jev,
             classes=classes,
             lr_s8=np.stack([np.column_stack([np.round(rng.random(n), 2), rng.random(n) < 0.6]) for _ in range(10)]),
-            his_claim_arms={"NLI": nli, "embeddings": None, "small LLM": None},
+            his_claim_arms={"NLI": nli, "embedding similarity": None, "small LLM": None},
             b=300,
         )
     )
@@ -271,7 +325,14 @@ def test_his_claim_uses_the_98_33_interval_on_the_shared_rows():
 
 def test_his_claim_needs_all_three_arms_named():
     with pytest.raises(ValueError):
-        additions(**base_kwargs(his_claim_arms={"NLI": None, "embeddings": None}))
+        additions(**base_kwargs(his_claim_arms={"NLI": None, "embedding similarity": None}))
+
+
+def test_his_claim_arm_names_are_the_design_ones():
+    assert CLAIM_ARMS == ("NLI", "embedding similarity", "small LLM")
+    # The old loose name, which could hold any embedding arm, is refused.
+    with pytest.raises(ValueError):
+        additions(**base_kwargs(his_claim_arms={"NLI": None, "embeddings": None, "small LLM": None}))
 
 
 JEV_EXAMPLES_TEXT = "Given the same 8 labels per class, Jev using them is at least as good as LR using them (one draw of labels)"
@@ -337,29 +398,52 @@ def test_ag_news_not_run():
     assert additions(**base_kwargs())["ag_news"] == {"status": "not run", "texts": ["not run"]}
 
 
-def test_ag_news_same_bin_no_ceiling_has_no_text():
+def test_ag_news_same_row_with_different_s_star_has_no_text():
     # Banking: s*=8, s_J=none is row 3. AG News: s*=5, s_J=none is also row 3.
     values = {s: PASS_LR for s in ("all", 35, 16, 8, 5)}
     out = additions(**base_kwargs(ag_news=ds_from(values, jev_acc=90.0)))["ag_news"]
     assert out["status"] == "run"
     assert out["s_star"] == 5
     assert out["s_j"] == "none"
-    assert out["bin_differs"] is False
+    assert out["row_differs"] is False
     assert out["jev_acc"] == 90.0
     assert out["texts"] == []
 
 
-def test_ag_news_different_bin_says_the_result_does_not_carry():
+def test_ag_news_different_row_says_the_result_does_not_carry():
     # AG News s*=none, s_J=none is row 5; Banking is row 3.
     out = additions(**base_kwargs(ag_news=ds_from({}, jev_acc=90.0)))["ag_news"]
-    assert out["bin_differs"] is True
+    assert out["row_differs"] is True
     assert out["texts"] == [CARRY]
+
+
+def test_ag_news_row_differs_when_only_s_j_differs():
+    # Banking: (8, none) is row 3. AG News: (8, 1) is row 2. s* is the same, so a reading of "bin"
+    # that looked at s* alone would say nothing here.
+    values = {s: PASS_LR for s in ("all", 35, 16, 8)}
+    values[1] = PASS_JEV
+    out = additions(**base_kwargs(ag_news=ds_from(values, jev_acc=90.0)))["ag_news"]
+    assert out["s_star"] == 8
+    assert out["s_j"] == 1
+    assert out["row_differs"] is True
+    assert out["texts"] == [CARRY]
+
+
+def test_ag_news_same_row_when_s_star_differs_only_within_the_row():
+    # Banking: (none, 1) and AG News: (35, 2) are both row 5, so nothing prints.
+    values = {s: PASS_LR for s in ("all", 35)}
+    values[1] = PASS_JEV
+    values[2] = PASS_JEV
+    out = additions(**base_kwargs(banking_s_star="none", banking_s_j=1, ag_news=ds_from(values, jev_acc=90.0)))["ag_news"]
+    assert (out["s_star"], out["s_j"]) == (35, 2)
+    assert out["row_differs"] is False
+    assert out["texts"] == []
 
 
 @pytest.mark.parametrize("jev_acc,capped", [(96.0, True), (97.3, True), (95.99, False)])
 def test_ag_news_ceiling_at_96_or_higher(jev_acc, capped):
     out = additions(**base_kwargs(banking_s_star="none", ag_news=ds_from({}, jev_acc=jev_acc)))["ag_news"]
-    assert out["bin_differs"] is False
+    assert out["row_differs"] is False
     assert out["texts"] == ([CEILING] if capped else [])
 
 
@@ -376,5 +460,5 @@ def test_prediction_on_record_is_true_iff_s_star_is_8_or_lower(s_star, expected)
 def test_additions_never_touch_the_verdict():
     # Same s*, s_J with and without arms that match: the verdict function has no arm input at all,
     # and additions do not return a verdict.
-    out = additions(**base_kwargs(his_claim_arms={"NLI": tied(60), "embeddings": None, "small LLM": None}))
+    out = additions(**base_kwargs(his_claim_arms={"NLI": tied(60), "embedding similarity": None, "small LLM": None}))
     assert "verdict" not in out
