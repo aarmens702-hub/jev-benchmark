@@ -5,9 +5,11 @@ Tests marked `data` fetch the two named TRAIN parquet files from Hugging Face (o
 use small synthetic frames and the committed label files, so they run offline.
 """
 import hashlib
+import re
 import unicodedata
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -110,6 +112,16 @@ def test_bank_uses_what_a_small_class_has():
     assert b.groupby("label").size().to_dict() == {"c0": 35, "c1": 35, "c2": len(pool[pool.label == "c2"])}
 
 
+def test_bank_accepts_numpy_integers_for_s():
+    sp = data._split(synthetic(per_class=80), lambda n_c: 10)
+    want = bank(sp.pool, 2, 8)
+    for s in (np.int64(8), np.int32(8), np.uint8(8)):
+        assert list(bank(sp.pool, 2, s).row_id) == list(want.row_id)
+    for bad in (True, np.bool_(True), 2.5, np.float64(8.0), 0, np.int64(0), "7"):
+        with pytest.raises(ValueError):
+            bank(sp.pool, 2, bad)
+
+
 def test_all_adds_validation_rows_back_on_toy_data():
     sp = data._split(synthetic(per_class=80), lambda n_c: 10)
     b = bank(sp.pool, 0, "all", val=sp.val)
@@ -143,12 +155,37 @@ def test_label_files_offline_shape():
         label_texts("imdb", bare=True)
 
 
+def test_ag_news_descriptions_are_the_full_written_text_with_no_stray_keys():
+    # The file is a YAML flow mapping, which would cut each description at its first comma.
+    assert label_texts("ag_news", bare=False) == {
+        "World": "world news, international affairs, politics and conflicts",
+        "Sports": "sports, games, athletes and competitions",
+        "Business": "business, companies, markets and the economy",
+        "Sci/Tech": "science and technology, computers, internet and research",
+    }
+    assert question("ag_news") == "What is this news article mainly about?"
+    assert list(label_texts("ag_news", bare=True).items()) == [(k, k) for k in ["World", "Sports", "Business", "Sci/Tech"]]
+
+
+def test_banking77_descriptions_have_no_truncation_or_stray_keys():
+    import json
+
+    blob = json.loads((REPO / "third_party" / "banking77" / "banking77_intents.v1.json").read_text(encoding="utf-8"))
+    got = label_texts("banking77", bare=False)
+    assert got == blob["descriptions"] and len(got) == 77  # returned exactly as written in the file
+    assert all(isinstance(v, str) and v.strip() and v.strip() == v for v in got.values())
+    assert all(re.fullmatch(r"[a-z0-9_?]+", k, re.I) for k in got)  # names only, no stray keys
+    assert all(v[-1].isalnum() or v[-1] in ".?)" for v in got.values())  # no text cut off mid-string by a parser
+    assert got["activate_my_card"] == "The customer wants to activate a new card or asks how to activate it"
+
+
 def test_third_party_notice_credits_both_repos():
     notice = (REPO / "third_party" / "NOTICE.md").read_text()
     for needle in [
         "Madheshvivekanandan/jev-vs-cosine", "911e91b1093622c605c10067b960c0aff660fc1d", "banking77_intents.v1.json",
         "zhuyansen/jev-zeroshot-vs-bert", "edbf0713583644bd3f47299fd6b104a8b2073219", "agnews.yaml", "MIT License",
         "Madhesh Vivekanandan", "Jason Zhu",
+        "Read as the literal text in the file, because a YAML flow mapping would cut each description at its first comma.",
     ]:
         assert needle in notice, needle
 
@@ -247,3 +284,12 @@ def test_label_files_match_dataset_labels_for_both_datasets_and_bare_names():
             assert len(label_texts(dataset, bare=bare)) == len(names)
         assert set(label_texts(dataset, bare=True).values()) == set(names)  # bare text is the official name
         assert all(label_texts(dataset, bare=False)[n] != n for n in names)  # descriptions differ from names
+
+
+@pytest.mark.data
+def test_known_rows_map_to_label_names():
+    """Pins ids to names, so an off-by-one in label mapping shows up as a failure here."""
+    banking = load_train("banking77").set_index("row_id")
+    assert banking.loc["banking77:train:0", "label"] == "card_arrival"
+    assert data.label_names("banking77")[0] == "activate_my_card"
+    assert load_train("ag_news").set_index("row_id").loc["ag_news:train:0", "label"] == "Business"
