@@ -8,6 +8,7 @@ import hashlib
 import unicodedata
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -108,6 +109,16 @@ def test_bank_uses_what_a_small_class_has():
     pool = pool[~((pool.label == "c2") & (pool.row_id.map(lambda r: int(r.split(":")[-1])) % 60 >= 4))]
     b = bank(pool, 0, 35)
     assert b.groupby("label").size().to_dict() == {"c0": 35, "c1": 35, "c2": len(pool[pool.label == "c2"])}
+
+
+def test_bank_accepts_numpy_integers_for_s():
+    sp = data._split(synthetic(per_class=80), lambda n_c: 10)
+    want = bank(sp.pool, 2, 8)
+    for s in (np.int64(8), np.int32(8), np.uint8(8)):
+        assert list(bank(sp.pool, 2, s).row_id) == list(want.row_id)
+    for bad in (True, np.bool_(True), 2.5, np.float64(8.0), 0, np.int64(0), "7"):
+        with pytest.raises(ValueError):
+            bank(sp.pool, 2, bad)
 
 
 def test_all_adds_validation_rows_back_on_toy_data():
@@ -247,3 +258,12 @@ def test_label_files_match_dataset_labels_for_both_datasets_and_bare_names():
             assert len(label_texts(dataset, bare=bare)) == len(names)
         assert set(label_texts(dataset, bare=True).values()) == set(names)  # bare text is the official name
         assert all(label_texts(dataset, bare=False)[n] != n for n in names)  # descriptions differ from names
+
+
+@pytest.mark.data
+def test_known_rows_map_to_label_names():
+    """Pins ids to names, so an off-by-one in label mapping shows up as a failure here."""
+    banking = load_train("banking77").set_index("row_id")
+    assert banking.loc["banking77:train:0", "label"] == "card_arrival"
+    assert data.label_names("banking77")[0] == "activate_my_card"
+    assert load_train("ag_news").set_index("row_id").loc["ag_news:train:0", "label"] == "Business"

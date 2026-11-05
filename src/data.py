@@ -8,6 +8,7 @@ import json
 import unicodedata
 from typing import Callable, Literal, NamedTuple
 
+import numpy as np
 import pandas as pd
 
 SEED = 20261105
@@ -122,6 +123,8 @@ def bank(pool: pd.DataFrame, draw: int, s: int | Literal["all"], val: pd.DataFra
         return _ordered(pd.concat([pool, val], ignore_index=True), lambda n: bank_key(draw, n)).sort_values(
             "label", kind="stable"
         ).reset_index(drop=True)
+    if isinstance(s, (int, np.integer)) and not isinstance(s, bool):
+        s = int(s)  # numpy integers (from grids built with numpy) are fine
     if not isinstance(s, int) or isinstance(s, bool) or s < 1:
         raise ValueError(f"s must be a positive int or 'all', got {s!r}")
     ordered = _ordered(pool, lambda n: bank_key(draw, n))
