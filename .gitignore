@@ -5,3 +5,7 @@ data/
 runs/
 .pytest_cache/
 .DS_Store
+.env
+.env.*
+.ruff_cache/
+*.egg-info/

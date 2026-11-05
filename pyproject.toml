@@ -1,0 +1,43 @@
+[project]
+name = "jev-benchmark"
+version = "0.1.0"
+description = "Pre-registered benchmark of Jev against cheap baselines"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "scikit-learn",
+    "rank-bm25",
+    "sentence-transformers",
+    "transformers",
+    "torch",
+    "huggingface_hub",
+    "httpx",
+    "pyyaml",
+    "matplotlib",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-timeout",
+    "pytest-socket",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+timeout = 60
+# Default run: no network, and the opt-in `data` tests are deselected.
+# Run them with: uv run pytest -m data  (a later -m overrides the one here).
+addopts = "-m 'not data' --disable-socket"
+# pytest-socket warns on every block; the tests that expect a block assert the error itself.
+filterwarnings = ["ignore:A test tried to use socket:UserWarning"]
+markers = [
+    "data: opt-in test that may reach Hugging Face hosts only (fetches named train files); not run by default",
+]
