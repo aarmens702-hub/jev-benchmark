@@ -1,0 +1,26 @@
+{
+  "model": "openai/gpt-oss-20b",
+  "messages": [
+    {"role": "system", "content": "Which option best fits the text?"},
+    {"role": "user", "content": "Text: my card has not arrived\n\nOptions:\n1. lost_card\n2. card_arrival"}
+  ],
+  "max_tokens": 16,
+  "reasoning": {"effort": "none"},
+  "logprobs": true,
+  "temperature": 0,
+  "stream": false,
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "option_choice",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {"id": {"type": "integer", "enum": [1, 2]}},
+        "required": ["id"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "provider": {"only": ["Darkbloom"], "allow_fallbacks": false, "require_parameters": true}
+}

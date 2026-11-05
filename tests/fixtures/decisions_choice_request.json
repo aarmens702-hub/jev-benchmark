@@ -1,0 +1,16 @@
+{
+  "model": "typesafe/jev-1.14",
+  "state": "my card has not arrived",
+  "questions": {
+    "label": {
+      "type": "choice",
+      "instructions": "Which option best fits the text?",
+      "criteria": {
+        "card_arrival": "The customer is waiting for a card.",
+        "lost_card": "The customer has lost a card.",
+        "top_up_failed": null
+      }
+    }
+  },
+  "provider": {"only": ["TypeSafe"], "allow_fallbacks": false, "require_parameters": true}
+}
