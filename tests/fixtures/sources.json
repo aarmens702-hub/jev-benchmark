@@ -1,0 +1,47 @@
+{
+  "read_on": "2026-11-04",
+  "method": "Plain unauthenticated reads of public docs. Values in the fixtures are our own; only the shapes follow the docs.",
+  "fixtures": {
+    "decisions_choice_request.json": {
+      "url": "https://openrouter.ai/docs/api/api-reference/alphadecisions/submit-a-decisions-request.md",
+      "also": ["https://docs.typesafe.ai/api.md", "https://openrouter.ai/docs/guides/community/jev.md"],
+      "basis": "DecisionsRequest and DecisionsChoiceQuestion schemas. A null criterion means a bare name (TypeSafe: a choice without a description is read by its name alone)."
+    },
+    "decisions_choice_response.json": {
+      "url": "https://openrouter.ai/docs/api/api-reference/alphadecisions/submit-a-decisions-request.md",
+      "also": ["https://docs.typesafe.ai/api.md"],
+      "basis": "DecisionsResponse and DecisionsChoiceAnswer schemas plus the documented 200 example. The build string is DESIGN.md's, not from the docs."
+    },
+    "decisions_refusal_response.json": {
+      "url": "https://openrouter.ai/docs/api/api-reference/alphadecisions/submit-a-decisions-request.md",
+      "basis": "DecisionsRefusalAnswer schema."
+    },
+    "error_402.json": {
+      "url": "https://openrouter.ai/docs/api/api-reference/alphadecisions/submit-a-decisions-request.md",
+      "basis": "PaymentRequiredResponse schema."
+    },
+    "error_402_in_flight.json": {
+      "url": "https://openrouter.ai/docs/api/reference/limits.md",
+      "basis": "In-flight spending budget section: this 402 is documented as transient."
+    },
+    "chat_logprobs_request.json": {
+      "url": "https://openrouter.ai/docs/api/api-reference/chat/create-a-chat-completion.md",
+      "also": [
+        "https://openrouter.ai/docs/guides/routing/provider-selection.md",
+        "https://openrouter.ai/docs/guides/features/structured-outputs.md",
+        "https://openrouter.ai/docs/guides/best-practices/reasoning-tokens.md",
+        "https://openrouter.ai/docs/api/reference/parameters.md"
+      ],
+      "basis": "ChatRequest schema; provider.only, allow_fallbacks and require_parameters; reasoning.effort none is documented as disabling reasoning. logprobs has no standalone guide page (https://openrouter.ai/docs/guides/features/logprobs.md is a 404)."
+    },
+    "chat_logprobs_response.json": {
+      "url": "https://openrouter.ai/docs/api/api-reference/chat/create-a-chat-completion.md",
+      "basis": "Built from the ChatResult, ChatChoice, ChatTokenLogprobs and ChatUsage schemas. The docs show no example of logprobs under a json_schema response. A top-level provider field is not in the ChatResult schema."
+    },
+    "key_response.json": {
+      "url": "https://openrouter.ai/docs/api/api-reference/api-keys/get-current-api-key.md",
+      "also": ["https://openrouter.ai/docs/api/reference/limits.md"],
+      "basis": "GET /api/v1/key: data.usage is credits used, all time."
+    }
+  }
+}

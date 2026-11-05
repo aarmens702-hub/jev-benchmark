@@ -1,0 +1,32 @@
+{
+  "id": "gen-fixture",
+  "object": "chat.completion",
+  "created": 1793750400,
+  "model": "openai/gpt-oss-20b",
+  "provider": "Darkbloom",
+  "system_fingerprint": null,
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "stop",
+      "message": {"role": "assistant", "content": "{\"id\":2}"},
+      "logprobs": {
+        "content": [
+          {"token": "{\"", "logprob": -0.001, "bytes": null, "top_logprobs": []},
+          {"token": "id", "logprob": -0.001, "bytes": null, "top_logprobs": []},
+          {"token": "\":", "logprob": -0.001, "bytes": null, "top_logprobs": []},
+          {"token": "2", "logprob": -0.25, "bytes": null, "top_logprobs": []},
+          {"token": "}", "logprob": -0.001, "bytes": null, "top_logprobs": []}
+        ],
+        "refusal": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 1200,
+    "completion_tokens": 5,
+    "total_tokens": 1205,
+    "cost": 0.00003,
+    "completion_tokens_details": {"reasoning_tokens": 0}
+  }
+}
