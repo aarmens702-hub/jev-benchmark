@@ -68,11 +68,14 @@ CANDIDATES = (
 )
 # Candidates that fail on their own account; anything else that stops a run ends Stage 0.
 CANDIDATE_STOPS = {"ArmNotRun", "HiddenReasoning", "ConsecutiveFailures"}
+# 20.7 pairs/s is a real measurement: Task 4 Step 5, 2026-11-04, deberta-v3-large, batch 16, 5,000 validation pairs.
 NLI = {
     "model": "MoritzLaurer/deberta-v3-large-zeroshot-v2.0-c",
     "revision": "b2730f16019076bb0009481121efbe4705e0e378",
     "pairs_per_second": 20.7,
+    "source": "Task 4 Step 5, 2026-11-04: batch 16, 5,000 validation pairs",
 }
+RATE_CHECK_EVERY = 100
 USAGE_WAIT_SECONDS = 120
 USAGE_POLL_SECONDS = 3
 EXIT_OK, EXIT_FAIL, EXIT_STOPPED = 0, 1, 2
@@ -183,6 +186,7 @@ class Stage0:
         self.usage: fields.UsageCheck | None = None
         self.candidates: dict = {}
         self.selected: dict | None = None
+        self.selection_decided = False
         self.est_jev = FIRST_CONTACT_JEV_USD
         self.spent_before = 0.0
         self.ledger = None
@@ -215,18 +219,35 @@ class Stage0:
         if problems:
             raise Stage0Stop(step, "an answer shape differs from the expected fixture: " + "; ".join(problems[:6]), ask=True)
 
-    def run(self, handle, step, name, rows, decide, expected, *, allowed=0, row_id=lambda r: r["row_id"], first_contact=False):
+    def run(self, handle, step, name, rows, decide, expected, *, allowed=0, row_id=lambda r: r["row_id"], first_contact=False,
+            check_rate=False):
         self.fits(handle, step, len(rows), expected)
         results = self.private / f"{name}.jsonl"
+        kwargs = dict(client=handle.client, results_path=results, expected_per_row=expected, row_id=row_id, allowed_arm_not_run=allowed)
         if first_contact and rows:
-            first = run_arm(rows[:1], decide, client=handle.client, results_path=results, expected_per_row=expected,
-                            row_id=row_id, allowed_arm_not_run=allowed)
+            first = run_arm(rows[:1], decide, **kwargs)
             self.gate(step)
             if first.status in ("stopped", "refused") and first.stop_type not in CANDIDATE_STOPS:
                 return first
-        report = run_arm(rows, decide, client=handle.client, results_path=results, expected_per_row=expected,
-                         row_id=row_id, allowed_arm_not_run=allowed)
-        self.gate(step)
+        if not check_rate:
+            report = run_arm(rows, decide, **kwargs)
+            self.gate(step)
+            return report
+        # Failure rate is checked after every 100 rows, so a bad arm stops early instead of at the end.
+        merged: dict = {}
+        report = None
+        for start in range(0, len(rows), RATE_CHECK_EVERY):
+            report = run_arm(rows[start:start + RATE_CHECK_EVERY], decide, **kwargs)
+            self.gate(step)
+            merged.update(report.decisions)
+            if report.status != "complete":
+                break
+            failed = sum(1 for d in merged.values() if d.failed)
+            if failed / len(merged) > FAILURE_RATE_LIMIT:
+                self.step(step, "FAIL", f"{failed} of {len(merged)} failed so far, above 1%")
+                raise Stage0Stop(step, f"failures are {failed} of {len(merged)} rows so far, above 1%. Stopped early. Pause and log.")
+        if report is not None:
+            report.decisions = merged
         return report
 
     def timed(self, step: str, fn):
@@ -293,7 +314,7 @@ class Stage0:
             raise Stage0Stop(step, f"OpenRouter's key usage did not rise to match {_money(self.usage.ledger_spend)} of Jev spend within "
                              f"{USAGE_WAIT_SECONDS} s (fields 13, 15, 16). Every paid Jev run would stop on a reconciliation gap: stop and ask.", ask=True)
         self.step("1c key usage", "PASS", f"spend showed in key usage after {self.usage.seconds:.0f} s")
-        self.bare_check(handle)
+        self.bare_check()
 
     def measure_usage(self, handle) -> fields.UsageCheck:
         spend = handle.client.ledger.confirmed() - handle.base_confirmed
@@ -310,7 +331,7 @@ class Stage0:
                 return fields.UsageCheck(None, spend, reported)
             self.rt.sleep(USAGE_POLL_SECONDS)
 
-    def bare_check(self, handle) -> None:
+    def bare_check(self) -> None:
         step = "1b bare-name schema check"
         rows = sample_rows(self.validation("banking77"), BARE_ROWS, "stage0:bare:")
         self.obs.phase = "bare"
@@ -319,9 +340,14 @@ class Stage0:
                           self.jev_decider(handle, step, "banking77", bare=True, cache=False), self.est_jev)
         summary = summarize(report.decisions)
         self.facts["bare"] = summary
-        if report.status != "complete" or summary["failed"]:
-            self.step(step, "FAIL", f"{summary['failed']} of {summary['rows']} rows failed; {report.stop_type or ''}")
-            raise Stage0Stop(step, "Jev did not accept bare names (null criteria). Fix with a logged bug fix, then rerun.")
+        if report.status != "complete":
+            self.step(step, "FAIL", f"{report.stop_type}: {report.reason}")
+            self.stop_if_stopped(step, report)
+        if summary["failed"]:
+            # Bare names are not accepted: the bare-name runs are not run, and Stage 0 goes on.
+            self.facts["bare_not_run"] = True
+            self.step(step, "NOT RUN", f"{summary['failed']} of {summary['rows']} rows failed; the Jev bare-name runs are not run")
+            return
         self.step(step, "PASS", f"{summary['rows']} rows")
 
     def selection(self) -> None:
@@ -330,6 +356,7 @@ class Stage0:
         options = label_texts("banking77", bare=False)
         instructions = prompts.small_llm_instructions("banking77")
         self.obs.phase = "selection"
+        self.selection_decided = False
         for model, provider, price, first_cost in CANDIDATES:
             handle = self.new_client(step)
 
@@ -341,7 +368,9 @@ class Stage0:
                               allowed=len(rows) - SELECT_PASS, first_contact=True)
             summary = summarize(report.decisions)
             valid = summary["rows"] - summary["failed"]
-            entry = {"requested": model, "provider": provider, "price": price, "valid": valid, "of": len(rows),
+            outage = report.stop_type == "ConsecutiveFailures" and bool(summary["reasons"]) and all(
+                r in ("network", "usage_unavailable") or r.startswith("http_") for r in summary["reasons"])
+            entry = {"outage": outage, "requested": model, "provider": provider, "price": price, "valid": valid, "of": len(rows),
                      "summary": summary, "stop": report.stop_type, "passed": False}
             self.candidates[model] = entry
             if report.status != "complete" and report.stop_type not in CANDIDATE_STOPS:
@@ -353,8 +382,10 @@ class Stage0:
                 models = sorted({d.model for d in report.decisions.values() if not d.failed})
                 entry["reply_models"] = models
                 self.selected = entry
+                self.selection_decided = True
                 self.step(step, "PASS", f"{model} on {provider}: {valid} of {len(rows)} usable")
                 return
+        self.selection_decided = True
         tried = ", ".join(f"{m}: {c['valid']} of {c['of']}" for m, c in self.candidates.items())
         self.step(step, "NOT RUN", f"no candidate reached {SELECT_PASS} of {SELECT_ROWS} ({tried}); the small LLM arm is marked not run")
 
@@ -365,7 +396,8 @@ class Stage0:
             handle = self.new_client(label)
             self.obs.phase = "full"
             expected = self.est_jev
-            report = self.run(handle, label, f"jev_{dataset}_val", rows, self.jev_decider(handle, label, dataset), expected)
+            report = self.run(handle, label, f"jev_{dataset}_val", rows, self.jev_decider(handle, label, dataset), expected,
+                              first_contact=True, check_rate=True)
             if report.status != "complete":
                 self.step(label, "FAIL", f"{report.stop_type}: {report.reason}")
                 self.stop_if_stopped(label, report)
@@ -398,7 +430,7 @@ class Stage0:
         handle = self.new_client(step)
         self.obs.phase = "repeat"
         decide = self.jev_decider(handle, step, "banking77", cache=False)
-        report = self.run(handle, step, "jev_banking77_repeat", rows, decide, self.est_jev, row_id=lambda r: r["key"])
+        report = self.run(handle, step, "jev_banking77_repeat", rows, decide, self.est_jev, row_id=lambda r: r["key"], check_rate=True)
         summary = summarize(report.decisions)
         stats = repeat_stats(report.decisions)
         self.facts["repeat"] = {**summary, **stats}
@@ -516,7 +548,7 @@ def _pct(x) -> str:
 
 def frozen_values(st: Stage0, stop) -> dict:
     selected = st.selected
-    llm = {"status": "not run"}
+    llm = {"status": "not run" if st.selection_decided else "pending"}  # pending: Stage 0 stopped before selection decided
     if selected is not None:
         llm = {
             "status": "selected",
@@ -530,6 +562,7 @@ def frozen_values(st: Stage0, stop) -> dict:
     models = st.facts.get("jev_models", [])
     return {
         "stage0_complete": stop is None,
+        # The frozen build is the expected constant; field 1 and the model-change stop enforce that replies match it.
         "jev": {"request_model": JEV_MODEL, "provider": JEV_PROVIDER, "build": EXPECTED_JEV_BUILD, "reply_models_seen": models},
         "small_llm": llm,
         "nli": dict(NLI),
@@ -596,7 +629,7 @@ def render_report(st: Stage0, stop, projection) -> str:
         s = c["summary"]
         out.append(f"- {model} on {c['provider']}: {c['valid']} of {c['of']} usable ({'PASS' if c['passed'] else 'FAIL'}); "
                    f"failures {s['failed']}; mean output tokens {_num(s['mean_out'], 1)}; cost {_money(s['cost'])}"
-                   + (f"; stopped on {c['stop']}" if c["stop"] else ""))
+                   + ("; stopped by an outage, not judged on its answers" if c.get("outage") else f"; stopped on {c['stop']}" if c["stop"] else ""))
     if st.selected:
         out.append(f"- Selected: {st.selected['requested']} on {st.selected['provider']}")
     elif st.candidates:

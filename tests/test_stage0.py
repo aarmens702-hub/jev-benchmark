@@ -43,11 +43,11 @@ class FakeApi:
     """A transport that answers like the documented API, with knobs for each failure the runner must catch."""
 
     def __init__(self, *, accuracy=0.9, cost=0.0001, llm_cost=0.00003, top=None, llm_misses=None, flip_rows=(), jev_model=jev_client.JEV_MODEL + "-20261014",
-                 mutate_jev=None, bad_fraction=0.0, reject_null=False, ok_models=("openai/gpt-oss-20b", "z-ai/glm-5.3-flash")):
+                 mutate_jev=None, bad_fraction=0.0, bad_after=0, reject_null=False, ok_models=("openai/gpt-oss-20b", "z-ai/glm-5.3-flash")):
         self.accuracy, self.cost, self.llm_cost, self.top = accuracy, cost, llm_cost, top
         self.llm_misses = llm_misses or {}  # model -> set of texts that come back without logprobs; "all" for every row
         self.flip_rows, self.jev_model, self.mutate_jev = set(flip_rows), jev_model, mutate_jev
-        self.bad_fraction, self.reject_null, self.ok_models = bad_fraction, reject_null, ok_models
+        self.bad_fraction, self.bad_after, self.reject_null, self.ok_models = bad_fraction, bad_after, reject_null, ok_models
         self.gold = {}
         self.calls = []
         self.seen = {}
@@ -72,8 +72,8 @@ class FakeApi:
         criteria = list(body["questions"]["label"]["criteria"])
         if self.reject_null and any(v is None for v in body["questions"]["label"]["criteria"].values()):
             return TransportResponse(400, {}, b"{}")
-        if self.bad_fraction and h("bad" + text) % 100 < self.bad_fraction * 100:
-            return TransportResponse(200, {}, b"{}")
+        if self.bad_fraction and len(self.calls) > self.bad_after and h("bad" + text) % 100 < self.bad_fraction * 100:
+            return TransportResponse(400, {}, b"{}")
         gold = self.gold.get(text.split(" sample")[0] and text, None)
         right = h("acc" + text) % 1000 < self.accuracy * 1000
         wrong = next(label for label in criteria if label != gold)
@@ -254,7 +254,8 @@ def test_frozen_yaml_records_the_selections(happy):
     assert frozen["small_llm"]["provider_options"] == {"only": ["Darkbloom"], "allow_fallbacks": False, "require_parameters": True}
     assert frozen["small_llm"]["reply_model_suffix_pattern"] == r"(?:-\d{8})?"
     assert frozen["nli"] == {"model": "MoritzLaurer/deberta-v3-large-zeroshot-v2.0-c", "revision": "b2730f16019076bb0009481121efbe4705e0e378",
-                             "pairs_per_second": 20.7}
+                             "pairs_per_second": 20.7,
+                             "source": "Task 4 Step 5, 2026-11-04: batch 16, 5,000 validation pairs"}
     assert frozen["stage0_complete"] is True
 
 
@@ -436,9 +437,18 @@ def test_bug_floor_fail_stops_and_prints_only_fail(tmp_path, capsys):
     assert "accuracy" not in report.lower()
 
 
-def test_bare_names_rejected_stops_with_a_message(tmp_path):
-    code, report, _, _, _ = run(tmp_path, FakeApi(reject_null=True))
-    assert code == stage0.EXIT_STOPPED and "bare names" in report
+def test_bare_names_rejected_marks_bare_runs_not_run_and_continues(tmp_path):
+    code, report, stage, _, _ = run(tmp_path, FakeApi(reject_null=True))
+    names = [n for n, _, _ in stage.steps]
+    assert ("1b bare-name schema check", "NOT RUN") in [(n, s) for n, s, _ in stage.steps]
+    assert "5 Jev + examples smoke" in names and "the Jev bare-name runs are not run" in report
+    assert {f.number: f.status for f in stage.findings}[18] == fields.UNCONFIRMED
+
+
+def test_bare_check_takes_no_client_argument():
+    import inspect
+
+    assert list(inspect.signature(Stage0.bare_check).parameters) == ["self"]
 
 
 # ------------------------------------------------------------------ selection
@@ -709,3 +719,82 @@ def test_one_client_per_step_and_none_shared_across_arms(tmp_path):
     assert stage.run_all() == stage0.EXIT_OK
     # smoke, bare check, gpt-oss selection, B77 validation, AG validation, repeatability, examples
     assert len(made) == 7 and len({id(c) for c in made}) == 7
+
+
+def finding_map(stage):
+    return {f.number: f for f in stage.findings}
+
+
+def test_field_7_is_unconfirmed_when_a_reply_has_no_provider(tmp_path):
+    _, _, stage, _, _ = run(tmp_path, FakeApi(mutate_jev=lambda p: p.pop("provider")))
+    assert finding_map(stage)[7].status == fields.UNCONFIRMED
+
+
+def test_field_7_is_confirmed_only_when_every_reply_names_the_pin(happy):
+    _, _, stage, _, _ = happy
+    assert finding_map(stage)[7].status == fields.CONFIRMED
+
+
+def test_field_7_is_a_mismatch_for_another_provider():
+    obs = fields.Observations()
+    for surface, provider, pin in (("jev", "TypeSafe", "TypeSafe"), ("chat", "SomeoneElse", "Darkbloom")):
+        obs.add(fields.Obs(surface=surface, phase="x", status=200, provider=provider, provider_only=(pin,), allow_fallbacks=False,
+                           ok_shape=True, model="m", cost=0.1))
+    assert {f.number: f for f in fields.evaluate(obs, None, {})}[7].status == fields.MISMATCH
+
+
+def test_request_side_fields_say_so(happy):
+    _, _, stage, _, _ = happy
+    for n in (6, 9, 17, 18):
+        assert "request-side plus HTTP 200 only" in finding_map(stage)[n].note
+
+
+def test_frozen_small_llm_is_pending_when_stage0_stopped_before_selection(tmp_path):
+    code, _, stage, _, _ = run(tmp_path, FakeApi(mutate_jev=lambda p: p["usage"].pop("input_tokens")))
+    frozen = yaml.safe_load((Path(stage.rt.report_dir) / "frozen.yaml").read_text())
+    assert code == stage0.EXIT_STOPPED and frozen["small_llm"] == {"status": "pending"}
+
+
+def test_frozen_small_llm_is_pending_when_stopped_mid_selection(tmp_path):
+    api = FakeApi()
+    real = api.llm
+    api.llm = lambda body: TransportResponse(200, {}, json.dumps({**json.loads(real(body).body), "choices": []}).encode())
+    _, _, stage, _, _ = run(tmp_path, api)
+    frozen = yaml.safe_load((Path(stage.rt.report_dir) / "frozen.yaml").read_text())
+    assert frozen["small_llm"] == {"status": "pending"}
+
+
+def test_a_shape_difference_on_ag_news_stops_after_one_row(tmp_path):
+    def mutate(payload):
+        if len(payload["answers"]["label"]["probabilities"]) == 4:
+            payload["usage"].pop("output_tokens")
+
+    code, report, _, api, _ = run(tmp_path, FakeApi(mutate_jev=mutate))
+    four = [b for u, b in api.calls if u.endswith("decisions") and len(b["questions"]["label"]["criteria"]) == 4]
+    assert code == stage0.EXIT_STOPPED and "usage.output_tokens" in report
+    assert 1 <= len(four) <= 4
+
+
+def test_failure_rate_is_checked_every_100_rows_and_stops_early(tmp_path):
+    api = FakeApi(bad_fraction=0.06, bad_after=40)
+    code, report, stage, _, _ = run(tmp_path, api)
+    assert code == stage0.EXIT_STOPPED and "so far, above 1%" in report
+    banking_texts = {b["state"] for u, b in api.calls if u.endswith("decisions") and isinstance(b["state"], str)}
+    assert "3b Jev AG News validation" not in [n for n, _, _ in stage.steps]
+    assert len(banking_texts) < 20 + 3 + 231 + 100  # stopped within the first 100-row chunk after smoke, not at the end
+
+
+def test_an_outage_stop_on_a_candidate_is_reported_as_an_outage(tmp_path):
+    api = FakeApi()
+    real = api.llm
+    api.llm = lambda body: TransportResponse(500, {}, b"{}") if body["model"].startswith("openai") else real(body)
+    _, report, stage, _, _ = run(tmp_path, api)
+    assert stage.candidates["openai/gpt-oss-20b"]["outage"] is True
+    assert "stopped by an outage" in report
+    assert stage.selected["requested"] == "z-ai/glm-5.3-flash"
+
+
+def test_frozen_nli_records_where_the_rate_was_measured(happy):
+    _, _, stage, _, _ = happy
+    frozen = yaml.safe_load((Path(stage.rt.report_dir) / "frozen.yaml").read_text())
+    assert frozen["nli"]["pairs_per_second"] == 20.7 and "Task 4 Step 5" in frozen["nli"]["source"]

@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 from jev_client import EXPECTED_JEV_BUILD, JEV_MAKER_PREFIX, QUESTION, ROUNDING_TOLERANCE, build_id
 from llm_client import MODEL_SUFFIX, reply_matches_request
-from openrouter import CHAT_URL, DECISIONS_URL, MalformedResponse, _is_number, safe_name
+from openrouter import CHAT_URL, DECISIONS_URL, MalformedResponse, _is_number, _squash, safe_name
 
 CONFIRMED, MISMATCH, UNCONFIRMED, NOT_TESTED = "confirmed", "mismatch", "unconfirmed", "not tested"
 
@@ -305,12 +305,20 @@ def evaluate(obs: Observations, usage: UsageCheck | None, candidates: dict) -> l
         None if costed else "no reply was seen")
     pinned = lambda o: bool(o.provider_only) and not o.allow_fallbacks  # noqa: E731
     both = bool(jev) and bool(chat)
-    yes(6, both and _all(jev + chat, pinned), "an unbilled rejection did not occur; both surfaces answered", "a surface did not answer under the pin",
+    yes(6, both and _all(jev + chat, pinned), "both surfaces answered HTTP 200 under the pin (request-side plus HTTP 200 only)", "a surface did not answer under the pin",
         None if both else "one surface was not reached")
     providers = {s: sorted({o.provider or "absent" for o in objs}) for s, objs in (("jev", jev), ("chat", chat))}
-    put(7, CONFIRMED if both else NOT_TESTED, f"provider on replies: {providers}")
+    echoed = lambda o: o.provider is not None and bool(o.provider_only) and _squash(o.provider) == _squash(o.provider_only[0])  # noqa: E731
+    if not both:
+        put(7, NOT_TESTED, "one surface was not reached")
+    elif all(o.provider is None for o in jev + chat) or any(o.provider is None for o in jev + chat):
+        put(7, UNCONFIRMED, f"provider missing on some replies, so the pin is not checked on the reply: {providers}")
+    elif _all(jev + chat, echoed):
+        put(7, CONFIRMED, f"every reply names the pinned provider: {providers}")
+    else:
+        put(7, MISMATCH, f"a reply names a provider other than the pin: {providers}")
     put(8, NOT_TESTED, "the docs are silent and a test needs extra paid calls; the order sent is shuffled per row")
-    yes(9, _all(jev, lambda o: o.require_parameters), "Jev answered with require_parameters true", "Jev rejected or was sent no pin", no_jev)
+    yes(9, _all(jev, lambda o: o.require_parameters), "Jev answered HTTP 200 with require_parameters true (request-side plus HTTP 200 only)", "Jev rejected or was sent no pin", no_jev)
     with_logprobs = [o for o in chat if o.has_logprobs]
     if with_logprobs:
         put(10, CONFIRMED, f"logprobs seen from: {sorted({o.request_model for o in with_logprobs})}")
@@ -339,9 +347,14 @@ def evaluate(obs: Observations, usage: UsageCheck | None, candidates: dict) -> l
         put(15, CONFIRMED if shows else MISMATCH, "Decisions spend appeared in key usage" if shows else "Decisions spend did not appear in key usage")
         put(16, CONFIRMED if shows else MISMATCH, f"{usage.seconds:.0f} s" if shows else "not seen within the wait")
     examples = [o for o in jev if o.phase == "examples"]
-    yes(17, _all(examples, lambda o: o.state_is_object), "accepted", "not accepted", None if examples else "the examples smoke did not run")
+    yes(17, _all(examples, lambda o: o.state_is_object), "accepted: HTTP 200 (request-side plus HTTP 200 only)", "not accepted", None if examples else "the examples smoke did not run")
     bare = [o for o in jev if o.phase == "bare"]
-    yes(18, _all(bare, lambda o: o.null_criteria), "accepted", "not accepted", None if bare else "the bare-name check did not run")
+    rejected_bare = [o for o in obs.select("jev", phase="bare") if o.status != 200]
+    if rejected_bare:
+        put(18, UNCONFIRMED, "null criteria rejected; the bare-name runs are not run")
+    else:
+        yes(18, _all(bare, lambda o: o.null_criteria), "accepted: HTTP 200 (request-side plus HTTP 200 only)", "not accepted",
+            None if bare else "the bare-name check did not run")
     wide = [o for o in jev if o.n_options >= 77]
     if wide:
         put(19, UNCONFIRMED, "77 accepted; 151 not tested, no 151-way task is in scope")
