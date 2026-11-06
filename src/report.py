@@ -80,7 +80,24 @@ def write_tables(results: dict, out_dir: Path) -> list:
         rows = [{"arm": arm, **vals, "flagged": flags.get(arm, False), "jev_flagged": flags.get("jev", False)} for arm, vals in adds["his_claim"].items()]
         _csv(rows, out_dir / "his_claim.csv")
         written.append("his_claim.csv")
+    rows = routing_rows(results.get("routing") or {})
+    if rows:
+        _csv(rows, out_dir / "routing.csv")
+        written.append("routing.csv")
     return written
+
+
+def routing_rows(res: dict) -> list:
+    """One row per routing arm and rule: accuracy and acc@80 on the routing sample, with the run's status."""
+    rows = []
+    for arm, by_rule in (res.get("accuracy") or {}).items():
+        if not isinstance(by_rule, dict):
+            rows.append({"arm": arm, "rule": None, "accuracy": None, "acc_at_80": None, "status": res.get("status"), "note": by_rule})
+            continue
+        for rule, vals in by_rule.items():
+            rows.append({"arm": arm, "rule": rule, "accuracy": vals.get("accuracy"), "acc_at_80": vals.get("acc@80"),
+                         "status": res.get("status"), "note": ""})  # fmt: skip
+    return rows
 
 
 def tick_labels(bank_sizes: dict, imbalanced: bool = False) -> tuple[list, list]:

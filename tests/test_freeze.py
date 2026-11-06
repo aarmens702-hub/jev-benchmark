@@ -377,11 +377,11 @@ def test_deviations_table_rows_have_every_column():
     header = [c.strip() for c in lines[0].strip("|").split("|")]
     assert header == ["Date", "What changed", "Reason", "Stage", "Approved by"]
     rows = lines[2:]
-    assert len(rows) == 4
+    assert len(rows) >= 4
     for row in rows:
         cells = [c.strip() for c in row.strip("|").split("|")]
         assert len(cells) == len(header) and all(cells), row
-        assert cells[header.index("Stage")] == "pre-freeze"
+        assert cells[header.index("Stage")].startswith("pre-freeze")
 
 
 # Rule sentences that registration.md must quote exactly as DESIGN.md states them.

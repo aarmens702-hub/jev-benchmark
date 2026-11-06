@@ -8,7 +8,7 @@
 
 card_ordering:
   topic: getting a card
-  examples: ordering, delivery, activation, expiry, spare, virtual or disposable cards, or which card types are offered
+  examples: ordering, delivery, activation, expiry, spare, virtual or disposable cards, or which cards and currencies are supported
   reason: Every name is about obtaining a card or which card products exist, before any problem with using one.
   intents:
     - activate_my_card
@@ -100,7 +100,7 @@ cash:
 
 payments:
   topic: card payments, charges, refunds and currency exchange
-  examples: card payment fees, pending or reverted card payments, a payment charged twice, extra charges on a statement, refunds, exchange rates and exchange charges, or supported currencies
+  examples: card payment fees, pending or reverted card payments, a duplicated payment, extra charges on a statement, refunds, exchange rates and exchange charges, or holding or exchanging currencies
   reason: Every name is about what a card payment cost, its status after it was made, refunds, or currency exchange.
   intents:
     - Refund_not_showing_up
