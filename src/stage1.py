@@ -242,10 +242,7 @@ def _test_text(dataset: str) -> pd.DataFrame:
     """The test text frame from the firewall; the gold frame is dropped here, unread. score.py loads gold itself."""
     import firewall
 
-    manifest = firewall.REPO_ROOT / "manifest.json"
-    if not manifest.is_file():
-        raise firewall.FirewallError("no manifest.json: the freeze has not happened")
-    texts, gold = firewall.load_test(dataset, firewall.freeze_token(manifest))
+    texts, gold = firewall.load_test(dataset, score.freeze_token())  # the token is computed in one place
     del gold
     return texts
 

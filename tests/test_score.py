@@ -770,3 +770,37 @@ def test_not_unique_to_jev_adds_the_correction():
     res = {"claims": ["Not unique to Jev"]}
     assert score.ROUTING_CORRECTION in score.corrections({}, res)
     assert score.ROUTING_CORRECTION not in score.corrections({}, {"claims": ["no new capability shown here"]})
+
+
+# --------------------------------------------------------------------------- the gold cache for a rescore
+
+
+def test_first_test_load_caches_gold_and_a_rescore_reads_it_without_the_firewall(tmp_path):
+    runs = tmp_path / "runs"
+    gold = make_fake_runs(runs, "stage1", gold_as_ids=True, int_ids=True)
+    text = pd.DataFrame({"row_id": gold["banking77"]["row_id"], "text": [f"t{i}" for i in gold["banking77"]["row_id"]]})
+    loads = []
+    load = lambda: loads.append(1) or (gold, CLASSES, text)  # noqa: E731
+    kw = dict(runs_root=runs, lock_path=tmp_path / "scored.lock", deviations_path=tmp_path / "deviations.md")
+    first = score.gold_for_test_stage("stage1", load=load, **kw)
+    assert loads == [1] and first[0]["banking77"].equals(gold["banking77"])
+    record = json.loads((runs / "stage1" / "test_record.json").read_text())
+    assert set(record["gold_cache"]) == {"banking77", "ag_news", "routing_text", "label_names"}
+    assert all(score.gold_cache_dir(runs, "stage1") in p.parents for p in (runs / "private").rglob("*.parquet") if "test_gold" in str(p))
+
+    # Scored once: the lock exists. Without a rescore row nothing is read; with one, the cache is used.
+    score.write_lock(tmp_path / "scored.lock", [], {"deviation_rows": 0})
+    write_deviations(tmp_path / "deviations.md", [])
+    no_firewall = lambda: (_ for _ in ()).throw(AssertionError("a rescore must not call the firewall"))  # noqa: E731
+    with pytest.raises(ScoreRefused, match="rescore"):
+        score.gold_for_test_stage("stage1", load=no_firewall, **kw)
+    write_deviations(tmp_path / "deviations.md", [("fix a scorer bug", "rescore")])
+    again, names, routing_text = score.gold_for_test_stage("stage1", load=no_firewall, **kw)
+    assert again["banking77"].equals(gold["banking77"]) and names == {d: list(c) for d, c in CLASSES.items()}
+    assert routing_text.equals(text)
+
+    # A cache that changed after the first load is refused.
+    path = score.gold_cache_dir(runs, "stage1") / "gold_ag_news.parquet"
+    gold["ag_news"].iloc[::-1].to_parquet(path, index=False)
+    with pytest.raises(ScoreRefused, match="does not match"):
+        score.gold_for_test_stage("stage1", load=no_firewall, **kw)

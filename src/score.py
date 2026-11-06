@@ -1126,19 +1126,98 @@ def _validation_text() -> pd.DataFrame:
     return data.split(data.load_train(ROUTING_DATASET), ROUTING_DATASET).val[["row_id", "text"]].reset_index(drop=True)
 
 
+def freeze_token() -> str:
+    """The token the firewall wants. The one place it is computed, for score.py and stage1.py.
+
+    TODO(merge): the freeze tooling adds firewall.freeze_token() with no arguments (SHA-256 of
+    `git show freeze-v1:manifest.json`); once it is in this branch, call it directly and drop the fallback.
+    """
+    import inspect
+
+    import firewall
+
+    if not inspect.signature(firewall.freeze_token).parameters:
+        return firewall.freeze_token()
+    return firewall.freeze_token(REPO / "manifest.json")
+
+
 def _test_gold() -> tuple[dict, dict, pd.DataFrame]:
     """The firewall's gold frames and label names, and Banking77's text for the routing sample (row order and
     state come from text alone). Other text frames are dropped unread."""
     import data
     import firewall
 
-    token = firewall.freeze_token(REPO / "manifest.json")
+    token = freeze_token()
     gold, names, routing_text = {}, {}, None
     for dataset in DATASETS:
         texts, gold[dataset] = firewall.load_test(dataset, token)
         if dataset == ROUTING_DATASET:
             routing_text = texts
         names[dataset] = data.label_names(dataset)
+    return gold, names, routing_text
+
+
+GOLD_CACHE_FILES = {"banking77": "gold_banking77.parquet", "ag_news": "gold_ag_news.parquet", "routing_text": "routing_text.parquet",
+                    "label_names": "label_names.json"}  # fmt: skip
+
+
+def gold_cache_dir(runs_root: Path, stage: str) -> Path:
+    """Gitignored (runs/private): test gold as first loaded, so a rescore never needs the firewall again."""
+    return Path(runs_root) / "private" / stage / "test_gold"
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def write_gold_cache(runs_root: Path, stage: str, gold: dict, names: dict, routing_text) -> None:
+    """Save the first load's gold, label names and routing text, and record each file's SHA-256 in
+    runs/<stage>/test_record.json. Everything goes under runs/, so the tree stays clean."""
+    folder = gold_cache_dir(runs_root, stage)
+    folder.mkdir(parents=True, exist_ok=True)
+    for dataset in DATASETS:
+        gold[dataset].to_parquet(folder / GOLD_CACHE_FILES[dataset], index=False)
+    if routing_text is not None:
+        routing_text[["row_id", "text"]].to_parquet(folder / GOLD_CACHE_FILES["routing_text"], index=False)
+    (folder / GOLD_CACHE_FILES["label_names"]).write_text(json.dumps({d: list(map(str, n)) for d, n in names.items()}))
+    hashes = {key: _sha256_file(folder / name) for key, name in GOLD_CACHE_FILES.items() if (folder / name).exists()}
+    record_path = Path(runs_root) / stage / "test_record.json"
+    record = json.loads(record_path.read_text()) if record_path.exists() else {}
+    record["gold_cache"] = hashes
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = record_path.with_name(record_path.name + ".tmp")
+    tmp.write_text(json.dumps(record, indent=1, sort_keys=True))
+    tmp.replace(record_path)
+
+
+def read_gold_cache(runs_root: Path, stage: str) -> tuple[dict, dict, Optional[pd.DataFrame]]:
+    """The cached first load, refused unless every file matches the SHA-256 recorded at that load."""
+    folder = gold_cache_dir(runs_root, stage)
+    record_path = Path(runs_root) / stage / "test_record.json"
+    hashes = json.loads(record_path.read_text()).get("gold_cache") if record_path.exists() else None
+    if not hashes:
+        raise ScoreRefused(f"a rescore reads the cached test gold, but {record_path.name} records no gold cache")
+    for key, digest in hashes.items():
+        path = folder / GOLD_CACHE_FILES[key]
+        if not path.exists() or _sha256_file(path) != digest:
+            raise ScoreRefused(f"the cached test gold {path.name} is missing or does not match its recorded SHA-256")
+    gold = {d: pd.read_parquet(folder / GOLD_CACHE_FILES[d]) for d in DATASETS}
+    names = json.loads((folder / GOLD_CACHE_FILES["label_names"]).read_text())
+    routing_text = pd.read_parquet(folder / GOLD_CACHE_FILES["routing_text"]) if "routing_text" in hashes else None
+    return gold, names, routing_text
+
+
+def gold_for_test_stage(stage: str, *, runs_root: Path, lock_path: Path, deviations_path: Path, load: Callable = None):
+    """Gold for the test stage. The first time, from the firewall, cached under runs/ with its hashes. A rescore
+    (the lock exists, and a deviations row with Stage "rescore" allows it) reads the cache and never calls the
+    firewall, since HEAD has moved past the freeze tag by then."""
+    if Path(lock_path).exists():
+        check_lock(lock_path, deviations_path)
+        return read_gold_cache(runs_root, stage)
+    gold, names, routing_text = (load or _test_gold)()
+    write_gold_cache(runs_root, stage, gold, names, routing_text)
     return gold, names, routing_text
 
 
@@ -1158,6 +1237,10 @@ def main(
     settings: Settings = RECORD,
     load_val_text: Optional[Callable[[], pd.DataFrame]] = None,
     validity_path: Path = VALIDITY_PATH,
+    load_test_gold: Optional[Callable] = None,
+    out_dir: Path = RESULTS,
+    lock_path: Path = LOCK,
+    deviations_path: Path = DEVIATIONS,
 ) -> int:
     p = argparse.ArgumentParser(prog="score", description="The one-shot scorer.")
     what = p.add_mutually_exclusive_group(required=True)
@@ -1176,9 +1259,11 @@ def main(
             return 1
         print("DRY RUN OK")
         return 0
-    gold, names, routing_text = _test_gold()
-    result = score(args.stage, gold, runs_root=runs_root, label_names=names, routing_text=routing_text, validity_path=validity_path)
-    print(f"scored {args.stage}: results in {RESULTS}, lock at {LOCK}")
+    gold, names, routing_text = gold_for_test_stage(args.stage, runs_root=runs_root, lock_path=lock_path, deviations_path=deviations_path,
+                                                    load=load_test_gold)  # fmt: skip
+    result = score(args.stage, gold, runs_root=runs_root, out_dir=out_dir, lock_path=lock_path, deviations_path=deviations_path,
+                   label_names=names, routing_text=routing_text, validity_path=validity_path)  # fmt: skip
+    print(f"scored {args.stage}: results in {out_dir}, lock at {lock_path}")
     print(result["headline"]["verdict"])
     return 0
 

@@ -470,15 +470,24 @@ class Poison:
         raise AssertionError("the runner touched gold")
 
 
-def test_the_firewall_loader_keeps_text_and_drops_gold_unread(tmp_path, monkeypatch):
-    (tmp_path / "manifest.json").write_text("{}")
+def test_the_firewall_loader_keeps_text_and_drops_gold_unread(monkeypatch):
     texts = pd.DataFrame({"row_id": [0, 1], "text": ["a", "b"]})
     seen = []
-    monkeypatch.setattr(firewall, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(score, "freeze_token", lambda: "token from the one helper")
     monkeypatch.setattr(firewall, "load_test", lambda d, token: seen.append((d, token)) or (texts, Poison()))
     Poison.touched.clear()
     assert stage1._test_text("banking77") is texts
-    assert Poison.touched == [] and seen == [("banking77", firewall.freeze_token(tmp_path / "manifest.json"))]
+    assert Poison.touched == [] and seen == [("banking77", "token from the one helper")]
+
+
+def test_the_freeze_token_has_one_helper():
+    import ast
+
+    for name in ("stage1.py", "score.py"):
+        tree = ast.parse((Path(stage1.__file__).parent / name).read_text())
+        users = {f.name for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)
+                 and any(isinstance(n, ast.Attribute) and n.attr == "freeze_token" and getattr(n.value, "id", "") == "firewall" for n in ast.walk(f))}
+        assert users <= {"freeze_token"}, name
 
 
 def make_test_frames(splits):
