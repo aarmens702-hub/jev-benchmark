@@ -213,6 +213,8 @@ def test_gold_read_only_inside_score():
             assert "load_test" not in names | imported, path.name
         if path.name != "firewall.py":  # the private, redirectable loader belongs to the firewall and its tests alone
             assert "_load_test" not in names | imported, path.name
+        if path.name != "score.py":  # test gold and its cache are the scorer's alone
+            assert not names & {"read_gold_cache", "gold_for_test_stage", "gold_cache_dir", "_test_gold", "write_gold_cache"}, path.name
     report_src = (SRC / "report.py").read_text()
     report_tree = ast.parse(report_src)
     report_imports = {a.name for n in ast.walk(report_tree) if isinstance(n, ast.Import) for a in n.names}
@@ -775,32 +777,92 @@ def test_not_unique_to_jev_adds_the_correction():
 # --------------------------------------------------------------------------- the gold cache for a rescore
 
 
-def test_first_test_load_caches_gold_and_a_rescore_reads_it_without_the_firewall(tmp_path):
+def stage_of_record(tmp_path, *, routing_files=True):
     runs = tmp_path / "runs"
-    gold = make_fake_runs(runs, "stage1", gold_as_ids=True, int_ids=True)
-    text = pd.DataFrame({"row_id": gold["banking77"]["row_id"], "text": [f"t{i}" for i in gold["banking77"]["row_id"]]})
+    gold = make_fake_runs(runs, "stage1", per_class={"banking77": 15, "ag_news": 4}, families=("lr",), classes_by_dataset=ROUTING_CLASSES)
+    text = make_fake_routing(runs, "stage1", gold["banking77"], 40, validity_path=tmp_path / "v.json") if routing_files else None
+    write_deviations(tmp_path / "deviations.md", [])
+    return runs, gold, text
+
+
+def cli_paths(tmp_path):
+    return dict(runs_root=tmp_path / "runs", out_dir=tmp_path / "results", lock_path=tmp_path / "scored.lock",
+                deviations_path=tmp_path / "deviations.md", validity_path=tmp_path / "v.json")  # fmt: skip
+
+
+def test_the_scorer_run_before_the_predictions_loads_nothing(tmp_path):
+    write_deviations(tmp_path / "deviations.md", [])
     loads = []
-    load = lambda: loads.append(1) or (gold, CLASSES, text)  # noqa: E731
+    with pytest.raises(ScoreRefused, match="neither predictions nor a not-run record"):
+        score.main(["--stage", "stage1"], load_test_gold=lambda: loads.append(1), **cli_paths(tmp_path))
+    assert loads == [] and not score.gold_cache_dir(tmp_path / "runs", "stage1").exists()
+    assert not (tmp_path / "runs" / "stage1" / "test_record.json").exists()
+
+
+def test_the_scorer_needs_the_runners_test_record_before_loading(tmp_path):
+    runs, gold, text = stage_of_record(tmp_path)
+    loads = []
+    with pytest.raises(ScoreRefused, match="test_record.json"):
+        score.main(["--stage", "stage1"], load_test_gold=lambda: loads.append(1), **cli_paths(tmp_path))
+    assert loads == [] and not score.gold_cache_dir(runs, "stage1").exists()
+    with pytest.raises(ScoreRefused, match="test_record.json"):
+        score.write_gold_cache(runs, "stage1", gold, CLASSES, text)
+    assert not score.gold_cache_dir(runs, "stage1").exists()
+
+
+def test_the_gold_cache_is_written_only_after_every_refusal_has_passed(tmp_path):
+    runs, gold, text = stage_of_record(tmp_path)
+    kw = dict(runs_root=runs, out_dir=tmp_path / "results", lock_path=tmp_path / "scored.lock", deviations_path=tmp_path / "deviations.md",
+              label_names=ROUTING_CLASSES, val_stage="val", clock=__import__("time").monotonic, limit_hours=1.0, record=False,
+              routing_text=text, routing_n=40, validity_path=tmp_path / "v.json")  # fmt: skip
+    seen = []
+    rows, _, _ = predictions.read("lr_a", "banking77", "stage1_routing", runs)
+    predictions.write("lr_a", "banking77", rows.iloc[::-1].reset_index(drop=True), "stage1_routing", root=runs)
+    with pytest.raises(ScoreRefused):
+        score._score("stage1", gold, FAST, after_lock=lambda: seen.append("called"), **kw)
+    assert seen == []
+    predictions.write("lr_a", "banking77", rows, "stage1_routing", root=runs)
+    score._score("stage1", gold, FAST, after_lock=lambda: seen.append((tmp_path / "scored.lock").exists()), **kw)
+    assert seen == [True]
+
+
+def test_a_rescore_reads_the_cached_gold_without_the_firewall(tmp_path):
+    runs, gold, text = stage_of_record(tmp_path)
+    (runs / "stage1" / "test_record.json").write_text(json.dumps({"datasets": {}}))
     kw = dict(runs_root=runs, lock_path=tmp_path / "scored.lock", deviations_path=tmp_path / "deviations.md")
-    first = score.gold_for_test_stage("stage1", load=load, **kw)
-    assert loads == [1] and first[0]["banking77"].equals(gold["banking77"])
+    first = score.gold_for_test_stage("stage1", load=lambda: (gold, ROUTING_CLASSES, text), **kw)
+    assert first[3] is False and first[0] is gold
+    score.write_gold_cache(runs, "stage1", gold, ROUTING_CLASSES, text)
     record = json.loads((runs / "stage1" / "test_record.json").read_text())
-    assert set(record["gold_cache"]) == {"banking77", "ag_news", "routing_text", "label_names"}
-    assert all(score.gold_cache_dir(runs, "stage1") in p.parents for p in (runs / "private").rglob("*.parquet") if "test_gold" in str(p))
+    assert set(record["gold_cache"]) == {"banking77", "ag_news", "routing_text", "label_names"} and "datasets" in record
 
     # Scored once: the lock exists. Without a rescore row nothing is read; with one, the cache is used.
     score.write_lock(tmp_path / "scored.lock", [], {"deviation_rows": 0})
-    write_deviations(tmp_path / "deviations.md", [])
     no_firewall = lambda: (_ for _ in ()).throw(AssertionError("a rescore must not call the firewall"))  # noqa: E731
     with pytest.raises(ScoreRefused, match="rescore"):
         score.gold_for_test_stage("stage1", load=no_firewall, **kw)
     write_deviations(tmp_path / "deviations.md", [("fix a scorer bug", "rescore")])
-    again, names, routing_text = score.gold_for_test_stage("stage1", load=no_firewall, **kw)
-    assert again["banking77"].equals(gold["banking77"]) and names == {d: list(c) for d, c in CLASSES.items()}
-    assert routing_text.equals(text)
+    again, names, routing_text, rescore = score.gold_for_test_stage("stage1", load=no_firewall, **kw)
+    assert rescore and again["banking77"].equals(gold["banking77"]) and names == ROUTING_CLASSES and routing_text.equals(text)
 
     # A cache that changed after the first load is refused.
     path = score.gold_cache_dir(runs, "stage1") / "gold_ag_news.parquet"
     gold["ag_news"].iloc[::-1].to_parquet(path, index=False)
     with pytest.raises(ScoreRefused, match="does not match"):
         score.gold_for_test_stage("stage1", load=no_firewall, **kw)
+
+
+def test_routing_logged_not_run_without_a_fingerprint_does_not_hold_up_banking77(tmp_path, monkeypatch):
+    monkeypatch.setattr(score, "DRY_RUN_ROUTING_ROWS", 40)
+    runs, val_gold, text, validity = routing_set(tmp_path, not_run=tuple(score.ROUTING_FILES), fingerprint=False)
+    results = routed_dry_run(tmp_path, runs, val_gold, text, validity)
+    assert results["routing"]["status"] == "not run" and results["datasets"]["banking77"]["primary"] is not None
+
+
+def test_stale_validity_checks_make_routing_invalid(tmp_path, monkeypatch):
+    monkeypatch.setattr(score, "DRY_RUN_ROUTING_ROWS", 40)
+    runs, val_gold, text, validity = routing_set(tmp_path)
+    blob = json.loads(validity.read_text())
+    validity.write_text(json.dumps({**blob, "fingerprint": "0" * 64}))
+    r = routed_dry_run(tmp_path, runs, val_gold, text, validity)["routing"]
+    assert r["status"] == "invalid" and score.VALIDITY_STALE in r["invalid"] and r["validity_checks"] is None

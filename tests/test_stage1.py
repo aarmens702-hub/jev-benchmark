@@ -421,8 +421,9 @@ def test_without_the_paid_flag_paid_arms_wait(tmp_path):
 
 
 def val_ready(val_run, tmp):
-    """A copy of the finished validation run, which the test stage requires."""
+    """A copy of the finished validation run and its routing checks, which the test stage requires."""
     shutil.copytree(val_run["tmp"] / "runs", tmp / "runs")
+    shutil.copy(val_run["tmp"] / "validity.json", tmp / "validity.json")
     return make_splits()  # same rows and text as the validation run, true labels
 
 
@@ -726,3 +727,35 @@ def test_giving_up_sets_aside_a_partial_routing_file_and_logs_it(tmp_path):
     assert not public.exists() and public.with_name(public.name + ".partial").exists()
     assert "out of time" in predictions.read_not_run("val_routing", runner.root)[("nli_rule_A", "banking77")]
     assert ("nli_rule_A", "routing") not in runner.unaccounted()
+
+
+def test_a_bad_test_record_is_a_clean_refusal(val_run, tmp_path, capsys):
+    splits = val_ready(val_run, tmp_path)
+    texts, _, _ = make_test_frames(splits)
+    record = tmp_path / "runs" / "stage1" / "test_record.json"
+    record.parent.mkdir(parents=True)
+    record.write_text(json.dumps({"gold_cache": {"banking77": "0" * 64}}))  # a scorer run by hand, before this runner
+    rt, api, _ = build(tmp_path, splits, load_test_text=lambda d: texts[d])
+    assert stage1.main(["--stage", "test"], runtime=rt) == EXIT_REFUSED
+    assert "test_record.json" in capsys.readouterr().out and api.calls == []
+
+
+def test_the_test_stage_refuses_stale_routing_checks(val_run, tmp_path, capsys):
+    loads = []
+    splits = val_ready(val_run, tmp_path)
+    blob = json.loads((tmp_path / "validity.json").read_text())
+    (tmp_path / "validity.json").write_text(json.dumps({**blob, "fingerprint": "0" * 64}))
+    rt, api, _ = build(tmp_path, splits, load_test_text=lambda d: loads.append(d))
+    assert stage1.main(["--stage", "test"], runtime=rt) == EXIT_REFUSED
+    assert "validity.json" in capsys.readouterr().out and loads == []
+
+
+def test_a_rejected_key_during_a_probe_leaves_it_to_run_again(tmp_path):
+    api = Twisted("jev banking77", lambda body: TransportResponse(402, {}, b'{"error":{"message":"Insufficient credits"}}'))
+    runner, api = paid_only(tmp_path, make_splits(), api=api)
+    with pytest.raises(PaidHalt, match="jev latency probe stopped"):
+        runner.run_paid()
+    assert not runner.probe_marker("jev").exists() and logged_not_run(tmp_path / "runs") == {}
+    api.reply = lambda body: None
+    runner.run_paid()
+    assert json.loads(runner.probe_marker("jev").read_text())["result"]["status"] == "complete"

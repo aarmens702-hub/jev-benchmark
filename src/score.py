@@ -296,23 +296,32 @@ class RoutingInput:
     gold_b: np.ndarray
     arms: dict  # routing arm -> {"A": array, "B": array} or None
     not_run: dict  # file -> reason
-    checks: Optional[dict]  # None when routing/validity.json is missing or unreadable
+    checks: Optional[dict]  # None when routing/validity.json is missing, unreadable or stale
     rules_changed: bool
     files: dict  # file -> rows, for the published predictions
     n_rows: int
+    validity_note: Optional[str] = None  # why checks is None
 
 
-def load_validity(path: Path) -> Optional[dict]:
+VALIDITY_MISSING = "the validation-draw checks were not recorded (routing/validity.json is missing or unreadable)"
+VALIDITY_STALE = "the validation-draw checks in routing/validity.json were made under different routing rules or text than the routing outputs"
+
+
+def load_validity(path: Path, fingerprint: str) -> tuple[Optional[dict], Optional[str]]:
+    """(checks, None), or (None, why) when the file is missing, unreadable, or made under another rule fingerprint."""
     path = Path(path)
     if not path.exists():
-        return None
+        return None, VALIDITY_MISSING
     try:
-        checks = json.loads(path.read_text())["checks"]
+        blob = json.loads(path.read_text())
+        checks = blob["checks"]
     except (ValueError, KeyError, TypeError):
-        return None
+        return None, VALIDITY_MISSING
     if not isinstance(checks, dict) or set(checks) != set(VALIDITY_KEYS) or not all(isinstance(v, bool) for v in checks.values()):
-        return None
-    return dict(checks)
+        return None, VALIDITY_MISSING
+    if blob.get("fingerprint") != fingerprint:
+        return None, VALIDITY_STALE
+    return dict(checks), None
 
 
 def load_routing(stage: str, runs_root: Path, text: pd.DataFrame, n: int, gold_b77: pd.DataFrame, validity_path: Path,
@@ -346,7 +355,7 @@ def load_routing(stage: str, runs_root: Path, text: pd.DataFrame, n: int, gold_b
             not_run[name] = "no validation predictions (dry run)"
         else:
             problems.append(f"routing {name} has neither predictions nor a not-run record")
-    if (files or logged) and not (folder / FINGERPRINT_FILE).exists():
+    if files and not (folder / FINGERPRINT_FILE).exists():  # a not-run record is not an output
         problems.append(f"routing outputs exist with no {FINGERPRINT_FILE}, so a rule change cannot be ruled out")
     for name, rows in files.items():
         ok = ~rows["failed"].to_numpy(dtype=bool)
@@ -364,6 +373,7 @@ def load_routing(stage: str, runs_root: Path, text: pd.DataFrame, n: int, gold_b
         raise ScoreRefused("routing: " + "; ".join(problems))
 
     rules_changed = False
+    recorded = routing.rule_fingerprint()  # with no routing output, the live rules are the ones to match
     if (folder / FINGERPRINT_FILE).exists():
         recorded = json.loads((folder / FINGERPRINT_FILE).read_text())["fingerprint"]
         rules_changed = bool(routing.rules_changed_since(recorded)) or (folder / FINGERPRINT_CHANGES).exists()
@@ -383,17 +393,15 @@ def load_routing(stage: str, runs_root: Path, text: pd.DataFrame, n: int, gold_b
             failed = rows["failed"].to_numpy(dtype=bool)
             top = np.where(failed, 0.0, rows["top_prob"].to_numpy(dtype=float))
             arms[arm][rule] = routing.arm_array(rows["pred"].astype(str).to_numpy(), top, golds[rule], failed)
-    return RoutingInput(gold_a, gold_b, arms, not_run, load_validity(validity_path), rules_changed, files, len(want))
-
-
-VALIDITY_MISSING = "the validation-draw checks were not recorded (routing/validity.json is missing or unreadable)"
+    checks, note = load_validity(validity_path, recorded)
+    return RoutingInput(gold_a, gold_b, arms, not_run, checks, rules_changed, files, len(want), note)
 
 
 def routing_summary(raw: dict, inp: RoutingInput) -> dict:
     """routing.routing_result without the gold vectors, plus what was not run and why."""
     out = {k: v for k, v in raw.items() if k not in ("gold_A", "gold_B")}
     if inp.checks is None:
-        out["invalid"] = list(out.get("invalid", [])) + [VALIDITY_MISSING]
+        out["invalid"] = list(out.get("invalid", [])) + [inp.validity_note or VALIDITY_MISSING]
         if out.get("status") == "valid":
             out["status"], out["claims"] = "invalid", []
     out["n_rows"] = inp.n_rows
@@ -691,6 +699,7 @@ def score(
     limit_hours: float = LIMIT_HOURS,
     routing_text: Optional[pd.DataFrame] = None,
     validity_path: Path = VALIDITY_PATH,
+    after_lock: Optional[Callable[[], None]] = None,
 ) -> dict:
     """The result of record: B=10,000, seed 2026, 80% coverage, written once to `out_dir` and `lock_path`.
 
@@ -701,7 +710,7 @@ def score(
     return _score(
         stage, gold, RECORD, runs_root=runs_root, out_dir=out_dir, lock_path=lock_path, deviations_path=deviations_path,
         label_names=label_names, val_stage=val_stage, clock=clock, limit_hours=limit_hours, record=True,
-        routing_text=routing_text, routing_n=routing.N_SAMPLE, validity_path=validity_path,
+        routing_text=routing_text, routing_n=routing.N_SAMPLE, validity_path=validity_path, after_lock=after_lock,
     )  # fmt: skip
 
 
@@ -774,6 +783,7 @@ def _score(
     routing_text: Optional[pd.DataFrame] = None,
     routing_n: int = routing.N_SAMPLE,
     validity_path: Path = VALIDITY_PATH,
+    after_lock: Optional[Callable[[], None]] = None,
 ) -> dict:
     if record:
         check_record(settings)
@@ -883,6 +893,8 @@ def _score(
         "deviation_rows": len(deviation_rows(deviations_path)),
     }
     write_lock(lock_path, prior_runs, entry)
+    if after_lock is not None:  # the test gold cache: written only once every refusal has passed
+        after_lock()
 
     full = {job.name: job.run() for job in jobs}
     if record:  # a bug guard, not a refusal: check_record already held before the lock
@@ -1175,6 +1187,8 @@ def _sha256_file(path: Path) -> str:
 def write_gold_cache(runs_root: Path, stage: str, gold: dict, names: dict, routing_text) -> None:
     """Save the first load's gold, label names and routing text, and record each file's SHA-256 in
     runs/<stage>/test_record.json. Everything goes under runs/, so the tree stays clean."""
+    if not (Path(runs_root) / stage / "test_record.json").exists():
+        raise ScoreRefused(f"no {stage}/test_record.json to record the gold cache in")
     folder = gold_cache_dir(runs_root, stage)
     folder.mkdir(parents=True, exist_ok=True)
     for dataset in DATASETS:
@@ -1184,7 +1198,9 @@ def write_gold_cache(runs_root: Path, stage: str, gold: dict, names: dict, routi
     (folder / GOLD_CACHE_FILES["label_names"]).write_text(json.dumps({d: list(map(str, n)) for d, n in names.items()}))
     hashes = {key: _sha256_file(folder / name) for key, name in GOLD_CACHE_FILES.items() if (folder / name).exists()}
     record_path = Path(runs_root) / stage / "test_record.json"
-    record = json.loads(record_path.read_text()) if record_path.exists() else {}
+    if not record_path.exists():
+        raise ScoreRefused(f"no {stage}/test_record.json to record the gold cache in")
+    record = json.loads(record_path.read_text())
     record["gold_cache"] = hashes
     record_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = record_path.with_name(record_path.name + ".tmp")
@@ -1209,16 +1225,39 @@ def read_gold_cache(runs_root: Path, stage: str) -> tuple[dict, dict, Optional[p
     return gold, names, routing_text
 
 
+def check_accounted(stage: str, runs_root: Path) -> None:
+    """Before the firewall is called: every expected file is present or logged not run. Needs no gold."""
+    missing = []
+    for rstage, names in ((stage, None), (routing_stage(stage), list(ROUTING_FILES))):
+        logged = predictions.read_not_run(rstage, runs_root)
+        for d in (DATASETS if names is None else (ROUTING_DATASET,)):
+            for arm in names if names is not None else expected_single_arms(d):
+                if (arm, d) not in logged and not predictions.paths(arm, d, rstage, runs_root)[0].exists():
+                    missing.append(f"{arm}__{d}")
+            if names is None:
+                for family in FAMILIES:
+                    if (family, d) not in logged:
+                        missing += [f"{n}__{d}" for _, _, n in family_files(family) if not predictions.paths(n, d, rstage, runs_root)[0].exists()]
+    if missing:
+        raise ScoreRefused(f"{len(missing)} expected files have neither predictions nor a not-run record (first {missing[0]}); "
+                           "nothing was loaded")  # fmt: skip
+
+
 def gold_for_test_stage(stage: str, *, runs_root: Path, lock_path: Path, deviations_path: Path, load: Callable = None):
-    """Gold for the test stage. The first time, from the firewall, cached under runs/ with its hashes. A rescore
-    (the lock exists, and a deviations row with Stage "rescore" allows it) reads the cache and never calls the
-    firewall, since HEAD has moved past the freeze tag by then."""
+    """(gold, names, routing text, rescore) for the test stage.
+
+    A rescore (the lock exists, and a deviations row with Stage "rescore" allows it) reads the cache and never
+    calls the firewall, since HEAD has moved past the freeze tag by then. The first time, every expected file
+    must be accounted for and the runner's test_record.json must exist before the firewall is called; the
+    cache itself is written by `score` right after the lock, once every refusal has passed.
+    """
     if Path(lock_path).exists():
         check_lock(lock_path, deviations_path)
-        return read_gold_cache(runs_root, stage)
-    gold, names, routing_text = (load or _test_gold)()
-    write_gold_cache(runs_root, stage, gold, names, routing_text)
-    return gold, names, routing_text
+        return (*read_gold_cache(runs_root, stage), True)
+    check_accounted(stage, runs_root)
+    if not (Path(runs_root) / stage / "test_record.json").exists():
+        raise ScoreRefused(f"no {stage}/test_record.json: the stage runner has not loaded test; nothing was loaded")
+    return (*(load or _test_gold)(), False)
 
 
 def _label_names() -> dict:
@@ -1259,10 +1298,11 @@ def main(
             return 1
         print("DRY RUN OK")
         return 0
-    gold, names, routing_text = gold_for_test_stage(args.stage, runs_root=runs_root, lock_path=lock_path, deviations_path=deviations_path,
-                                                    load=load_test_gold)  # fmt: skip
+    gold, names, routing_text, rescore = gold_for_test_stage(args.stage, runs_root=runs_root, lock_path=lock_path,
+                                                             deviations_path=deviations_path, load=load_test_gold)  # fmt: skip
+    cache = None if rescore else (lambda: write_gold_cache(runs_root, args.stage, gold, names, routing_text))
     result = score(args.stage, gold, runs_root=runs_root, out_dir=out_dir, lock_path=lock_path, deviations_path=deviations_path,
-                   label_names=names, routing_text=routing_text, validity_path=validity_path)  # fmt: skip
+                   label_names=names, routing_text=routing_text, validity_path=validity_path, after_lock=cache)  # fmt: skip
     print(f"scored {args.stage}: results in {out_dir}, lock at {lock_path}")
     print(result["headline"]["verdict"])
     return 0

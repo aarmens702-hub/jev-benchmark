@@ -161,5 +161,5 @@ def make_fake_routing(root: Path, stage: str, gold_b77: pd.DataFrame, n: int, *,
         (folder / score.FINGERPRINT_FILE).write_text(json.dumps({"fingerprint": routing.rule_fingerprint(), "first_arm": "jev_rule_A"}))
     if validity_path is not None:
         checks = checks or {k: True for k in score.VALIDITY_KEYS}
-        Path(validity_path).write_text(json.dumps({"checks": checks}))
+        Path(validity_path).write_text(json.dumps({"checks": checks, "fingerprint": routing.rule_fingerprint()}))
     return text

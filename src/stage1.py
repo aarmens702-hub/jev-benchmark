@@ -438,13 +438,24 @@ class Stage1:
         missing = self.unaccounted_in("val", targets, rows)
         if missing:
             raise Refused(f"the validation run is missing {len(missing)} arms (first {missing[0][0]}__{missing[0][1]}); rerun --stage val")
+        validity = Path(self.rt.validity_path)
+        try:
+            recorded = json.loads(validity.read_text()).get("fingerprint") if validity.exists() else None
+        except ValueError:
+            recorded = None
+        if recorded != routing.rule_fingerprint():
+            raise Refused(f"{validity.name} is missing or was made under other routing rules or text; rerun --stage val and commit it")
 
     def write_records(self) -> None:
         """Test hashes and duplicate counts (test stage), then every bank's size, before any bank is used."""
         if self.stage == "test":
             path = self.root / self.pred_stage / "test_record.json"
             if path.exists():
-                prior = json.loads(path.read_text())["datasets"]
+                try:
+                    prior = json.loads(path.read_text())["datasets"]
+                    assert isinstance(prior, dict)
+                except (ValueError, KeyError, TypeError, AssertionError):
+                    raise Refused(f"{path} is unreadable or has no test record from this runner; find out why before going on") from None
                 changed = [d for d in DATASETS if prior.get(d, {}).get("text_sha256") != self.record[d]["text_sha256"]]
                 if changed:
                     raise Refused(f"test text differs from the first load for {changed}; stop and find out why")
@@ -648,6 +659,8 @@ class Stage1:
                 decide = self.decider(PaidArm("small_llm", "banking77"), client)
             result = latency_probe.probe_api(arm, rows, decide, client=client, results_path=self.private / "latency" / f"{arm}.jsonl",
                                              warmup=PROBE_WARMUP, expected_per_row=per_row, read_swap_gb=self.rt.read_swap_gb)  # fmt: skip
+            if isinstance(client.stop, openrouter.KeyOrCreditsStop):  # no final marker: the probe runs again once the key is fixed
+                raise PaidHalt(f"the {arm} latency probe stopped: the key was rejected or credits ran out ({client.stop}); fix it and rerun")
             print(f"latency probe {arm}: {result['status']}, {result['timed']['n']} timed requests")
             self.save_probe(arm, result)
         if not self.probe_marker("network").exists():
