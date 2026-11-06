@@ -129,10 +129,11 @@ def build(tmp_path, api=None, *, reported=None, clock=None):
     clock = clock or Clock()
     started = []
 
-    def make_client():
+    def make_client(reconcile_grace_seconds=None):
         ledger = Ledger(ledger_path, stage="stage0")
         usage = reported(ledger, clock) if reported else ledger.confirmed
-        client = Client(api, ledger, usage, sleep=lambda s: None, reconcile_grace_seconds=0)
+        client = Client(api, ledger, usage, sleep=lambda s: None, reconcile_grace_seconds=reconcile_grace_seconds or 0)
+        client.asked_grace = reconcile_grace_seconds
         started.append(client)
         return client
 
@@ -709,8 +710,8 @@ def test_one_client_per_step_and_none_shared_across_arms(tmp_path):
     made = []
     real = rt.make_client
 
-    def counting():
-        client = real()
+    def counting(**kwargs):
+        client = real(**kwargs)
         made.append(client)
         return client
 
@@ -798,3 +799,111 @@ def test_frozen_nli_records_where_the_rate_was_measured(happy):
     _, _, stage, _, _ = happy
     frozen = yaml.safe_load((Path(stage.rt.report_dir) / "frozen.yaml").read_text())
     assert frozen["nli"]["pairs_per_second"] == 20.7 and "Task 4 Step 5" in frozen["nli"]["source"]
+
+
+# ------------------------------------------------------------------ fix round 3: B2, R7, R8
+
+
+def test_reasoning_on_the_first_contact_row_only_still_fails_the_candidate(tmp_path):
+    """attack9 on the real runner: a stop on first contact must hold for the rest of that candidate's arm."""
+    api = FakeApi()
+    real = api.llm
+    seen = {"openai": 0}
+
+    def first_row_thinks(body):
+        reply = real(body)
+        if body["model"].startswith("openai"):
+            seen["openai"] += 1
+            if seen["openai"] == 1:
+                payload = json.loads(reply.body)
+                payload["usage"]["completion_tokens_details"]["reasoning_tokens"] = 12
+                return TransportResponse(200, {}, json.dumps(payload).encode())
+        return reply
+
+    api.llm = first_row_thinks
+    _, _, stage, api, _ = run(tmp_path, api)
+    gpt = stage.candidates["openai/gpt-oss-20b"]
+    assert gpt["passed"] is False and gpt["stop"] == "HiddenReasoning" and gpt["valid"] < stage0.SELECT_PASS
+    assert len(selection_calls(api, "openai/gpt-oss-20b")) == 1  # the other 49 rows were never sent
+    assert stage.selected["requested"] == "z-ai/glm-5.3-flash"
+
+
+def test_a_jev_first_contact_arm_not_run_is_not_re_sent(tmp_path, monkeypatch):
+    from openrouter import ArmNotRun
+
+    real = stage0.jev_decide
+    count = {"n": 0}
+
+    def first_fails(*args, **kwargs):
+        decision = real(*args, **kwargs)
+        count["n"] += 1
+        if count["n"] == 1:
+            raise ArmNotRun("first contact could not be scored")
+        return decision
+
+    monkeypatch.setattr(stage0, "jev_decide", first_fails)
+    code, report, stage, api, _ = run(tmp_path, FakeApi())
+    assert code == stage0.EXIT_STOPPED
+    assert len([1 for u, _ in api.calls if u.endswith("decisions")]) == 1
+    assert "ArmNotRun" in report
+
+
+def test_grace_from_lag_rounds_up_with_floor_and_cap():
+    assert stage0.grace_from_lag(0.0) == 30 and stage0.grace_from_lag(29.1) == 30
+    assert stage0.grace_from_lag(44.2) == 45 and stage0.grace_from_lag(180.0) == 180
+    assert stage0.grace_from_lag(500.0) == stage0.GRACE_CAP_SECONDS == 180
+
+
+@pytest.mark.parametrize("lag, grace", [(9, 30), (44, 45)])
+def test_measured_lag_sets_the_grace_for_every_later_client_and_frozen_yaml(tmp_path, lag, grace):
+    clock = Clock()
+    rt, api, _ = build(tmp_path, FakeApi(), reported=lambda ledger, clock_: (lambda: ledger.confirmed() if clock.now >= lag else 0.0), clock=clock)
+    asked = []
+    real = rt.make_client
+
+    def recording(**kwargs):
+        asked.append(kwargs.get("reconcile_grace_seconds"))
+        return real(**kwargs)
+
+    rt.make_client = recording
+    stage = Stage0(rt)
+    assert stage.run_all() == stage0.EXIT_OK
+    assert stage.grace == grace == stage0.grace_from_lag(stage.usage.seconds)
+    assert asked[0] is None and asked[1:] == [grace] * (len(asked) - 1) and len(asked) == 7  # smoke measures; the rest use it
+    frozen = yaml.safe_load((tmp_path / "out" / "frozen.yaml").read_text())
+    assert frozen["key_usage"]["reconcile_grace_seconds"] == grace
+    assert frozen["key_usage"]["lag_seconds"] == pytest.approx(stage.usage.seconds, abs=0.1)
+
+
+def test_frozen_yaml_has_no_grace_when_the_lag_was_not_measured(tmp_path):
+    clock = Clock()
+    run(tmp_path, FakeApi(), reported=lambda ledger, clock_: (lambda: 0.0), clock=clock)
+    frozen = yaml.safe_load((tmp_path / "out" / "frozen.yaml").read_text())
+    assert frozen["key_usage"] == {"lag_seconds": None, "reconcile_grace_seconds": None}
+
+
+def test_paid_client_factory_passes_the_grace_and_accepts_only_once(monkeypatch):
+    calls = []
+    monkeypatch.setattr(stage0, "build_client", lambda paid, **kw: calls.append((paid, kw)) or object())
+    make = stage0.paid_client_factory("stage0", 0.25)
+    make()
+    make(reconcile_grace_seconds=45)
+    assert calls == [("stage0", {"accept_key_usage_usd": 0.25, "reconcile_grace_seconds": 30}),
+                     ("stage0", {"accept_key_usage_usd": None, "reconcile_grace_seconds": 45})]
+
+
+from test_clients import paid  # noqa: E402,F401  the real paid route over httpx.MockTransport, key reader stubbed
+
+
+def test_rerun_with_accept_when_the_ledger_agrees_stops_cleanly_and_sends_nothing(tmp_path, paid, capsys):
+    """R8: on the real paid route, a second --accept-key-usage-usd is a clean stop message, not a traceback."""
+    stage0.paid_client_factory("stage0")()  # an earlier run recorded the baseline; the ledger agrees with the key
+    splits = {name: synthetic_split(name) for name in ("banking77", "ag_news")}
+    (tmp_path / "out").mkdir()
+    rt = Runtime(make_client=stage0.paid_client_factory("stage0", 0.0), load_split=lambda d: splits[d],
+                 runs_root=tmp_path / "runs", report_dir=tmp_path / "out", clock=Clock(), sleep=lambda s: None)
+    assert Stage0(rt).run_all() == stage0.EXIT_STOPPED
+    out = capsys.readouterr().out
+    assert "STOPPED at 1 Jev smoke" in out and "nothing to accept" in out and "Traceback" not in out
+    assert paid["posts"] == []
+    assert "nothing to accept" in (tmp_path / "out" / "stage0_report.md").read_text()

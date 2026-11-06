@@ -12,7 +12,9 @@ count and output-token mean. Stops that are about one arm end only that arm: a c
 provider, missing logprobs, 10 failures in a row, hidden reasoning. Stops that are about money or
 the key end the client for good: the budget, a 401/402/403, a reconciliation gap or unreadable
 usage, a ledger mismatch, a bug or Ctrl-C. A new client after such a stop re-checks the ledger
-against the key's usage before it sends anything.
+against the key's usage before it sends anything. An arm is named by its results file: calling
+run_arm again on the same client with the same file continues that arm (first contact, then the
+rest, or 100-row chunks), keeping its stop, its pin, its counts and its missing-logprob allowance.
 """
 import hashlib
 import json
@@ -110,6 +112,10 @@ class KeyOrCreditsStop(RunStop):
 
 class LedgerMismatch(RunStop):
     """The key's reported usage shows spend the ledger doesn't hold: ledger lost, or spend outside it."""
+
+
+class AcceptRefused(RunStop, ValueError):
+    """accept_key_usage_usd was not a usable amount, or there was nothing to accept. Nothing is written or sent."""
 
 
 class ReconciliationGap(RunStop):
@@ -410,6 +416,7 @@ class Client:
         self._output_tokens = 0
         self._output_calls = 0
         self._pinned_model: str | None = None
+        self._arm_path: Path | None = None
         usage = reported_usage()
         if self.is_paid:
             self._check_paid_start(usage, accept_key_usage_usd)
@@ -438,7 +445,7 @@ class Client:
         spend, counted against the total and the current stage: accepting never gives room back.
         """
         if accept_usd is not None and (not _is_number(accept_usd) or accept_usd < 0):
-            raise ValueError("accept_key_usage_usd must be a finite number of US dollars, zero or more")
+            raise AcceptRefused("accept_key_usage_usd must be a finite number of US dollars, zero or more. Nothing sent.")
         baseline = self.ledger.baseline()
         if baseline is None:
             if not self.ledger.is_empty():
@@ -474,21 +481,26 @@ class Client:
                 )
             return
         if not mismatch:
-            raise ValueError("this ledger already has a baseline and agrees with the key's usage, so there is nothing to accept")
+            raise AcceptRefused(
+                "this ledger already has a baseline and agrees with the key's usage, so there is nothing to accept. "
+                "Nothing sent; run again without accept_key_usage_usd (--accept-key-usage-usd)."
+            )
         self._require_cover(accept_usd, since - held, "the spend outside the ledger")
         self._charge_accepted(accept_usd, since - held)
 
     @staticmethod
     def _require_cover(accept_usd: float, amount: float, what: str) -> None:
-        if accept_usd < amount - RECONCILE_FLOOR_USD - 1e-12:
+        """Within a cent either way. Accepting too much would put the ledger above what the key will ever
+        report, and every later client would read that as billed less than the ledger and stop."""
+        if abs(accept_usd - amount) > RECONCILE_FLOOR_USD + 1e-12:
             raise LedgerMismatch(
-                f"accept_key_usage_usd of US${accept_usd:.6f} does not cover {what}, US${amount:.6f}, "
+                f"accept_key_usage_usd of US${accept_usd:.6f} does not match {what}, US${amount:.6f}, "
                 f"to within US${RECONCILE_FLOOR_USD}. Nothing sent."
             )
 
     def _charge_accepted(self, accept_usd: float, amount: float) -> None:
-        """Counted against the total and the current stage. Raises BudgetExceeded, after writing, if it passes a cap."""
-        self.ledger.charge(max(accept_usd, amount), {"accepted_key_usage_usd": accept_usd, "unaccounted_usd": amount})
+        """The shown amount, counted against the total and the current stage. Raises BudgetExceeded, after writing, past a cap."""
+        self.ledger.charge(amount, {"accepted_key_usage_usd": accept_usd, "unaccounted_usd": amount})
 
     def latch(self, stop: RunStop) -> None:
         """Record why the run must end. Later sends refuse; the current row's paid answer can still be kept."""
@@ -547,18 +559,27 @@ class Client:
         lower = max(0.0, self.ledger.confirmed() - self._base_confirmed)
         return lower, lower + max(0.0, self.ledger.uncertain() - self._base_uncertain) + self._pre_start_slack
 
-    def begin_arm(self) -> None:
-        """Called by run_arm. A new arm gets its own model pin and counts, and clears a stop about the last arm."""
+    def begin_arm(self, results_path) -> None:
+        """Called by run_arm. An arm is named by its results file.
+
+        The same file as this client's last arm continues that arm: its stop, pin and counts are kept,
+        so a candidate stopped on its first-contact row stays stopped. A different file is a new arm:
+        it gets its own pin and counts, and a stop about the last arm is cleared.
+        """
+        path = Path(results_path).resolve()
         with self._lock:
             if self._in_arm:
                 raise RuntimeError("this client is already running an arm; run arms one after another")
+            self._in_arm = True
+            if path == self._arm_path:
+                return
+            self._arm_path = path
             if isinstance(self.stop, ARM_SCOPED_STOPS):
                 self.stop = None
             self._pinned_model = None
             self.consecutive_failures = 0
             self._output_tokens = 0
             self._output_calls = 0
-            self._in_arm = True
 
     def _read_usage(self) -> float | None:
         try:
@@ -882,7 +903,7 @@ def run_arm(
     seen = {row_id(row) for row in rows}
     if len(seen) != len(rows):
         raise ValueError("row ids must be unique, or a row would be paid for twice")
-    client.begin_arm()
+    client.begin_arm(results_path)
     try:
         return _run_arm(rows, decide, client, results_path, expected_per_row, row_id, allowed_arm_not_run, seen)
     finally:
@@ -894,7 +915,8 @@ def _run_arm(rows, decide, client, results_path, expected_per_row, row_id, allow
     report = RunReport(status="complete")
     todo = [row for row in rows if results.needs_run(row_id(row))]
     counter_lock = threading.Lock()
-    without_logprobs = [0]
+    # The allowance is the arm's, so misses already saved in its file count against it.
+    without_logprobs = [sum(1 for d in results.finished.values() if d.reason == NO_USABLE_LOGPROBS)]
 
     def run_one(row):
         if client.stop is not None:

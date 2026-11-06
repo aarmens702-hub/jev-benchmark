@@ -2347,7 +2347,7 @@ def test_accepting_spend_outside_an_existing_ledger_charges_it_and_never_resets(
     paid["usage"] += 0.15  # spend outside the ledger
     with pytest.raises(openrouter.LedgerMismatch):
         build_client("stage0", sleep=no_sleep)
-    with pytest.raises(openrouter.LedgerMismatch, match="cover"):
+    with pytest.raises(openrouter.LedgerMismatch, match="within"):
         build_client("stage0", sleep=no_sleep, accept_key_usage_usd=0.135)  # 10% short: not within a cent
     after = build_client("stage0", sleep=no_sleep, accept_key_usage_usd=0.15)
     assert after.ledger.baseline() == 0.0  # the baseline is untouched
@@ -2368,11 +2368,11 @@ def test_accepted_usage_must_be_a_finite_amount_of_zero_or_more(paid, accept):
 def test_accepted_usage_must_cover_the_key_to_within_a_cent(paid):
     paid["usage"] = 0.40
     for short in (0.9 * 0.40, 0.36, 0.389):
-        with pytest.raises(openrouter.LedgerMismatch, match="cover"):
+        with pytest.raises(openrouter.LedgerMismatch, match="within"):
             build_client("stage0", sleep=no_sleep, accept_key_usage_usd=short)
     assert Ledger(paid["path"], stage="stage0").is_empty()
     client = build_client("stage0", sleep=no_sleep, accept_key_usage_usd=0.391)
-    assert client.ledger.spent() == pytest.approx(0.40)  # charged at the larger of the accepted and the shown amount
+    assert client.ledger.spent() == pytest.approx(0.40)  # charged at the shown amount
 
 
 def test_lost_ledger_then_accept_does_not_give_the_stage_a_fresh_cap(paid):
@@ -2557,3 +2557,99 @@ def test_a_client_runs_one_arm_at_a_time(tmp_path):
     with pytest.raises(RuntimeError, match="one after another"):
         run_arm(rows(1), jev_decider(client), client=client, results_path=results_path(tmp_path))
     assert transport.calls == []
+
+
+# ------------------------------------------------------------------ fix round 3, B1: accepting too much
+
+
+@pytest.mark.parametrize("usage, accept", [(0.0123, 0.05), (0.0, 0.02), (0.40, 0.4201)])
+def test_accepting_more_than_the_key_shows_is_refused_and_writes_nothing(paid, usage, accept):
+    """attack8: the surplus would sit above anything the key reports, and every later client would stop."""
+    paid["usage"] = usage
+    with pytest.raises(openrouter.LedgerMismatch, match="within"):
+        build_client("stage0", sleep=no_sleep, accept_key_usage_usd=accept)
+    assert Ledger(paid["path"], stage="stage0").is_empty()
+    assert paid["posts"] == []
+
+
+def test_over_accepting_spend_outside_an_existing_ledger_is_refused(paid):
+    build_client("stage0", sleep=no_sleep)
+    paid["usage"] = 0.15
+    before = paid["path"].read_text()
+    with pytest.raises(openrouter.LedgerMismatch, match="within"):
+        build_client("stage0", sleep=no_sleep, accept_key_usage_usd=0.17)
+    assert paid["path"].read_text() == before
+
+
+@pytest.mark.parametrize("usage, accept", [(0.0123, 0.02), (0.0123, 0.0053), (0.40, 0.409), (0.0, 0.0)])
+def test_accepting_within_a_cent_then_runs_arms_to_completion(paid, usage, accept):
+    paid["usage"], paid["cost"] = usage, 0.001
+    client = build_client("stage0", sleep=no_sleep, accept_key_usage_usd=accept)
+    assert client.ledger.spent() == pytest.approx(usage)  # the shown amount, not the accepted one
+    report = run_arm(rows(30), jev_decider(client), client=client, results_path=private(paid, "a"), expected_per_row=0.001)
+    assert report.status == "complete", report.reason
+    for name in ("b", "c"):  # and later clients agree with the key too
+        client = build_client("stage0", sleep=no_sleep)
+        report = run_arm(rows(30), jev_decider(client), client=client, results_path=private(paid, name), expected_per_row=0.001)
+        assert report.status == "complete", report.reason
+
+
+def test_a_refused_accept_is_a_clean_stop(paid):
+    """R8 at the client: a refused accept is a RunStop, so a runner reports it rather than crashing."""
+    build_client("stage0", sleep=no_sleep)
+    with pytest.raises(openrouter.AcceptRefused, match="nothing to accept") as caught:
+        build_client("stage0", sleep=no_sleep, accept_key_usage_usd=0.0)
+    assert isinstance(caught.value, openrouter.RunStop) and isinstance(caught.value, ValueError)
+    with pytest.raises(openrouter.RunStop):
+        build_client("stage0", sleep=no_sleep, accept_key_usage_usd=math.nan)
+    assert paid["posts"] == []
+
+
+# ------------------------------------------------------------------ fix round 3, B2: an arm is its results file
+
+
+def test_the_same_results_file_continues_the_arm_and_keeps_its_stop(tmp_path):
+    """attack9: Stage 0 runs first contact on rows[:1], then all rows, on one client and one file."""
+
+    def handler(body, n):
+        return llm_ok(body, reasoning=12 if n == 0 else 0)
+
+    client, transport, _, _ = make_client(tmp_path, handler)
+    path = results_path(tmp_path)
+    first = run_arm(rows(50)[:1], llm_decider(client), client=client, results_path=path, allowed_arm_not_run=1)
+    assert first.stop_type == "HiddenReasoning"
+    rest = run_arm(rows(50), llm_decider(client), client=client, results_path=path, allowed_arm_not_run=1)
+    assert rest.stop_type == "HiddenReasoning" and len(transport.calls) == 1
+    assert sum(1 for d in rest.decisions.values() if not d.failed) < 49
+
+
+def test_consecutive_failures_count_across_chunks_of_one_arm(tmp_path):
+    def handler(body, n):
+        return status(400) if 5 <= n < 15 else jev_ok(body)
+
+    client, transport, _, _ = make_client(tmp_path, handler, max_concurrency=1)
+    path = results_path(tmp_path)
+    data = rows(30)
+    first = run_arm(data[:10], jev_decider(client), client=client, results_path=path)  # rows 5-9 fail
+    assert first.status == "complete" and client.consecutive_failures == 5
+    second = run_arm(data[10:20], jev_decider(client), client=client, results_path=path)  # rows 10-14 fail
+    assert second.stop_type == "ConsecutiveFailures"
+    assert len(transport.calls) == 15
+
+
+def test_the_missing_logprob_allowance_is_the_arms_across_calls_and_reruns(tmp_path):
+    client, transport, _, _ = make_client(tmp_path, llm_with_missing_logprobs({0, 1}), max_concurrency=1)
+    path = results_path(tmp_path)
+    data = rows(10)
+    first = run_arm(data[:1], llm_decider(client), client=client, results_path=path, allowed_arm_not_run=1)
+    assert first.status == "complete"  # one miss is within the allowance
+    rest = run_arm(data, llm_decider(client), client=client, results_path=path, allowed_arm_not_run=1)
+    assert rest.stop_type == "ArmNotRun" and len(transport.calls) == 2  # the second miss is past it
+
+
+def test_a_different_results_file_is_a_new_arm(tmp_path):
+    client, _, _, _ = make_client(tmp_path, lambda body, n: llm_ok(body, reasoning=12 if n == 0 else 0))
+    run_arm(rows(1), llm_decider(client), client=client, results_path=tmp_path / "runs" / "private" / "a.jsonl")
+    assert isinstance(client.stop, HiddenReasoning)
+    report = run_arm(rows(3), llm_decider(client), client=client, results_path=tmp_path / "runs" / "private" / "b.jsonl")
+    assert report.status == "complete", report.reason
