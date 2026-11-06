@@ -1,0 +1,32 @@
+stage0_complete: true
+jev:
+  request_model: typesafe/jev-1.14
+  provider: TypeSafe
+  build: jev-1.14-20261014
+  reply_models_seen:
+  - typesafe/jev-1.14-20261014
+small_llm:
+  status: selected
+  model: mistralai/mistral-nemo
+  provider: DekaLLM
+  provider_options:
+    only:
+    - DekaLLM
+    allow_fallbacks: false
+    require_parameters: true
+  reasoning_field_sent: false
+  reply_model_suffix_pattern: (?:-\d{8})?
+  reply_models_seen:
+  - mistralai/mistral-nemo
+  price_per_million_tokens_usd:
+    input: 0.018
+    output: 0.03
+    as_of: '2026-11-05'
+nli:
+  model: MoritzLaurer/deberta-v3-large-zeroshot-v2.0-c
+  revision: b2730f16019076bb0009481121efbe4705e0e378
+  pairs_per_second: 20.7
+  source: 'Task 4 Step 5, 2026-11-04: batch 16, 5,000 validation pairs'
+key_usage:
+  lag_seconds: 24.2
+  reconcile_grace_seconds: 120
