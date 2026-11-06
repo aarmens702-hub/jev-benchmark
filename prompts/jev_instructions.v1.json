@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "banking77": "Which banking support intent does the customer_message express? Pick the single best match.",
+  "ag_news": "What is this news article mainly about?"
+}
