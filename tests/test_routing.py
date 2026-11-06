@@ -392,9 +392,10 @@ def test_not_unique_when_small_llm_or_nli_is_within_5_of_jev_under_rule_b():
     n = 200
     good = arm(np.ones(n))
     out = result(all_arms(**{"small LLM": {"A": good, "B": good}}))
-    assert out["claims"] == [routing.CLAIM_FOLLOWS, routing.CLAIM_NOT_UNIQUE]
+    assert out["claims"][0] == routing.CLAIM_FOLLOWS and len(out["claims"]) == 2
     assert out["not_unique"] is True
-    assert out["not_unique_context"].startswith(f"{routing.CLAIM_FOLLOWS}: shown (")
+    assert out["claims"][1].startswith(f"{routing.CLAIM_NOT_UNIQUE} ({routing.CLAIM_FOLLOWS}: shown; Jev minus Intent LR + code")
+    assert "lower limit" in out["claims"][1] and "falls 0.0 points from rule A to rule B)" in out["claims"][1]
     bad = np.zeros(n)
     out = result(all_arms(NLI={"A": arm(bad), "B": arm(bad)}))
     assert out["claims"] == [routing.CLAIM_FOLLOWS] and out["not_unique"] is False
@@ -405,8 +406,14 @@ def test_not_unique_when_small_llm_or_nli_is_within_5_of_jev_under_rule_b():
     weak = np.ones(n)
     weak[:60] = 0
     out = result(all_arms(Jev={"A": arm(weak), "B": arm(weak)}, **{"small LLM": {"A": arm(weak), "B": arm(weak)}}))
-    assert out["claims"] == [routing.CLAIM_NOT_UNIQUE]
-    assert out["not_unique_context"].startswith(f"{routing.CLAIM_FOLLOWS}: not shown (")
+    assert len(out["claims"]) == 1
+    assert out["claims"][0].startswith(f"{routing.CLAIM_NOT_UNIQUE} ({routing.CLAIM_FOLLOWS}: not shown; Jev minus")
+
+    # An invalid run makes no claim and carries no context either.
+    checks = dict.fromkeys(("agreement_in_40_60", "state_blind_at_most_70", "text_blind_at_most_70", "lr_a_at_least_70"), True)
+    out = result(all_arms(**{"small LLM": {"A": arm(weak), "B": arm(weak)}}), valid={**checks, "agreement_in_40_60": False})
+    assert out["status"] == "invalid" and out["claims"] == [] and "not_unique_context" not in out
+
 
 def test_failed_rows_are_wrong_and_invalid_or_missing_jev_makes_no_claim():
     n = 200
@@ -759,3 +766,33 @@ def test_run_validity_trains_lr_a_on_the_pool_only_and_scores_the_validation_dra
     assert set(checks) == {"agreement_in_40_60", "state_blind_at_most_70", "text_blind_at_most_70", "lr_a_at_least_70"}
     assert all(isinstance(v, (bool, np.bool_)) for v in checks.values())
     assert stats == routing.validity_stats(routing.validation_draw(split))
+
+
+# ------------------------------------------------------------------ gold pinned
+
+
+PINNED_GOLD = [
+    # (intent, family, state, rule A queue, rule B queue)
+    ("change_pin", "card_problems", ("premium", "new", "email"), "blue", "coral"),
+    ("top_up_by_bank_transfer_charge", "top_ups", ("personal", "active", "app"), "silver", "teal"),
+    ("card_arrival", "card_ordering", ("business", "frozen", "phone"), "amber", "amber"),
+    ("activate_my_card", "card_ordering", ("business", "active", "phone"), "coral", "blue"),
+    ("verify_source_of_funds", "account", ("personal", "active", "email"), "teal", "silver"),
+    ("get_physical_card", "card_ordering", ("business", "active", "email"), "coral", "green"),
+    # The intents whose wording was fixed keep their family, hence their gold.
+    ("supported_cards_and_currencies", "card_ordering", ("personal", "active", "app"), "coral", "green"),
+    ("transaction_charged_twice", "payments", ("business", "new", "email"), "indigo", "indigo"),
+    ("exchange_rate", "payments", ("premium", "active", "phone"), "blue", "blue"),
+]
+
+
+def test_gold_is_pinned_for_chosen_intents_and_states_so_wording_changes_cannot_move_it():
+    for intent, family, (tier, status, channel), qa, qb in PINNED_GOLD:
+        assert routing.family_of(intent) == family, intent
+        row = {"label": intent, "tier": tier, "status": status, "channel": channel}
+        frame = pd.DataFrame([row])
+        assert routing.gold_queues(frame, "A")[0] == qa, intent
+        assert routing.gold_queues(frame, "B")[0] == qb, intent
+    # Family sizes are pinned too (12, 10, 6, 11, 11, 6, 12, 9 intents).
+    sizes = {f: len(spec["intents"]) for f, spec in routing.load_families().items()}
+    assert sizes == {"card_ordering": 12, "card_problems": 10, "security": 6, "top_ups": 11, "transfers": 11, "cash": 6, "payments": 12, "account": 9}

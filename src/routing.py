@@ -566,14 +566,6 @@ def routing_result(
     out["vs_jev_B"] = {name: vs_jev.get(name, NOT_RUN) for name in ("small LLM", "NLI")}
     not_unique = any(c["lower"] > -MARGIN for c in vs_jev.values())
     out["follows"], out["not_unique"] = follows, not_unique
-    if not_unique:
-        # "Not unique to Jev" is never reported alone: the first claim's result goes next to it.
-        out["not_unique_context"] = (
-            f"{CLAIM_FOLLOWS}: {'shown' if follows else 'not shown'} "
-            f"(Jev minus Intent LR + code under rule B {out['jev_vs_code_B']['estimate']:.1f} points, lower limit "
-            f"{out['jev_vs_code_B']['lower']:.1f}; Jev falls {out['jev_drop']:.1f} points from rule A to rule B)."
-        )
-
     if out["invalid"]:
         out["status"] = "invalid"
         return out
@@ -581,7 +573,12 @@ def routing_result(
     if follows:
         out["claims"].append(CLAIM_FOLLOWS)
     if not_unique:
-        out["claims"].append(CLAIM_NOT_UNIQUE)
+        # Never reported alone: the first claim's result, with numbers, is part of the claim text.
+        out["claims"].append(
+            f"{CLAIM_NOT_UNIQUE} ({CLAIM_FOLLOWS}: {'shown' if follows else 'not shown'}; Jev minus Intent LR + code "
+            f"under rule B {out['jev_vs_code_B']['estimate']:.1f} points, lower limit {out['jev_vs_code_B']['lower']:.1f}; "
+            f"Jev falls {out['jev_drop']:.1f} points from rule A to rule B)"
+        )
     if not out["claims"]:
         out["claims"].append(CLAIM_NONE)
     return out
