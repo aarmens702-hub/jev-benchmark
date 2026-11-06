@@ -31,7 +31,7 @@ A failed check may lead to a **bug fix only**, logged with a reason.
 ## Guards
 - **Fetch by file.** All data arrives by `hf_hub_download` of the named train parquet at the pinned revision. No `load_dataset`.
 - **`src/firewall.py`** is the only module that may load test. `load_test(token)` raises unless the token equals SHA-256 of `manifest.json` at the tag `freeze-v1`; HEAD is the tagged commit; the tagged manifest records the public GitHub repo URL, has no pending hash and verifies against the tree, the code and the train parquets; the git tree is clean, every tracked file's raw bytes equal its committed blob, and nothing is hidden from git (no skip-worktree, assume-unchanged, replace refs, filters, or untracked files hidden outside .gitignore); and the public repo, read with no credentials or local config, shows the tag and main at HEAD. Stage 1 and the scorer run with a fresh bytecode folder and only the repo's `src/` on the import path.
-- **`tests/test_firewall.py`** runs in CI and fails if:
+- **`tests/test_firewall.py`** runs with the test suite (there is no CI; it runs before the freeze) and fails if:
   - any test parquet exists under `data/` or the HF cache before the freeze;
   - `split="test"`, `test-0000` or `load_dataset(` appears outside `firewall.py`;
   - `load_test` without a token does not raise;
@@ -66,7 +66,7 @@ A failed check may lead to a **bug fix only**, logged with a reason.
 - **Halt spending:** projected spend passes the cap. Mark the rest as not run.
 - **Never:** change anything frozen after Stage 1 starts without a deviations row and a statement in the post.
 
-## Still unknown until Stage 0
+## Unknowns before Stage 0 (resolved by Stage 0 and the validation run; see stage0/stage0_report.md)
 - Jev 1.14's tie mass and AG News behaviour. All tie evidence is from 1.13 on a free route.
 - Whether OpenRouter's Jev route returns the full probability output.
 - Number of test duplicates.

@@ -197,12 +197,14 @@ Full detail is in `stage0/stage0_report.md` and `stage0/frozen.yaml`, both hashe
 
 ## Deviations so far
 
-All four were decided and written into DESIGN.md before the freeze, before any test data was on disk. They are rows in `deviations.md` with Stage "pre-freeze". A fifth row records the pre-freeze validation run of the full pipeline, which used no test data.
+All six were decided before the freeze, before any test data was on disk. They are rows in `deviations.md` with Stage "pre-freeze". Another row records the pre-freeze validation run of the full pipeline, which used no test data; during it, one transient network error and one memory-guard stop paused the run, and both resumed from checkpoints with nothing skipped.
 
 1. **Small LLM candidates replaced.** The first candidates, openai/gpt-oss-20b on Darkbloom and z-ai/glm-5.3-flash on Wafer, returned HTTP 400 "Reasoning is mandatory for this endpoint and cannot be disabled" in Stage 0, so neither could run with reasoning off. They were replaced by mistralai/mistral-nemo on DekaLLM, mistralai/mistral-small-3.2-24b-instruct on Parasail and meta-llama/llama-3.1-8b-instruct on CoreWeave, tried cheapest first with no reasoning field. Selection used no labels and picked mistralai/mistral-nemo on DekaLLM.
 2. **LR-CV folds.** Embedding LR-CV picks C by stratified k-fold inside the bank with k = min(s, 5), not leave-one-out, because leave-one-out could take many hours on the Mac. It is a secondary arm, and it uses no outside labels either way.
 3. **AG News descriptions read literally.** The descriptions are the literal text in the file, because a YAML flow mapping cuts each at its first comma. The upstream loader does cut them, so this study's AG News label text differs from the upstream repo's.
 4. **Registration by public GitHub repo instead of OSF.** Aarmen's decision on 2026-11-05. The registration is this repo made public at the tag `freeze-v1`, with the manifest at the tag recording the repo URL and the public tag recording the commit.
+5. **Outage rows get one more pass.** A row that failed because the service failed (network, usage unavailable, or any HTTP error) gets one more pass at the end of its arm or on a rerun, two passes at most. Answered-but-invalid rows and empty or non-JSON 200 replies stay final. Gold is not read until the stage ends, so this cannot select on results.
+6. **Repeated validation text and test duplicates.** AG News validation keeps its fixed 800 rows although 3 texts repeat inside it, so those texts appear twice in the s=all bank. At the test stage, validation rows sharing text with a test row are removed before s=all is built, as pool rows are.
 
 Any later change to a frozen input gets a row in `deviations.md` and a statement in the post.
 

@@ -1,6 +1,6 @@
 # How many labels is Jev worth? (design v2, 2026-11-04)
 
-Status: revised after a builder check and a validation review. Nothing built, run or paid for. Validation rules are in [VALIDATION.md](VALIDATION.md) and stay in force for the whole build.
+Status: frozen design. Built, reviewed, Stage 0 passed and a full validation dry run passed before the freeze (see below and deviations.md). Validation rules are in [VALIDATION.md](VALIDATION.md).
 
 ## Why
 A senior ML engineer replied to Aarmen's comment on a LinkedIn post about Jev, asking for this comparison. Answer him with a public, pre-registered test, and publish whatever it shows. Reply after results unless Aarmen changes that.
@@ -132,9 +132,9 @@ Hard cap CA$10 (about US$7.15 at 1.3994), everything included, enforced by a lim
 
 Credits: US$5 bought and key limit set by Aarmen on 2026-11-04. Top up only if Stage 0's measured numbers require it, and never past US$7.15.
 
-Estimate from assumed tokens (one measured figure, 2,376 per Banking77 Jev call on 1.13), before the bare-name cut: Jev runs US$1.07, pilots at most US$0.50, small LLM US$0.40 (gpt-oss on Darkbloom) to US$0.96 (GLM on Wafer). Total with the 5.5% fee: about CA$2.90 to CA$3.75. Recompute from measured tokens at the end of Stage 0.
+Measured costs replaced the earlier estimates at Stage 0: Jev about US$0.0001 per Banking77 row; the selected small LLM (mistral-nemo on DekaLLM) about US$0.00005 per row. Projected Stage 1 spend is US$1.60 with fee, plus about US$0.08 for routing on 800 rows.
 
-- **Stage 0, before freeze, validation rows only, at most US$0.50:** Jev smoke test, small LLM selection, Jev on validation, repeatability, routing pilot.
+- **Stage 0, before freeze, validation rows only, at most US$0.50:** Jev smoke test, small LLM selection, Jev on validation, repeatability. The routing pilot ran as 20-row smokes inside the validation dry run.
 - **Stage 1, after freeze, approved all at once, in order:** Jev Banking77; Jev AG News; Jev + examples; routing; small LLM Banking77; small LLM AG News; Jev bare-name runs.
 
 Stop if projected spend passes the cap and mark the rest as not run. Gold is not read until the stage ends.
@@ -149,11 +149,12 @@ Computer time estimated at 3-7 hours (267,560 NLI pairs, plus routing). Time 5,0
 
 ## Rules
 - Terms: never train a model on Jev outputs (MCA 2.3(b)). MCA 14.1 is broad, so link pricing and docs rather than copying them.
-- Personal account, no employer data, and the author's employer is not discussed. Disclose AI help. Aarmen must be able to explain every line.
+- Personal account; no employer data, and the author's employer is not discussed. Disclose AI help. Aarmen must be able to explain every line.
 - Aarmen's yes needed for: each paid stage, the public repo (the registration), each post and reply. All three paid and repo steps were pre-approved on 2026-11-05; posts and replies still need his yes.
-- Public text follows the author's writing rules.
+- Public text follows the author's writing rules: plain words, no em dashes, every claim backed by a measured number.
 
 ## Stage 0 result (2026-11-05)
+NLI timing (Task 4, 2026-11-04): deberta-v3-large at 20.7 pairs/s on validation, about 3.6 h for 267,560 pairs, so the large model is kept under the 12-hour rule.
 PASS, validation only. Jev 1.14 build jev-1.14-20261014: 0 failures on 756 Banking77 and 800 AG News rows; confidence 1.0 on 41.1% and 67.1%; 98.0% label agreement over 3 calls on 100 rows. Small LLM selected: mistralai/mistral-nemo on DekaLLM (49 of 50 usable, about 10 output tokens, no reasoning). Usage posts in about 24 s; reconcile grace 120 s. Stage 0 spend US$0.146; projected Stage 1 US$1.60 with fee. Full detail in stage0_report.md and frozen.yaml.
 
 ## Needed from Aarmen

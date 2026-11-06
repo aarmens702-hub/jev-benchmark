@@ -20,7 +20,7 @@
 - Copy reused code as named files at pinned SHAs into `third_party/` with license notices. Never clone. Never copy `.cache/` or result files. Code from unlicensed repos is not copied.
 - Never train any model on Jev outputs. Full 77-way Jev vectors stay in gitignored `runs/private/`.
 - No Claude attribution or co-author lines in commits, PRs or issues. Commit with Aarmen's GitHub noreply email.
-- Public text follows the author's writing rules.
+- Public text follows the author's writing rules (plain words, no em dashes, every claim measured).
 - Seeds: split 20261105, option order 1105, bootstrap 2026, routing sample prefix `20261105:routing:`.
 
 **Spend guards (all tested in Task 5):**
