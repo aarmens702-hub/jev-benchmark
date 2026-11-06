@@ -1,0 +1,5 @@
+dataset,coverage,s_star,s_j,verdict_row,differs_from_80,flags
+banking77,0.5,all,2,5,True,
+banking77,0.7,8,3,2,False,
+banking77,0.9,8,3,2,False,
+banking77,1.0,8,3,2,False,

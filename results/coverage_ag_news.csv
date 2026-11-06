@@ -1,0 +1,5 @@
+dataset,coverage,s_star,s_j,verdict_row,differs_from_80,flags
+ag_news,0.5,all,8,,,
+ag_news,0.7,none,16,,,
+ag_news,0.9,all,16,,,
+ag_news,1.0,all,16,,,

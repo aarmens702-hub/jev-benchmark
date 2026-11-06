@@ -1,0 +1,18 @@
+{
+ "runs": [
+  {
+   "stage": "stage1",
+   "dry_run": false,
+   "started": "2026-11-06T21:48:47+00:00",
+   "status": "complete",
+   "settings": {
+    "b": 10000,
+    "seed": 2026,
+    "coverage": 0.8
+   },
+   "deviation_rows": 7,
+   "finished": "2026-11-06T22:02:18+00:00",
+   "published_files": 454
+  }
+ ]
+}

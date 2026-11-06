@@ -1,0 +1,4 @@
+arm,status,C,lower,upper,level,matches_jev,flagged,jev_flagged
+NLI,run,-29.0159245516,-30.97505752839368,-27.033658261371738,98.33,False,False,False
+embedding similarity,run,-12.0922232529,-13.670560524753991,-10.3299472120591,98.33,False,False,False
+small LLM,run,-28.5694959802,-30.6943056943,-26.25573637297638,98.33,False,False,False

@@ -1,0 +1,11 @@
+arm,rule,accuracy,acc_at_80,status,note
+Jev,A,85.25,93.61328125,valid,
+Jev,B,97.125,99.0513392857,valid,
+small LLM,A,71.375,79.6875,valid,
+small LLM,B,75.5,81.40625,valid,
+NLI,A,71.125,79.21875,valid,
+NLI,B,79.625,89.6875,valid,
+LR-A,A,97.125,100.0,valid,
+LR-A,B,51.5,59.6875,valid,
+Intent LR + code,A,98.375,99.375,valid,
+Intent LR + code,B,98.375,99.21875,valid,
