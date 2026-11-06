@@ -28,8 +28,10 @@ import hashlib
 import hmac
 import json
 import os
+import shutil
 import subprocess
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 
 import pandas as pd
@@ -72,6 +74,25 @@ _GIT_CONFIG = (
 )
 
 
+@lru_cache(maxsize=1)
+def git_executable() -> str:
+    """The git binary, resolved once from PATH. Refused if it lives inside this repo, where a commit could plant one."""
+    found = shutil.which("git")
+    if found is None:
+        raise FirewallError("git is not on PATH")
+    real = Path(found).resolve()
+    if real == REPO_ROOT.resolve() or REPO_ROOT.resolve() in real.parents:
+        raise FirewallError(f"refusing git inside the repo: {real}")
+    return str(real)
+
+
+def git_identity() -> dict:
+    """The git binary's path and version, to record with the test-load record."""
+    exe = git_executable()
+    version = subprocess.run([exe, "--version"], capture_output=True, text=True, check=True, env=git_env()).stdout.strip()
+    return {"path": exe, "version": version}
+
+
 def git_env() -> dict:
     """The environment for every git call: no GIT_* variable, no global or system config, no replace objects."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
@@ -81,7 +102,7 @@ def git_env() -> dict:
 
 def git_bytes(repo_dir: Path, *args: str, error=FirewallError, stdin: bytes | None = None) -> bytes:
     try:
-        done = subprocess.run(["git", *_GIT_CONFIG, *args], cwd=repo_dir, capture_output=True, check=True, env=git_env(),
+        done = subprocess.run([git_executable(), *_GIT_CONFIG, *args], cwd=repo_dir, capture_output=True, check=True, env=git_env(),
                               input=stdin)
     except (subprocess.CalledProcessError, FileNotFoundError, NotADirectoryError) as exc:
         raise error(f"git {' '.join(args)} failed in {repo_dir}") from exc
@@ -115,34 +136,33 @@ def _allowed_ignored(rel: str, tracked: set) -> bool:
     return False
 
 
+def _blob_id(data: bytes, committed: str) -> str:
+    """Git's blob id for raw bytes: SHA-1, or SHA-256 in a repo using that object format."""
+    algo = hashlib.sha256 if len(committed) == 64 else hashlib.sha1
+    return algo(b"blob %d\0" % len(data) + data).hexdigest()
+
+
 def _content_problems(repo_dir: Path, allow_changed, error) -> list[str]:
     """Raw bytes on disk against HEAD's blobs, with no filters or eol conversion.
 
     A clean filter or an eol rule makes `git status` compare converted bytes, so the code that runs can differ
-    from the committed code while the tree looks clean. Hashing the raw bytes closes that.
+    from the committed code while the tree looks clean. Every blob id is computed here in Python from the raw
+    bytes (the link text for a symlink), so no path quoting, filter or git config is involved.
     """
-    files, links, missing = [], [], []
-    for entry in _z(git_bytes(repo_dir, "ls-tree", "-r", "-z", "HEAD", error=error)):
+    differ = []
+    for entry in _z(git_bytes(repo_dir, "ls-tree", "-r", "-z", "--full-tree", "HEAD", error=error)):
         meta, path = entry.split("\t", 1)
         mode, kind, blob = meta.split()
         if path in allow_changed or kind != "blob":
             continue
         disk = repo_dir / path
         if mode == "120000":
-            links.append((path, blob))
+            data = os.fsencode(os.readlink(disk)) if disk.is_symlink() else None
         elif disk.is_symlink() or not disk.is_file():
-            missing.append(path)
+            data = None
         else:
-            files.append((path, blob))
-    differ = list(missing)
-    if files:
-        out = git_bytes(repo_dir, "hash-object", "--no-filters", "--stdin-paths", error=error,
-                        stdin="".join(p + "\n" for p, _ in files).encode()).decode().split()
-        differ += [p for (p, blob), got in zip(files, out) if got != blob]
-    for path, blob in links:
-        disk = repo_dir / path
-        target = os.readlink(disk).encode() if disk.is_symlink() else None
-        if target is None or hashlib.sha1(b"blob %d\0" % len(target) + target).hexdigest() != blob:
+            data = disk.read_bytes()
+        if data is None or _blob_id(data, blob) != blob:
             differ.append(path)
     return [f"files on disk differ from the committed bytes (filters or eol conversion?): {sorted(differ)[:5]}"] if differ else []
 
@@ -263,7 +283,7 @@ def ls_remote(url: str, refs: list[str]) -> str:
     """
     with tempfile.TemporaryDirectory() as empty:
         empty = str(Path(empty).resolve())
-        cmd = ["git", "-c", "credential.helper=", "-c", "core.askPass=", "-c", "http.extraHeader=",
+        cmd = [git_executable(), "-c", "credential.helper=", "-c", "core.askPass=", "-c", "http.extraHeader=",
                "-c", "http.sslVerify=true", "ls-remote", url, *refs]
         try:
             done = subprocess.run(cmd, cwd=empty, capture_output=True, text=True, check=True,

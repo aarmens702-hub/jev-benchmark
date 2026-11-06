@@ -6,4 +6,7 @@
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
-PYTHONPATH="$root/src" exec uv run --frozen python -m freeze "$@"
+# -P keeps the repo root off sys.path, so only src/ is importable.
+p="$(mktemp -d)"
+export PYTHONPYCACHEPREFIX="$p"
+PYTHONPATH="$root/src" exec uv run --frozen python -P -m freeze "$@"

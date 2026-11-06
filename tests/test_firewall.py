@@ -837,3 +837,57 @@ def test_pinned_revisions_match_design():
     design = (REPO / "DESIGN.md").read_text()
     for spec in firewall.PINNED_TEST_FILES.values():
         assert spec["revision"] in design
+
+
+# --------------------------------------------------------------------------- content check and git binary
+
+
+def test_content_check_handles_quoted_and_newline_paths(tmp_path):
+    repo = make_repo(tmp_path, tag=False)
+    odd = ['"quoted.py', "new\nline.py", "space name.py", "unié.py"]
+    for name in odd:
+        (repo / "src" / name).write_text("x = 1\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "odd names")
+    assert firewall._content_problems(repo, (), FirewallError) == []
+    for name in odd:
+        (repo / "src" / name).write_text("x = 2\n")
+        problems = firewall._content_problems(repo, (), FirewallError)
+        assert problems and repr(f"src/{name}") in problems[0], name  # the message lists paths as a Python list
+        (repo / "src" / name).write_text("x = 1\n")
+
+
+def test_content_check_covers_symlinks_and_missing_files(tmp_path):
+    repo = make_repo(tmp_path, tag=False)
+    (repo / "src" / "link.py").symlink_to("a.py")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "link")
+    assert firewall._content_problems(repo, (), FirewallError) == []
+    (repo / "src" / "link.py").unlink()
+    (repo / "src" / "link.py").symlink_to("../manifest.json")
+    assert "src/link.py" in firewall._content_problems(repo, (), FirewallError)[0]
+    (repo / "src" / "link.py").unlink()
+    assert "src/link.py" in firewall._content_problems(repo, (), FirewallError)[0]
+
+
+@pytest.fixture
+def fresh_git_lookup():
+    firewall.git_executable.cache_clear()
+    yield
+    firewall.git_executable.cache_clear()
+
+
+def test_git_inside_the_repo_is_refused(monkeypatch, fresh_git_lookup):
+    monkeypatch.setattr(firewall.shutil, "which", lambda name: str(firewall.REPO_ROOT / "tools" / "git"))
+    with pytest.raises(FirewallError, match="inside the repo"):
+        firewall.git_executable()
+    firewall.git_executable.cache_clear()
+    monkeypatch.setattr(firewall.shutil, "which", lambda name: None)
+    with pytest.raises(FirewallError, match="not on PATH"):
+        firewall.git_executable()
+
+
+def test_git_identity_records_path_and_version(fresh_git_lookup):
+    identity = firewall.git_identity()
+    assert Path(identity["path"]).is_absolute() and firewall.REPO_ROOT.resolve() not in Path(identity["path"]).parents
+    assert identity["version"].startswith("git version")

@@ -143,9 +143,12 @@ def test_gitignore_keeps_what_must_be_committed(path):
     assert git("check-ignore", "-q", "--no-index", path).returncode == 1, path
 
 
-def test_stage1_script_uses_a_fresh_bytecode_folder():
-    text = (REPO / "scripts" / "stage1.sh").read_text()
-    lines = text.splitlines()
-    prefix = next(i for i, line in enumerate(lines) if line.startswith('export PYTHONPYCACHEPREFIX="$(mktemp -d)"'))
-    run = next(i for i, line in enumerate(lines) if "python -m stage1" in line)
-    assert prefix < run
+@pytest.mark.parametrize("script,module", [("stage1.sh", "stage1"), ("freeze.sh", "freeze")])
+def test_run_scripts_use_a_fresh_bytecode_folder_and_only_src_on_the_path(script, module):
+    lines = (REPO / "scripts" / script).read_text().splitlines()
+    made = next(i for i, line in enumerate(lines) if line == 'p="$(mktemp -d)"')  # its own line, so set -e sees a failure
+    exported = next(i for i, line in enumerate(lines) if line == 'export PYTHONPYCACHEPREFIX="$p"')
+    run = [i for i, line in enumerate(lines) if f"-m {module}" in line]
+    assert len(run) == 1 and made < exported < run[0]
+    assert f"uv run --frozen python -P -m {module}" in lines[run[0]]
+    assert lines[1:4] and "set -euo pipefail" in lines
