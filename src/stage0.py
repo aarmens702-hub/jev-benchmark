@@ -63,9 +63,11 @@ FIRST_CONTACT_JEV_USD = 0.0003
 EXAMPLES_COST_FACTOR = 2.0
 SAFETY = 1.25
 CANDIDATES = (
-    # model, provider, price per M tokens in/out on 2026-11-04 (DESIGN.md), first-contact cost per row
-    ("openai/gpt-oss-20b", "Darkbloom", (0.018, 0.09), 0.0001),
-    ("z-ai/glm-5.3-flash", "Wafer", (0.044, 0.20), 0.0002),
+    # model, provider, price per M tokens in/out on 2026-11-05 (DESIGN.md), first-contact cost per row, reasoning setting.
+    # The reasoning setting is the request's reasoning field; None sends no such field (none of these has built-in reasoning).
+    ("mistralai/mistral-nemo", "DekaLLM", (0.018, 0.030), 0.00005, None),
+    ("mistralai/mistral-small-3.2-24b-instruct", "Parasail", (0.09, 0.30), 0.0002, None),
+    ("meta-llama/llama-3.1-8b-instruct", "CoreWeave", (0.22, 0.22), 0.0003, None),
 )
 # Candidates that fail on their own account; anything else that stops a run ends Stage 0.
 CANDIDATE_STOPS = {"ArmNotRun", "HiddenReasoning", "ConsecutiveFailures"}
@@ -80,6 +82,7 @@ RATE_CHECK_EVERY = 100
 USAGE_WAIT_SECONDS = 120
 USAGE_POLL_SECONDS = 3
 # Ruling R7: later clients wait the measured usage lag, rounded up, before believing a short report.
+GRACE_FLOOR_SECONDS = 120
 GRACE_CAP_SECONDS = 180
 EXIT_OK, EXIT_FAIL, EXIT_STOPPED = 0, 1, 2
 
@@ -364,11 +367,12 @@ class Stage0:
         instructions = prompts.small_llm_instructions("banking77")
         self.obs.phase = "selection"
         self.selection_decided = False
-        for model, provider, price, first_cost in CANDIDATES:
+        for model, provider, price, first_cost, reasoning in CANDIDATES:
             handle = self.new_client(step)
 
-            def decide(row, model=model, provider=provider, handle=handle):
-                return llm_pick(row["row_id"], row["text"], options, model, provider, client=handle.client, instructions=instructions)
+            def decide(row, model=model, provider=provider, handle=handle, reasoning=reasoning):
+                return llm_pick(row["row_id"], row["text"], options, model, provider, client=handle.client, instructions=instructions,
+                                reasoning=reasoning)
 
             slug = model.replace("/", "_")
             report = self.run(handle, step, f"select_{slug}", rows, self.timed(step, decide), first_cost,
@@ -377,7 +381,7 @@ class Stage0:
             valid = summary["rows"] - summary["failed"]
             outage = report.stop_type == "ConsecutiveFailures" and bool(summary["reasons"]) and all(
                 r in ("network", "usage_unavailable") or r.startswith("http_") for r in summary["reasons"])
-            entry = {"outage": outage, "requested": model, "provider": provider, "price": price, "valid": valid, "of": len(rows),
+            entry = {"outage": outage, "requested": model, "provider": provider, "price": price, "reasoning": reasoning, "valid": valid, "of": len(rows),
                      "summary": summary, "stop": report.stop_type, "passed": False}
             self.candidates[model] = entry
             if report.status != "complete" and report.stop_type not in CANDIDATE_STOPS:
@@ -542,8 +546,8 @@ class Stage0:
 
 
 def grace_from_lag(seconds: float) -> int:
-    """The measured lag rounded up, at least the default grace and at most GRACE_CAP_SECONDS."""
-    return int(min(GRACE_CAP_SECONDS, max(DEFAULT_RECONCILE_GRACE_SECONDS, math.ceil(seconds))))
+    """The measured lag rounded up, at least GRACE_FLOOR_SECONDS and at most GRACE_CAP_SECONDS."""
+    return int(min(GRACE_CAP_SECONDS, max(GRACE_FLOOR_SECONDS, math.ceil(seconds))))
 
 
 def _money(x) -> str:
@@ -567,9 +571,10 @@ def frozen_values(st: Stage0, stop) -> dict:
             "model": selected["requested"],
             "provider": selected["provider"],
             "provider_options": {"only": [selected["provider"]], "allow_fallbacks": False, "require_parameters": True},
+            "reasoning_field_sent": selected.get("reasoning") is not None,
             "reply_model_suffix_pattern": MODEL_SUFFIX,
             "reply_models_seen": selected.get("reply_models", []),
-            "price_per_million_tokens_usd": {"input": selected["price"][0], "output": selected["price"][1], "as_of": "2026-11-04"},
+            "price_per_million_tokens_usd": {"input": selected["price"][0], "output": selected["price"][1], "as_of": "2026-11-05"},
         }
     models = st.facts.get("jev_models", [])
     return {
