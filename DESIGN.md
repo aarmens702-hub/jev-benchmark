@@ -43,7 +43,7 @@ Both sequences use the same 2-point margin, so neither side has an easier path t
 | Embedding LR (primary) | Those embeddings, C=100, draws 0-9 | Mac |
 | Embedding LR-CV (secondary) | C from {1,10,100,1000}: stratified k-fold inside the bank with k = min(s, 5), C=100 at s=1, ties toward 100 and then the smaller C. No outside labels | Mac |
 | TF-IDF + LR | Word 1-2 grams, lowercase, no stop list, min_df=1, C=100, max_iter=5000 | Mac |
-| Small LLM | `openai/gpt-oss-20b` or `z-ai/glm-5.3-flash`; integer option ids, enum schema, logprobs, `require_parameters: true`, no `:batch` | API |
+| Small LLM | First passing of `mistralai/mistral-nemo`, `mistralai/mistral-small-3.2-24b-instruct`, `meta-llama/llama-3.1-8b-instruct` (see selection); integer option ids, enum schema, logprobs, `require_parameters: true` | API |
 
 **Scores.**
 - Jev: returned probability of its choice.
@@ -56,7 +56,7 @@ Both sequences use the same 2-point margin, so neither side has an easier path t
 
 **Failures.** A row with no valid answer after retries is wrong and is kept in the covered set, ranked above all other rows. Report failures per arm. 31 or more failures on Banking77, or 76 or more on AG News (about 1%), flags that arm in every table.
 
-**Small LLM selection uses no labels.** Candidates are model-and-provider pairs that list logprobs and structured outputs, tried cheapest first: gpt-oss-20b on Darkbloom ($0.018/$0.09 per M on 2026-11-04), then glm-5.3-flash on Wafer ($0.044/$0.20). Call each with one named provider and `allow_fallbacks: false`, so a run can't mix providers or precision levels. On 50 validation rows, a candidate passes if it returns valid schema output with usable logprobs for 49 or more. Pick the first that passes and freeze the model, provider and any tag. If none passes, the arm is not run, and the post says his "constrained output models" claim went untested. Accuracy is not computed.
+**Small LLM selection uses no labels.** Candidates are model-and-provider pairs with no built-in reasoning that list logprobs, top_logprobs and structured outputs, tried cheapest first: mistralai/mistral-nemo on DekaLLM ($0.018/$0.030 per M on 2026-11-05), then mistralai/mistral-small-3.2-24b-instruct on Parasail ($0.09/$0.30), then meta-llama/llama-3.1-8b-instruct on CoreWeave ($0.22/$0.22). Deviation, logged before the freeze: Stage 0 on 2026-11-05 found that gpt-oss-20b and glm-5.3-flash return HTTP 400 "Reasoning is mandatory for this endpoint and cannot be disabled", so neither can run with reasoning off; requests to the new candidates send no reasoning field. Call each with one named provider and `allow_fallbacks: false`, so a run can't mix providers or precision levels. On 50 validation rows, a candidate passes if it returns valid schema output with usable logprobs for 49 or more. Pick the first that passes and freeze the model, provider and any tag. If none passes, the arm is not run, and the post says his "constrained output models" claim went untested. Accuracy is not computed.
 
 **Label accounting.** No choice for any arm may use validation or test labels. C, temperature, prompts, descriptions and retrieval settings are fixed.
 
