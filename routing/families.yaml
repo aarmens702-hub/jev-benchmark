@@ -1,0 +1,132 @@
+# Banking77 intents grouped into 8 families for the routing test (DESIGN.md, "Routing test").
+# Written from the 77 official intent names only: no message text, label descriptions, counts or
+# model output were looked at. Every intent is in exactly one family (tests/test_routing.py).
+#
+# `topic` and `examples` are what the rule text says: "the message is about <topic> (<examples>)".
+# Both are built from the intent names in the family, worded without numbers, dates or negations.
+# `reason` is the one-line reason for the grouping.
+
+card_ordering:
+  topic: getting a card
+  examples: ordering, delivery, activation, expiry, spare, virtual or disposable cards, or which card types are offered
+  reason: Every name is about obtaining a card or which card products exist, before any problem with using one.
+  intents:
+    - activate_my_card
+    - card_about_to_expire
+    - card_arrival
+    - card_delivery_estimate
+    - disposable_card_limits
+    - get_disposable_virtual_card
+    - get_physical_card
+    - getting_spare_card
+    - getting_virtual_card
+    - order_physical_card
+    - supported_cards_and_currencies
+    - visa_or_mastercard
+
+card_problems:
+  topic: using a card
+  examples: a card that stopped working, a declined card payment, contactless, a blocked or changed PIN, a card kept by a machine, where a card is accepted, or linking a card to Apple Pay, Google Pay or an account
+  reason: Every name is about a card the customer already holds failing or being set up for use.
+  intents:
+    - apple_pay_or_google_pay
+    - card_acceptance
+    - card_linking
+    - card_not_working
+    - card_swallowed
+    - change_pin
+    - contactless_not_working
+    - declined_card_payment
+    - pin_blocked
+    - virtual_card_not_working
+
+security:
+  topic: card or account security
+  examples: a lost, stolen or compromised card or phone, or a card payment, cash withdrawal or direct debit that the customer finds unrecognised
+  reason: Every name is about loss, theft, compromise or activity the customer did not make, which is a security matter.
+  intents:
+    - card_payment_not_recognised
+    - cash_withdrawal_not_recognised
+    - compromised_card
+    - direct_debit_payment_not_recognised
+    - lost_or_stolen_card
+    - lost_or_stolen_phone
+
+top_ups:
+  topic: topping up the account
+  examples: top-up methods, limits, charges, checks, pending, failed or reverted top-ups, automatic top-ups, or a balance that is slow to update after a cash or cheque deposit
+  reason: Every name is about putting money into the account, and a cash or cheque deposit is a top-up by cash or cheque.
+  intents:
+    - automatic_top_up
+    - balance_not_updated_after_cheque_or_cash_deposit
+    - pending_top_up
+    - top_up_by_bank_transfer_charge
+    - top_up_by_card_charge
+    - top_up_by_cash_or_cheque
+    - top_up_failed
+    - top_up_limits
+    - top_up_reverted
+    - topping_up_by_card
+    - verify_top_up
+
+transfers:
+  topic: bank transfers
+  examples: sending, receiving, cancelling or timing a transfer, transfer fees, pending, failed or declined transfers, beneficiaries, or a balance that is slow to update after a transfer
+  reason: Every name is about moving money by bank transfer into or out of the account.
+  intents:
+    - balance_not_updated_after_bank_transfer
+    - beneficiary_not_allowed
+    - cancel_transfer
+    - declined_transfer
+    - failed_transfer
+    - pending_transfer
+    - receiving_money
+    - transfer_fee_charged
+    - transfer_into_account
+    - transfer_not_received_by_recipient
+    - transfer_timing
+
+cash:
+  topic: cash machines and cash withdrawals
+  examples: ATM support, withdrawal charges, declined or pending withdrawals, receiving the wrong amount of cash, or the exchange rate on a withdrawal
+  reason: Every name is about taking cash out at a machine.
+  intents:
+    - atm_support
+    - cash_withdrawal_charge
+    - declined_cash_withdrawal
+    - pending_cash_withdrawal
+    - wrong_amount_of_cash_received
+    - wrong_exchange_rate_for_cash_withdrawal
+
+payments:
+  topic: card payments, charges, refunds and currency exchange
+  examples: card payment fees, pending or reverted card payments, a payment charged twice, extra charges on a statement, refunds, exchange rates and exchange charges, or supported currencies
+  reason: Every name is about what a card payment cost, its status after it was made, refunds, or currency exchange.
+  intents:
+    - Refund_not_showing_up
+    - card_payment_fee_charged
+    - card_payment_wrong_exchange_rate
+    - exchange_charge
+    - exchange_rate
+    - exchange_via_app
+    - extra_charge_on_statement
+    - fiat_currency_support
+    - pending_card_payment
+    - request_refund
+    - reverted_card_payment?
+    - transaction_charged_twice
+
+account:
+  topic: the account and the customer's identity
+  examples: age limits, supported countries, personal details, closing the account, a forgotten passcode, or identity and source of funds checks
+  reason: Every name is about who may hold the account, the holder's details and checks, access, or closing it.
+  intents:
+    - age_limit
+    - country_support
+    - edit_personal_details
+    - passcode_forgotten
+    - terminate_account
+    - unable_to_verify_identity
+    - verify_my_identity
+    - verify_source_of_funds
+    - why_verify_identity
