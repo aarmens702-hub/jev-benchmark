@@ -192,7 +192,10 @@ def test_lock_is_written_before_results_so_a_crash_counts_as_a_run(fresh, monkey
 def test_deviation_rows_skip_the_header_and_rule(tmp_path):
     write_deviations(tmp_path / "d.md", [("one", "stage1"), ("two", "rescore")])
     assert len(score.deviation_rows(tmp_path / "d.md")) == 2
-    assert score.deviation_rows(REPO / "deviations.md") == []  # the real table is empty before Stage 1
+    # Before Stage 1 the real table holds only pre-freeze rows, and the scorer finds its Stage column.
+    real = score.deviation_rows(REPO / "deviations.md")
+    column = score._stage_column(REPO / "deviations.md")
+    assert real and all(score._cells(row)[column] == "pre-freeze" for row in real)
     assert score.deviation_rows(tmp_path / "missing.md") == []
 
 

@@ -1,6 +1,10 @@
 # Deviations
 
-Every change to anything frozen after Stage 1 starts, every bug fix after a failed validation check, and every skipped run gets a row. Nothing is edited after the fact.
+Every change to anything frozen after Stage 1 starts, every bug fix after a failed validation check, and every skipped run gets a row. Nothing is edited after the fact. Rows with Stage "pre-freeze" record departures from the original plan that were decided and written into DESIGN.md before the freeze, before any test data was on disk.
 
 | Date | What changed | Reason | Stage | Approved by |
 |---|---|---|---|---|
+| 2026-11-04 | Embedding LR-CV picks C by stratified k-fold inside the bank with k = min(s, 5), instead of leave-one-out | Leave-one-out at s of 2 to 16 could take many hours on the Mac and break the compute guards. Secondary arm only; no outside labels either way | pre-freeze | Build ruling; DESIGN.md amended before the freeze |
+| 2026-11-04 | AG News label descriptions are read as the literal text in agnews.yaml, not as parsed YAML | A YAML flow mapping cuts each description at its first comma. The visible text is the author's description. The upstream repo's loader does truncate them, so the post discloses the difference | pre-freeze | Build ruling; DESIGN.md amended before the freeze |
+| 2026-11-05 | Small LLM candidates replaced: openai/gpt-oss-20b on Darkbloom and z-ai/glm-5.3-flash on Wafer out; mistralai/mistral-nemo on DekaLLM, mistralai/mistral-small-3.2-24b-instruct on Parasail and meta-llama/llama-3.1-8b-instruct on CoreWeave in, cheapest first, with no reasoning field sent | Stage 0 got HTTP 400 "Reasoning is mandatory for this endpoint and cannot be disabled" from both original candidates, so neither could run with reasoning off. Selection used no labels and picked mistralai/mistral-nemo on DekaLLM (49 of 50 usable) | pre-freeze | Build ruling under Aarmen's go-ahead of 2026-11-05; DESIGN.md amended before the freeze |
+| 2026-11-05 | Registration is by making the GitHub repo aarmens702-hub/jev-benchmark public at tag freeze-v1, with the manifest recording the repo URL and tagged commit, instead of an OSF registration | Aarmen's decision. Less formal than OSF: the public tag and its commit are the record | pre-freeze | Aarmen |
