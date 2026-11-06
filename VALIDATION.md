@@ -30,17 +30,17 @@ A failed check may lead to a **bug fix only**, logged with a reason.
 
 ## Guards
 - **Fetch by file.** All data arrives by `hf_hub_download` of the named train parquet at the pinned revision. No `load_dataset`.
-- **`src/firewall.py`** is the only module that may load test. `load_test(token)` raises unless the token equals SHA-256 of the frozen `manifest.json`, the manifest holds a registration (the public GitHub repo URL and the tagged commit), the git tree is clean, and HEAD is at the freeze tag.
+- **`src/firewall.py`** is the only module that may load test. `load_test(token)` raises unless the token equals SHA-256 of `manifest.json` at the tag `freeze-v1`; HEAD is the tagged commit; the tagged manifest records the public GitHub repo URL, has no pending hash and verifies against the tree, the code and the train parquets; the git tree is clean, every tracked file's raw bytes equal its committed blob, and nothing is hidden from git (no skip-worktree, assume-unchanged, replace refs, filters, or untracked files hidden outside .gitignore); and the public repo, read with no credentials or local config, shows the tag and main at HEAD. Stage 1 and the scorer run with a fresh bytecode folder and only the repo's `src/` on the import path.
 - **`tests/test_firewall.py`** runs in CI and fails if:
   - any test parquet exists under `data/` or the HF cache before the freeze;
   - `split="test"`, `test-0000` or `load_dataset(` appears outside `firewall.py`;
   - `load_test` without a token does not raise;
   - any `.cache/` or prior results file is in the repo;
   - any validation row id appears in a bank at s of 35 or less;
-  - `predict*.py` can import the gold file.
+  - a `predict*.py` file imports a gold module or uses any firewall name that reads test data.
 - **Reuse.** Copy named files only at pinned SHAs, never clone into the project. The Jev cache starts empty and is keyed on model build.
-- **Manifest.** SHA-256 for code, lock file, descriptions, prompts, rule text, seeds, thresholds and train parquet. Test file hashes and post-freeze duplicate counts are recorded after first load.
-- **One-shot scorer.** Test text and gold are split on load. Predictors see text only. `score.py` runs only when every arm has a prediction file or a logged "not run". It writes `scored.lock`, and rerunning needs a deviations row.
+- **Manifest.** SHA-256 for code, tests, lock file, descriptions, prompts, rule text and routing validity, Stage 0 outputs, DESIGN.md, VALIDATION.md, PLAN.md, registration.md, deviations.md and the train parquets, plus the routing rule fingerprint; seeds, thresholds and model ids recorded as values. Test file hashes and post-freeze duplicate counts are recorded after first load, in gitignored `runs/` until scoring finishes, then committed with the results.
+- **One-shot scorer.** Test text and gold are split on load. Predictors see text only. `score.py` runs only when every arm has a prediction file or a logged "not run". It writes `scored.lock`, and rerunning needs a deviations row. Nothing tracked is written between the freeze and the end of scoring. The scorer keeps its own gold cache in gitignored `runs/`, with SHA-256s recorded at first load, so a rescore (which needs a deviations row with Stage `rescore`) never calls `load_test`.
 - **Pilot ledger.** Append-only log of every paid call and row id.
 
 ## Checks that must pass before the freeze

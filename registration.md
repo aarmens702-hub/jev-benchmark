@@ -183,7 +183,7 @@ From VALIDATION.md, "What stops the project":
 
 ## Budget
 
-Hard cap CA$10 (about US$7.15 at 1.3994), everything included, enforced by a limit on the key and in code. Stage 0, before the freeze and on validation rows only, was capped at US$0.50 and spent US$0.146. A full run of the Stage 1 pipeline on validation rows only, ending in the blind dry run, cost about US$0.34 more before the freeze (see deviations.md). Projected Stage 1 spend from measured tokens is US$1.60 with the 5.5% credit fee (about CA$2.23), routing excluded.
+Hard cap CA$10 (about US$7.15 at 1.3994), everything included, enforced by a limit on the key and in code. Stage 0, before the freeze and on validation rows only, was capped at US$0.50 and spent US$0.146. A full run of the Stage 1 pipeline on validation rows only, ending in the blind dry run, cost US$0.27 more before the freeze, by the ledger (see deviations.md). Projected Stage 1 spend from measured tokens is US$1.60 with the 5.5% credit fee (about CA$2.23), routing excluded.
 
 - **Stage 1, after freeze, approved all at once, in order:** Jev Banking77; Jev AG News; Jev + examples; routing; small LLM Banking77; small LLM AG News; Jev bare-name runs.
 

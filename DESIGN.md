@@ -112,7 +112,7 @@ Invalid, and reported as such, if: rules or text change after any arm output on 
 Build order: routing is built last. If it comes out invalid or isn't ready, it is reported that way and does not hold up the Banking77 result.
 
 ## Freeze
-Code, lock file, model ids and pins, label text, prompts, seeds, grid, coverage, tie and failure rules, bootstrap code, outcome rules, routing rules. Registration: make the GitHub repo aarmens702-hub/jev-benchmark public at the freeze, with the tag `freeze-v1` and the SHA-256 manifest; the manifest records the public repo URL and tagged commit as its registration. No OSF (Aarmen's decision, 2026-11-05). Aarmen pre-approved making the repo public at the freeze and starting Stage 1 right after. Keep a deviations table.
+Code, lock file, model ids and pins, label text, prompts, seeds, grid, coverage, tie and failure rules, bootstrap code, outcome rules, routing rules. Registration: make the GitHub repo aarmens702-hub/jev-benchmark public at the freeze, with the tag `freeze-v1` on the commit that holds the SHA-256 manifest. The manifest records the public repo URL; the public tag records the commit, since a commit cannot contain its own SHA. No OSF (Aarmen's decision, 2026-11-05). Aarmen pre-approved making the repo public at the freeze and starting Stage 1 right after. Keep a deviations table.
 
 **Disclosure, in the registration and the post:** the analyst read prior Banking77 and AG News results before registering, including Jev at about 83% on a test sample, LR matching it near 5 labels per class, and about half of answers at confidence 1.0 (Jev 1.13, tallied from a third party's cached outputs on a mixed sample, with no text or gold). The 80% coverage, grid, bins and prediction were set after reading them. Registration prevents later changes; it does not make the design blind. Inherited choices used labels this study does not count: C=100 (1,500 training messages, 19.5 per class) and the retrieved-24 recipe (770 messages, 10 per class, on a larger bank). Jev's training data is not disclosed, so memorisation of public datasets cannot be ruled out.
 
@@ -128,7 +128,7 @@ MIT, copy named files at pinned SHAs with notice and credit, never clone into th
 No license, method and citation only, and do not clone: simonmesmith/jev-banking77-experiment (it holds test labels and predictions), 4esv/jev-eval, mAliAytekin/banking77.
 
 ## Budget
-Hard cap CA$10 (about US$7.15 at 1.3994), everything included, enforced by a limit on the key. Explicit yes before each stage.
+Hard cap CA$10 (about US$7.15 at 1.3994), everything included, enforced by a limit on the key and in code. Paid stages pre-approved by Aarmen up to the US$5 balance (2026-11-05).
 
 Credits: US$5 bought and key limit set by Aarmen on 2026-11-04. Top up only if Stage 0's measured numbers require it, and never past US$7.15.
 
@@ -150,7 +150,7 @@ Computer time estimated at 3-7 hours (267,560 NLI pairs, plus routing). Time 5,0
 ## Rules
 - Terms: never train a model on Jev outputs (MCA 2.3(b)). MCA 14.1 is broad, so link pricing and docs rather than copying them.
 - Personal account, no employer data, and the author's employer is not discussed. Disclose AI help. Aarmen must be able to explain every line.
-- Aarmen's yes needed for: each paid stage, OSF registration, public repo, each post and reply.
+- Aarmen's yes needed for: each paid stage, the public repo (the registration), each post and reply. All three paid and repo steps were pre-approved on 2026-11-05; posts and replies still need his yes.
 - Public text follows the author's writing rules.
 
 ## Stage 0 result (2026-11-05)
@@ -160,4 +160,4 @@ PASS, validation only. Jev 1.14 build jev-1.14-20261014: 0 failures on 756 Banki
 The OpenRouter key is in the macOS Keychain under service `jev-benchmark-openrouter`, entered by Aarmen. Claude never sees or prints the value; code reads it at run time. The original post's article is useful background for the post but doesn't block the freeze.
 
 ## Deliverables
-Public repo, OSF registration, about 800-word blog post on GitHub Pages with the gap-vs-labels chart, LinkedIn post, reply to him.
+Public repo tagged `freeze-v1` (the registration), about 800-word blog post on GitHub Pages with the gap-vs-labels chart, LinkedIn post, reply to him.

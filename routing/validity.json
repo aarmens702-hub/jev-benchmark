@@ -1,0 +1,18 @@
+{
+ "checks": {
+  "agreement_in_40_60": true,
+  "lr_a_at_least_70": true,
+  "state_blind_at_most_70": true,
+  "text_blind_at_most_70": true
+ },
+ "computed_at": "2026-11-06T09:02:04+00:00",
+ "fingerprint": "61a4813bc3bac76e997cb791d59d28d0aff8ebfc35cacac417a668170a906fb3",
+ "rows": 756,
+ "stats": {
+  "agreement": 49.6031746032,
+  "state_blind_A": 44.3121693122,
+  "state_blind_B": 44.8412698413,
+  "text_blind_A": 68.5185185185,
+  "text_blind_B": 69.0476190476
+ }
+}
