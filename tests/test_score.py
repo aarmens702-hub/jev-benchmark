@@ -207,7 +207,7 @@ def test_gold_read_only_inside_score():
             n.id for n in ast.walk(tree) if isinstance(n, ast.Name)
         }
         imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) for a in n.names}
-        if path.name not in ("score.py", "firewall.py"):
+        if path.name not in ("score.py", "firewall.py", "stage1.py"):
             assert "load_test" not in names | imported, path.name
     report_src = (SRC / "report.py").read_text()
     report_tree = ast.parse(report_src)
@@ -223,6 +223,15 @@ def test_gold_read_only_inside_score():
         if isinstance(f, ast.FunctionDef) and any(isinstance(n, ast.Attribute) and n.attr == "load_test" for n in ast.walk(f))
     ]
     assert callers == ["_test_gold"]
+    # stage1.py reaches the firewall in one place, _test_text, which returns the text frame and drops gold.
+    stage1_tree = ast.parse((SRC / "stage1.py").read_text())
+    callers = [
+        f.name
+        for f in ast.walk(stage1_tree)
+        if isinstance(f, ast.FunctionDef) and any(isinstance(n, ast.Attribute) and n.attr == "load_test" for n in ast.walk(f))
+    ]
+    assert callers == ["_test_text"]
+    assert "load_test" not in {a.name for n in ast.walk(stage1_tree) if isinstance(n, ast.ImportFrom) for a in n.names}
 
 
 def test_gold_label_ids_from_the_firewall_map_to_names():
