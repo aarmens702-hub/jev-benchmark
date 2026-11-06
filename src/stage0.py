@@ -37,6 +37,7 @@ from labels import label_texts
 from ledger import HARD_CAP_USD, STAGE_CAPS_USD, RunStop
 from llm_client import MODEL_SUFFIX, llm_pick
 from openrouter import (
+    DEFAULT_RECONCILE_GRACE_SECONDS,
     REPO_ROOT,
     Client,
     add_paid_argument,
@@ -78,6 +79,8 @@ NLI = {
 RATE_CHECK_EVERY = 100
 USAGE_WAIT_SECONDS = 120
 USAGE_POLL_SECONDS = 3
+# Ruling R7: later clients wait the measured usage lag, rounded up, before believing a short report.
+GRACE_CAP_SECONDS = 180
 EXIT_OK, EXIT_FAIL, EXIT_STOPPED = 0, 1, 2
 
 
@@ -93,7 +96,8 @@ class Stage0Stop(Exception):
 class Runtime:
     """Everything that touches the machine, the network or the repo, so tests can swap in fakes."""
 
-    make_client: Callable[[], Client]
+    # Called with reconcile_grace_seconds: None until step 1c has measured the lag, then that grace.
+    make_client: Callable[..., Client]
     load_split: Callable[[str], data.Split] = lambda dataset: data.split(data.load_train(dataset), dataset)
     runs_root: Path = REPO_ROOT / "runs"
     report_dir: Path = REPO_ROOT
@@ -191,6 +195,7 @@ class Stage0:
         self.spent_before = 0.0
         self.ledger = None
         self._first_client = True
+        self.grace: int | None = None  # set from the measured usage lag in step 1c
         self.cache = JevCache(self.private / "jev_cache.jsonl")
         self.splits: dict = {}
 
@@ -201,7 +206,7 @@ class Stage0:
 
     def new_client(self, step: str) -> Handle:
         try:
-            client = self.rt.make_client()
+            client = self.rt.make_client(reconcile_grace_seconds=self.grace)
         except RunStop as stop:
             raise Stage0Stop(step, f"the client would not start: {type(stop).__name__}: {stop}") from None
         client.transport = fields.Recorder(client.transport, self.obs)
@@ -313,7 +318,9 @@ class Stage0:
             self.step("1c key usage", "FAIL", "key usage did not show the spend within the wait")
             raise Stage0Stop(step, f"OpenRouter's key usage did not rise to match {_money(self.usage.ledger_spend)} of Jev spend within "
                              f"{USAGE_WAIT_SECONDS} s (fields 13, 15, 16). Every paid Jev run would stop on a reconciliation gap: stop and ask.", ask=True)
-        self.step("1c key usage", "PASS", f"spend showed in key usage after {self.usage.seconds:.0f} s")
+        self.grace = grace_from_lag(self.usage.seconds)
+        self.step("1c key usage", "PASS", f"spend showed in key usage after {self.usage.seconds:.0f} s; "
+                  f"later clients wait {self.grace} s before believing a short report")
         self.bare_check()
 
     def measure_usage(self, handle) -> fields.UsageCheck:
@@ -534,6 +541,11 @@ class Stage0:
         (report_dir / "frozen.yaml").write_text(yaml.safe_dump(frozen_values(self, stop), sort_keys=False), encoding="utf-8")
 
 
+def grace_from_lag(seconds: float) -> int:
+    """The measured lag rounded up, at least the default grace and at most GRACE_CAP_SECONDS."""
+    return int(min(GRACE_CAP_SECONDS, max(DEFAULT_RECONCILE_GRACE_SECONDS, math.ceil(seconds))))
+
+
 def _money(x) -> str:
     return "n/a" if x is None else f"US${x:.4f}"
 
@@ -566,6 +578,11 @@ def frozen_values(st: Stage0, stop) -> dict:
         "jev": {"request_model": JEV_MODEL, "provider": JEV_PROVIDER, "build": EXPECTED_JEV_BUILD, "reply_models_seen": models},
         "small_llm": llm,
         "nli": dict(NLI),
+        # For Stage 1's clients: the usage lag step 1c measured, and the grace that follows from it (ruling R7).
+        "key_usage": {
+            "lag_seconds": None if st.usage is None or st.usage.seconds is None else round(st.usage.seconds, 1),
+            "reconcile_grace_seconds": st.grace,
+        },
     }
 
 
@@ -692,14 +709,24 @@ def main(argv=None, runtime: Runtime | None = None) -> int:
     if runtime is None:
         if args.paid != STAGE:
             parser.error("Stage 0 spends real money: run it with --paid stage0, after Aarmen's yes")
-        accept = [args.accept_key_usage_usd]
-
-        def make_client() -> Client:
-            amount, accept[0] = accept[0], None  # only the first start can record a baseline
-            return build_client(args.paid, accept_key_usage_usd=amount)
-
-        runtime = Runtime(make_client=make_client)
+        runtime = Runtime(make_client=paid_client_factory(args.paid, args.accept_key_usage_usd))
     return Stage0(runtime).run_all()
+
+
+def paid_client_factory(paid: str, accept_key_usage_usd=None) -> Callable[..., Client]:
+    """Clients on the real paid route. The accepted amount goes to the first start only.
+
+    If it is refused (not an amount, or nothing to accept because the ledger already agrees), the
+    client raises a RunStop before sending, and Stage 0 ends with a clean message.
+    """
+    accept = [accept_key_usage_usd]
+
+    def make_client(reconcile_grace_seconds=None) -> Client:
+        amount, accept[0] = accept[0], None  # only the first start can record a baseline
+        grace = DEFAULT_RECONCILE_GRACE_SECONDS if reconcile_grace_seconds is None else reconcile_grace_seconds
+        return build_client(paid, accept_key_usage_usd=amount, reconcile_grace_seconds=grace)
+
+    return make_client
 
 
 if __name__ == "__main__":
