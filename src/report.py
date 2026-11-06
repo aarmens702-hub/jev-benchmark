@@ -13,6 +13,7 @@ import pandas as pd
 
 GRID_LABELS = ("1", "2", "3", "5", "8", "16", "35", "all")
 TOTAL_AXIS_TITLE = "total labels (all classes)"
+IMBALANCED = {"banking77"}  # DESIGN.md: Banking77's s=all bank is imbalanced across classes
 DATASET_TITLES = {"banking77": "Banking77 (77 intents, sets the verdict)", "ag_news": "AG News (4 topics, a check only)"}
 
 
@@ -57,8 +58,8 @@ def write_tables(results: dict, out_dir: Path) -> list:
         if d.get("coverages"):
             flags = ";".join(f for f in d.get("failure_flags", []))
             rows = [
-                {"dataset": name, "coverage": c["coverage"], "s_star": c["s_star"], "s_j": c["s_j"], "verdict_row": c["verdict_row"],
-                 "differs_from_80": c["differs_from_80"], "flags": flags}
+                {"dataset": name, "coverage": c["coverage"], "s_star": c["s_star"], "s_j": c["s_j"], "verdict_row": c.get("verdict_row"),
+                 "differs_from_80": c.get("differs_from_80"), "flags": flags}
                 for c in d["coverages"]
             ]  # fmt: skip
             _csv(rows, out_dir / f"coverage_{name}.csv")
@@ -82,7 +83,7 @@ def write_tables(results: dict, out_dir: Path) -> list:
     return written
 
 
-def tick_labels(bank_sizes: dict) -> tuple[list, list]:
+def tick_labels(bank_sizes: dict, imbalanced: bool = False) -> tuple[list, list]:
     """x labels (per class, with "all" given its real counts) and the total-labels axis labels."""
     per_class = []
     totals = []
@@ -90,7 +91,8 @@ def tick_labels(bank_sizes: dict) -> tuple[list, list]:
         size = bank_sizes[s]
         totals.append(f"{size['total']:,.0f}")
         if s == "all":
-            per_class.append(f"all\n{size['per_class']:.1f}/class avg\n{size['total']:,.0f} total")
+            note = ", imbalanced" if imbalanced else ""
+            per_class.append(f"all\n{size['per_class']:.1f}/class avg{note}\n{size['total']:,.0f} total")
         else:
             per_class.append(s)
     return per_class, totals
@@ -119,13 +121,14 @@ def chart(results: dict, path: Path) -> dict:
         ax.axhline(0, color="black", linewidth=0.8)
         for m in (-2, 2):
             ax.axhline(m, color="grey", linewidth=0.8, linestyle="--")
-        per_class, totals = tick_labels(d["bank_sizes"])
+        per_class, totals = tick_labels(d["bank_sizes"], imbalanced=name in IMBALANCED)
         ax.set_xticks(x, per_class, fontsize=8)
         ax.set_xlabel("labels per class (s)")
         ax.set_ylabel("embedding LR minus zero-label Jev, acc@80 (points)")
         title = DATASET_TITLES.get(name, name)
-        if d.get("failure_flags"):
-            title += "\nflagged for failures: " + ", ".join(d["failure_flags"][:3])
+        plotted = [f for f in d.get("failure_flags", []) if f == "jev" or f.startswith("lr_d")]  # arms in this chart
+        if plotted:
+            title += "\nflagged for failures: " + ", ".join(plotted[:3]) + (" ..." if len(plotted) > 3 else "")
         ax.set_title(title, fontsize=10)
         top = ax.secondary_xaxis("top")
         top.set_xticks(x, totals, fontsize=7)

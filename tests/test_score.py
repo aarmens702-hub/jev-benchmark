@@ -30,7 +30,7 @@ FAST = Settings(b=200, seed=2026, coverage=0.8)  # dry-run tests only; the resul
 def record_set(tmp_path_factory):
     """One scored stage-of-record run on fake data at B=10,000, shared by the read-only tests."""
     base = tmp_path_factory.mktemp("record")
-    gold = make_fake_runs(base / "runs", "stage1", gold_as_ids=True)
+    gold = make_fake_runs(base / "runs", "stage1", gold_as_ids=True, int_ids=True)  # the firewall's types
     make_fake_runs(base / "runs", "val", seed=1)  # validation scores for realised coverage
     results = score.score("stage1", gold, **paths(base), label_names=CLASSES)
     return base, gold, results
@@ -50,8 +50,9 @@ def copy_runs(src: Path, dst: Path) -> None:
 
 
 def write_deviations(path: Path, rows=()) -> None:
+    """rows: (what changed, stage) pairs."""
     lines = ["# Deviations", "", "| Date | What changed | Reason | Stage | Approved by |", "|---|---|---|---|---|"]
-    lines += [f"| 2026-12-01 | {r} | x | stage1 | Aarmen |" for r in rows]
+    lines += [f"| 2026-12-01 | {what} | x | {stage} | Aarmen |" for what, stage in rows]
     path.write_text("\n".join(lines) + "\n")
 
 
@@ -157,14 +158,17 @@ def test_refuses_rerun_without_deviation_row(fresh, monkeypatch):
 
     with pytest.raises(ScoreRefused, match="needs a new row"):
         score.score("stage1", gold, **paths(base), label_names=CLASSES)
-    write_deviations(base / "deviations.md", ["Fixed a typo in the README"])  # a row, but not about scoring
-    with pytest.raises(ScoreRefused, match="needs a new row"):
+    write_deviations(base / "deviations.md", [("Re-scored after a crash", "stage1")])  # mentions scoring, wrong Stage
+    with pytest.raises(ScoreRefused, match="Stage 'rescore'"):
+        score.score("stage1", gold, **paths(base), label_names=CLASSES)
+    write_deviations(base / "deviations.md", [("Re-scored after a crash", "stage1"), ("again", "rescore later")])
+    with pytest.raises(ScoreRefused, match="Stage 'rescore'"):
         score.score("stage1", gold, **paths(base), label_names=CLASSES)
 
-    write_deviations(base / "deviations.md", ["Fixed a typo in the README", "Re-scored after a crash in report.py"])
+    write_deviations(base / "deviations.md", [("Re-scored after a crash", "stage1"), ("again", "rescore later"), ("Crash in report.py", "rescore")])
     score.score("stage1", gold, **paths(base), label_names=CLASSES)
     lock = json.loads((base / "scored.lock").read_text())
-    assert [r["deviation_rows"] for r in lock["runs"]] == [0, 2]
+    assert [r["deviation_rows"] for r in lock["runs"]] == [0, 3]
     with pytest.raises(ScoreRefused, match="needs a new row"):  # that row is used up
         score.score("stage1", gold, **paths(base), label_names=CLASSES)
 
@@ -186,7 +190,7 @@ def test_lock_is_written_before_results_so_a_crash_counts_as_a_run(fresh, monkey
 
 
 def test_deviation_rows_skip_the_header_and_rule(tmp_path):
-    write_deviations(tmp_path / "d.md", ["one", "two"])
+    write_deviations(tmp_path / "d.md", [("one", "stage1"), ("two", "rescore")])
     assert len(score.deviation_rows(tmp_path / "d.md")) == 2
     assert score.deviation_rows(REPO / "deviations.md") == []  # the real table is empty before Stage 1
     assert score.deviation_rows(tmp_path / "missing.md") == []
@@ -252,11 +256,11 @@ def test_published_files_never_contain_full_vectors(record_set, tmp_path):
     planted = tmp_path / "out"
     (planted / "predictions").mkdir(parents=True)
     pd.DataFrame({"row_id": ["a"], "probs": [[0.1, 0.9]]}).to_parquet(planted / "predictions" / "x.parquet")
-    with pytest.raises(ScoreRefused, match="outside the published set"):
+    with pytest.raises(score.PublishGuardError, match="outside the published set"):
         score.assert_no_vectors(planted)
     (planted / "predictions" / "x.parquet").unlink()
     np.savez(planted / "v.npz", vectors=np.ones((2, 3)))
-    with pytest.raises(ScoreRefused, match="array files"):
+    with pytest.raises(score.PublishGuardError, match="array files"):
         score.assert_no_vectors(planted)
 
 
@@ -268,14 +272,15 @@ def test_chart_labels_all_with_real_counts_and_has_total_labels_axis(record_set)
         drawn = results["chart"][dataset]
         total_all = sizes[dataset]["d0_sall"]["rows"]
         assert drawn["x_labels"][:7] == ["1", "2", "3", "5", "8", "16", "35"]
-        assert drawn["x_labels"][7] == f"all\n{total_all / k:.1f}/class avg\n{total_all:,} total"
+        note = ", imbalanced" if dataset == "banking77" else ""
+        assert drawn["x_labels"][7] == f"all\n{total_all / k:.1f}/class avg{note}\n{total_all:,} total"
         assert drawn["total_axis_title"] == report.TOTAL_AXIS_TITLE
         mean35 = np.mean([sizes[dataset][f"d{r}_s35"]["rows"] for r in range(10)])
         assert drawn["total_labels"][6] == f"{mean35:,.0f}" and drawn["total_labels"][7] == f"{total_all:,}"
     # The real counts in DESIGN.md come through the same labels.
     real = {s: {"total": 9999.0 if s == "all" else 77.0 * int(s), "per_class": 9999 / 77 if s == "all" else float(s)} for s in report.GRID_LABELS}
-    per_class, totals = report.tick_labels(real)
-    assert per_class[-1] == "all\n129.9/class avg\n9,999 total" and totals[-1] == "9,999"
+    per_class, totals = report.tick_labels(real, imbalanced=True)
+    assert per_class[-1] == "all\n129.9/class avg, imbalanced\n9,999 total" and totals[-1] == "9,999"
     ag = {s: {"total": 119_852.0 if s == "all" else 4.0 * int(s), "per_class": 119_852 / 4 if s == "all" else float(s)} for s in report.GRID_LABELS}
     assert report.tick_labels(ag)[0][-1] == "all\n29963.0/class avg\n119,852 total"
 
@@ -350,12 +355,18 @@ def test_all_secondary_rows_are_computed(record_set):
     assert "brier" in arms["lr_d3_s8"] and "nll" in arms["nli"]
     # Realised coverage from each arm's validation scores; cost and latency without any ratio.
     assert 0 < arms["jev"]["realised_coverage"] <= 1 and arms["lr_d0_s1"]["realised_threshold"] is not None
-    assert arms["jev"]["cost_usd"] > 0 and arms["jev"]["latency_p95_s"] >= arms["jev"]["latency_p50_s"]
-    assert arms["nli"]["cost_usd"] is None and arms["nli"]["latency_n"] == 18
+    assert arms["jev"]["cost_usd"] > 0 and arms["jev"][score.PIPE_P95] >= arms["jev"][score.PIPE_P50]
+    assert arms["nli"]["cost_usd"] is None and arms["nli"][score.PIPE_N] == 18
+    assert "pipeline time per row p50 s (not latency)" in pd.read_csv(base / "results" / "arms.csv").columns
+    assert results["latency_probes"]["status"] == "missing"
     assert "ratio" not in json.dumps(results).lower()
     # s* and s_J at 50, 70, 90 and 100% coverage, with the verdict row compared to 80%.
     assert [c["coverage"] for c in b77["coverages"]] == [0.5, 0.7, 0.9, 1.0]
-    assert all("verdict_row" in c and "differs_from_80" in c for c in b77["coverages"])
+    assert all("verdict_row" in c and "differs_from_80" in c and "verdict" not in c for c in b77["coverages"])
+    ag = results["datasets"]["ag_news"]
+    assert [c["coverage"] for c in ag["coverages"]] == [0.5, 0.7, 0.9, 1.0] and "coverage_notes" not in ag
+    assert all({"s_star", "s_j"} <= set(c) and "verdict_row" not in c for c in ag["coverages"])
+    assert (base / "results" / "coverage_ag_news.csv").exists()
     # Risk-coverage, the grid with draw range and wins, isolated passes labelled, secondary LR arms.
     assert len(b77["risk_coverage"]["coverage"]) == 20 and "lr_s8_mean" in b77["risk_coverage"]["arms"]
     assert len(b77["grid"]) == 8 and {"gap_min", "gap_max", "draws_beating_jev"} <= set(b77["grid"][0])
@@ -386,7 +397,8 @@ def test_failure_flags_at_31_on_banking77_and_76_on_ag_news(dataset, below, at):
 
 def test_a_flagged_arm_is_flagged_in_every_table(tmp_path):
     runs = tmp_path / "runs"
-    val_gold = make_fake_runs(runs, "val", per_class={"banking77": 11, "ag_news": 20}, failures={("jev", "banking77"): 31, ("nli", "ag_news"): 75}, families=("lr",))
+    failures = {("jev", "banking77"): 31, ("nli", "banking77"): 31, ("nli", "ag_news"): 75}
+    val_gold = make_fake_runs(runs, "val", per_class={"banking77": 11, "ag_news": 20}, failures=failures, families=("lr",))
     results = score.dry_run(val_gold, runs_root=runs, settings=FAST, deviations_path=tmp_path / "d.md")
     b77 = results["datasets"]["banking77"]
     assert "jev" in b77["failure_flags"] and "nli" not in results["datasets"]["ag_news"]["failure_flags"]
@@ -399,7 +411,7 @@ def test_a_flagged_arm_is_flagged_in_every_table(tmp_path):
     assert any("jev" in n for n in results["headline"]["notes"])
     assert pd.read_csv(out / "his_claim.csv")["jev_flagged"].all()
     assert "jev (flagged)" in pd.read_csv(out / "risk_coverage_banking77.csv").columns
-    assert "jev" in results["chart"]["banking77"]["title"]
+    assert "jev" in results["chart"]["banking77"]["title"] and "nli" not in results["chart"]["banking77"]["title"]
 
 
 # --------------------------------------------------------------------------- the dry run
@@ -457,10 +469,10 @@ def test_dry_run_needs_jev_and_lr_on_banking77(tmp_path):
 def test_dry_run_cli_prints_only_ok_or_a_failure(tmp_path, capsys):
     runs = tmp_path / "runs"
     val_gold = make_fake_runs(runs, "val", families=("lr",))
-    code = score.main(["--dry-run"], runs_root=runs, load_val_gold=lambda: val_gold, settings=FAST)
+    code = score.main(["--dry-run"], runs_root=runs, load_val_gold=lambda: val_gold, load_label_names=lambda: CLASSES, settings=FAST)
     assert code == 0 and capsys.readouterr().out == "DRY RUN OK\n"
     predictions.paths("jev", "banking77", "val", runs)[0].unlink()
-    code = score.main(["--dry-run"], runs_root=runs, load_val_gold=lambda: val_gold, settings=FAST)
+    code = score.main(["--dry-run"], runs_root=runs, load_val_gold=lambda: val_gold, load_label_names=lambda: CLASSES, settings=FAST)
     out = capsys.readouterr().out
     assert code == 1 and out.startswith("DRY RUN FAILED:") and out.count("\n") == 1
     assert not any(ch.isdigit() for ch in out.replace("banking77", ""))  # no numbers, so no accuracy
@@ -473,3 +485,173 @@ def test_dry_run_at_settings_of_record_on_fake_validation(tmp_path):
     results = score.dry_run(val_gold, runs_root=runs, deviations_path=tmp_path / "d.md")
     assert results["settings"] == {"b": 10_000, "seed": 2026, "coverage": 0.8}
     assert set(results["datasets"]) == {"banking77", "ag_news"}
+
+
+# --------------------------------------------------------------------------- review round 1: lock in the computation
+
+
+def file_arm(base, stage, arm, dataset, gold):
+    names = score.gold_names(gold[dataset], CLASSES[dataset])["label"].to_numpy()
+    rows, vectors, classes = predictions.read(arm, dataset, stage, base / "runs")
+    return score.build_arm(arm, score.Loaded(rows, vectors, classes), names)
+
+
+def test_each_bootstrap_gets_jev_every_lr_draw_at_its_own_s_and_gold_classes(fresh, monkeypatch):
+    base, gold = fresh
+    calls = []
+    real = score.bootstrap_ds
+
+    def spy(lr, jev, classes, *args, **kwargs):
+        if kwargs.get("n_replicates") is None:
+            calls.append((lr, jev, classes, kwargs["coverage"]))
+        return real(lr, jev, classes, *args, **kwargs)
+
+    monkeypatch.setattr(score, "bootstrap_ds", spy)
+    score.score("stage1", gold, **paths(base), label_names=CLASSES)
+    seen = set()
+    for dataset in ("banking77", "ag_news"):
+        names = score.gold_names(gold[dataset], CLASSES[dataset])["label"].to_numpy()
+        jev = file_arm(base, "stage1", "jev", dataset, gold).array
+        for family in score.FAMILIES:
+            want = {s: [file_arm(base, "stage1", f"{family}_d{0 if s == 'all' else r}_s{s}", dataset, gold).array for r in range(10)] for s in GRID}
+            mine = [c for c in calls if len(c[2]) == len(names) and np.array_equal(c[0][1][0], want[1][0])]
+            assert mine, (dataset, family)
+            for lr, jev_arg, classes, coverage in mine:
+                assert np.array_equal(jev_arg, jev)
+                assert list(classes) == list(names)  # stratified by gold class
+                for s in GRID:
+                    for r in range(10):
+                        assert np.array_equal(lr[s][r], want[s][r]), (family, s, r)
+                seen.add((dataset, family, coverage))
+    for dataset in ("banking77", "ag_news"):
+        assert {c for d, f, c in seen if d == dataset and f == "lr"} == {0.5, 0.7, 0.8, 0.9, 1.0}
+        assert {c for d, f, c in seen if d == dataset and f != "lr"} == {0.8}
+
+
+def test_failed_rows_rank_first_and_count_wrong_in_acc_at_80():
+    # Rows 0-1 failed; answered rows by confidence 0.9 ... 0.4, correct T T F T T T F T.
+    rows = pd.DataFrame(
+        {
+            "row_id": list(range(10)),
+            "pred": ["", "", "a", "a", "b", "a", "a", "a", "b", "a"],
+            "top_prob": [0.0, 0.0, 0.9, 0.85, 0.8, 0.75, 0.7, 0.6, 0.5, 0.4],
+            "failed": [True, True] + [False] * 8,
+            "latency_s": [0.1] * 10,
+        }
+    )
+    gold = np.array(["a"] * 10)
+    arm = score.build_arm("nli", score.Loaded(rows, None, None), gold)
+    # Keep 8: the 2 failed rows (wrong), then the top 6 answered, 5 of them correct: 5/8.
+    assert score.arm_row("banking77", arm, 0.8, None)["acc_at_80"] == pytest.approx(62.5)
+    assert arm.array[:2, 2].tolist() == [1.0, 1.0]
+
+
+def test_ag_news_addition_and_secondary_coverages_use_their_own_results(record_set):
+    base, gold, results = record_set
+    ag_jev = file_arm(base, "stage1", "jev", "ag_news", gold)
+    b77_jev = file_arm(base, "stage1", "jev", "banking77", gold)
+    ag_acc = 100 * score.acc_at(ag_jev.array[:, 0], ag_jev.correct, ag_jev.failed, 0.8)
+    b77_acc = 100 * score.acc_at(b77_jev.array[:, 0], b77_jev.correct, b77_jev.failed, 0.8)
+    assert ag_acc != pytest.approx(b77_acc)  # so the check below can tell them apart
+    assert results["additions"]["ag_news"]["jev_acc"] == pytest.approx(ag_acc)
+    for dataset, jev in (("banking77", b77_jev), ("ag_news", ag_jev)):
+        for entry in results["datasets"][dataset]["coverages"]:
+            c = entry["coverage"]
+            assert entry["ds_coverage"] == c
+            assert entry["jev_acc"] == pytest.approx(100 * score.acc_at(jev.array[:, 0], jev.correct, jev.failed, c))
+
+
+def test_realised_threshold_is_the_20th_percentile_of_validation_scores(record_set):
+    base, gold, results = record_set
+    val, _, _ = predictions.read("jev", "banking77", "val", base / "runs")
+    threshold = np.quantile(val.loc[~val.failed, "top_prob"], 0.2)
+    row = next(r for r in results["datasets"]["banking77"]["arms"] if r["arm"] == "jev")
+    assert row["realised_threshold"] == pytest.approx(threshold)
+    test = file_arm(base, "stage1", "jev", "banking77", gold)
+    assert row["realised_coverage"] == pytest.approx(np.mean(test.failed | (test.conf >= threshold)))
+
+
+def test_pipeline_time_leaves_out_cached_rows():
+    rows = pd.DataFrame({"latency_s": [100.0, 1.0, 2.0, 3.0], "cached": [True, False, False, False], "cost": [0.0, 1e-4, 1e-4, 1e-4]})
+    out = score.cost_and_latency(rows)
+    assert out[score.PIPE_N] == 3 and out[score.PIPE_P50] == pytest.approx(2.0) and out[score.PIPE_P95] < 100
+
+
+def test_embedding_similarity_scores_at_temperature_005(record_set):
+    base, gold, _ = record_set
+    names = score.gold_names(gold["banking77"], CLASSES["banking77"])["label"].to_numpy()
+    _, cos, classes = predictions.read("embed_sim", "banking77", "stage1", base / "runs")
+    idx = [classes.index(g) for g in names]
+    pub = pd.read_parquet(base / "results" / "predictions" / "banking77" / "embed_sim.parquet")
+    at = lambda t: (np.exp(cos / t) / np.exp(cos / t).sum(axis=1, keepdims=True))[np.arange(len(idx)), idx]  # noqa: E731
+    assert np.allclose(pub["gold_prob"], at(0.05)) and not np.allclose(pub["gold_prob"], at(0.2))
+
+
+def test_latency_probe_summary_is_included_when_probes_exist(fresh, monkeypatch):
+    base, gold = fresh
+    monkeypatch.setattr(score, "SECONDARY_COVERAGES", ())
+    probe = {"arm": "jev", "timed": {"n": 3, "p50": 0.3, "p95": 0.4},
+             "condition": {"hardware": "m", "region": "r", "date": "2026-12-01", "concurrency": 1}}  # fmt: skip
+    (base / "runs" / "latency").mkdir()
+    (base / "runs" / "latency" / "probes.jsonl").write_text(json.dumps(probe) + "\n")
+    results = score.score("stage1", gold, **paths(base), label_names=CLASSES)
+    group = results["latency_probes"]["by_condition"][0]
+    assert results["latency_probes"]["status"] == "run" and group["arms"][0]["timed"]["p95"] == 0.4
+
+
+# --------------------------------------------------------------------------- review round 1: refuse before the lock
+
+
+def test_refuses_a_predicted_label_outside_the_label_names(fresh):
+    base, gold = fresh
+    rows, vec, classes = predictions.read("small_llm", "banking77", "stage1", base / "runs")
+    rows.loc[3, "pred"] = "card_arival"
+    rows.loc[3, "failed"] = False
+    predictions.write("small_llm", "banking77", rows, "stage1", None, None, base / "runs")
+    with pytest.raises(ScoreRefused, match="small_llm predicts labels outside the label names"):
+        score.score("stage1", gold, **paths(base), label_names=CLASSES)
+    assert not (base / "scored.lock").exists()
+
+
+def test_refuses_unusable_metric_inputs_and_missing_bank_sizes_before_the_lock(fresh):
+    base, gold = fresh
+    sizes_path = base / "runs" / "stage1" / "bank_sizes.json"
+    sizes = json.loads(sizes_path.read_text())
+    good = json.dumps(sizes)
+    for r in range(10):
+        del sizes["ag_news"][f"d{r}_s16"]
+    sizes_path.write_text(json.dumps(sizes))
+    with pytest.raises(ScoreRefused, match="s=16"):
+        score.score("stage1", gold, **paths(base), label_names=CLASSES)
+    sizes_path.write_text(good)
+    rows, vec, classes = predictions.read("nli", "ag_news", "stage1", base / "runs")
+    vec[2, 1] = np.nan  # an answered row with a broken vector would make Brier refuse after the lock
+    predictions.write("nli", "ag_news", rows, "stage1", vec, classes, base / "runs")
+    with pytest.raises(ScoreRefused, match="nli has an answered row with no probability vector"):
+        score.score("stage1", gold, **paths(base), label_names=CLASSES)
+    rows.loc[2, "top_prob"] = 1.5
+    vec[2, 1] = 0.1
+    predictions.write("nli", "ag_news", rows, "stage1", vec, classes, base / "runs")
+    with pytest.raises(ScoreRefused, match="outside"):
+        score.score("stage1", gold, **paths(base), label_names=CLASSES)
+    assert not (base / "scored.lock").exists() and not (base / "results").exists()
+
+
+def test_refuses_results_without_a_lock_and_predictions_without_gold(fresh):
+    base, gold = fresh
+    with pytest.raises(ScoreRefused, match="ag_news has prediction files but no gold"):
+        score.score("stage1", {"banking77": gold["banking77"]}, **paths(base), label_names=CLASSES)
+    (base / "results").mkdir()
+    (base / "results" / "results.json").write_text("{}")
+    with pytest.raises(ScoreRefused, match="results.json exists without scored.lock"):
+        score.score("stage1", gold, **paths(base), label_names=CLASSES)
+
+
+def test_firewall_integer_row_ids_round_trip_through_prediction_files(tmp_path):
+    rows = pd.DataFrame({"row_id": [0, 1, 2], "pred": ["a", "b", "a"], "top_prob": [0.6, 0.7, 0.8], "failed": [False] * 3, "latency_s": [0.1] * 3})
+    predictions.write("lr_d0_s1", "banking77", rows, "stage1", np.full((3, 2), 0.5), ["a", "b"], tmp_path)
+    got, vec, _ = predictions.read("lr_d0_s1", "banking77", "stage1", tmp_path)
+    assert got["row_id"].tolist() == [0, 1, 2] and vec.shape == (3, 2)
+    gold = pd.DataFrame({"row_id": pd.RangeIndex(3, name="row_id"), "label": [0, 1, 0]})  # firewall shape
+    data = score.DatasetInput("banking77", single={"x": score.Loaded(got, vec, ["a", "b"])})
+    score.check_row_order(score.gold_names(gold, ["a", "b"]), data)  # no error

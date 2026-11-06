@@ -89,7 +89,8 @@ def read(arm: str, dataset: str, stage: str = "val", root: Path = RUNS):
     if private.exists():
         with np.load(private, allow_pickle=False) as z:
             vectors, classes = z["vectors"], [str(c) for c in z["classes"]]
-            if list(z["row_id"]) != rows["row_id"].tolist():
+            # The private file keeps row ids as text; the public one keeps their own type (the firewall's are ints).
+            if [str(r) for r in z["row_id"]] != rows["row_id"].astype(str).tolist():
                 raise ValueError(f"{private.name} does not match {public.name}; delete both and rerun")
     return rows, vectors, classes
 

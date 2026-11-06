@@ -9,8 +9,8 @@ permuted first (seed 2026) so the output carries no real comparison.
 
 It runs only when every arm has a prediction file or a logged "not run" (predictions.mark_not_run), and
 every file holds the gold rows in gold's order. It writes scored.lock before the first result is
-computed, so a rerun after a crash counts as a rerun, and a rerun needs a new row in deviations.md that
-mentions scoring. The result of record uses B=10,000, seed 2026 and 80% coverage and nothing else.
+computed, so a rerun after a crash counts as a rerun, and a rerun needs a new row in deviations.md whose
+Stage is exactly "rescore". Every refusal happens before the lock. The result of record uses B=10,000, seed 2026 and 80% coverage and nothing else.
 Published files never hold a full probability vector.
 """
 from __future__ import annotations
@@ -90,6 +90,10 @@ PUBLISHED_COLUMNS = ["row_id", "pred", "top_prob", "failed", "gold_prob", "model
 
 class ScoreRefused(RuntimeError):
     """A condition for scoring does not hold. Nothing has been written."""
+
+
+class PublishGuardError(RuntimeError):
+    """The scorer's own output broke the publishing rule: a bug, found after the lock, never a refusal."""
 
 
 @dataclass(frozen=True)
@@ -204,6 +208,35 @@ def gold_names(frame: pd.DataFrame, names: Optional[list]) -> pd.DataFrame:
             raise ScoreRefused("gold holds label ids, so label names are needed")
         labels = labels.map(lambda i: names[int(i)])
     return pd.DataFrame({"row_id": frame["row_id"].to_numpy(), "label": labels.astype(str).to_numpy()})
+
+
+def check_labels(gold: pd.DataFrame, data: DatasetInput, names: Optional[list]) -> None:
+    """Gold and every answered prediction must be a known label name, or a mapping slip scores every row wrong."""
+    allowed = set(map(str, names)) if names is not None else set(gold["label"])
+    bad_gold = sorted(set(gold["label"]) - allowed)
+    if bad_gold:
+        raise ScoreRefused(f"{data.dataset}: gold labels outside the label names, e.g. {bad_gold[0]!r}")
+    arms = list(data.single.items()) + [item for fam in data.families.values() for item in fam.items()]
+    for name, loaded in arms:
+        rows = loaded.rows
+        answered = rows.loc[~rows["failed"].to_numpy(dtype=bool), "pred"].astype(str)
+        outside = sorted(set(answered) - allowed)
+        if outside:
+            raise ScoreRefused(f"{data.dataset}: {name} predicts labels outside the label names, e.g. {outside[0]!r}")
+
+
+def check_arm(dataset: str, arm: "Arm") -> None:
+    """Every input a metric reads must be usable, so no metric can refuse after the lock."""
+    ok = ~arm.failed
+    conf = arm.conf[ok]
+    if not np.isfinite(conf).all():
+        raise ScoreRefused(f"{dataset}: {arm.name} has an answered row with no top probability")
+    base = arm.name.split("_d")[0] if arm.name.startswith(FAMILIES) else arm.name
+    low = -1.0 if base in RANK_ONLY else 0.0
+    if ((conf < low - 1e-9) | (conf > 1 + 1e-9)).any():
+        raise ScoreRefused(f"{dataset}: {arm.name} has a top probability outside [{low:g}, 1]")
+    if arm.probs is not None and not np.isfinite(arm.probs[ok]).all():
+        raise ScoreRefused(f"{dataset}: {arm.name} has an answered row with no probability vector")
 
 
 def check_row_order(gold: pd.DataFrame, data: DatasetInput) -> None:
@@ -323,8 +356,15 @@ def realised_coverage(arm: Arm, val_rows: Optional[pd.DataFrame]) -> dict:
     }
 
 
+# Timing in prediction files is pipeline time per row (batch-amortised for local arms, concurrent for API
+# arms), not latency. Latency comes from latency_probe.py and is reported separately.
+PIPE_P50 = "pipeline time per row p50 s (not latency)"
+PIPE_P95 = "pipeline time per row p95 s (not latency)"
+PIPE_N = "pipeline time rows"
+
+
 def cost_and_latency(rows: pd.DataFrame) -> dict:
-    out = {"cost_usd": None, "latency_p50_s": None, "latency_p95_s": None, "latency_n": 0}
+    out = {"cost_usd": None, PIPE_P50: None, PIPE_P95: None, PIPE_N: 0}
     if "cost" in rows.columns:
         out["cost_usd"] = float(rows["cost"].sum())
     lat = rows["latency_s"].to_numpy(dtype=float) if "latency_s" in rows.columns else np.array([])
@@ -333,8 +373,19 @@ def cost_and_latency(rows: pd.DataFrame) -> dict:
     lat = lat[np.isfinite(lat)]
     if len(lat):
         p50, p95 = np.percentile(lat, [50, 95])
-        out.update(latency_p50_s=float(p50), latency_p95_s=float(p95), latency_n=int(len(lat)))
+        out.update({PIPE_P50: float(p50), PIPE_P95: float(p95), PIPE_N: int(len(lat))})
     return out
+
+
+def latency_probes(runs_root: Path) -> dict:
+    """The latency probes' p50 and p95 by condition, if runs/latency/probes.jsonl exists."""
+    import latency_probe
+
+    path = Path(runs_root) / "latency" / "probes.jsonl"
+    if not path.exists():
+        return {"status": "missing", "note": "no latency probes were run; pipeline times are not latency"}
+    results = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return {"status": "run", **latency_probe.build_report(results)}
 
 
 def risk_coverage(arm: Arm) -> list:
@@ -401,12 +452,27 @@ def bank_size_table(sizes: Mapping, n_classes: int) -> dict:
 # --------------------------------------------------------------------------- lock and deviations
 
 
+RESCORE_STAGE = "rescore"
+
+
+def _cells(line: str) -> list:
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
 def deviation_rows(path: Path) -> list:
     """Data rows of the deviations table: lines that start with "|", minus the header and its rule."""
     if not Path(path).exists():
         return []
     lines = [ln.strip() for ln in Path(path).read_text(encoding="utf-8").splitlines() if ln.strip().startswith("|")]
     return [ln for ln in lines[2:] if not re.fullmatch(r"\|[\s:|-]*", ln)]
+
+
+def _stage_column(path: Path) -> int:
+    lines = [ln for ln in Path(path).read_text(encoding="utf-8").splitlines() if ln.strip().startswith("|")]
+    header = _cells(lines[0]) if lines else []
+    if "Stage" not in header:
+        raise ScoreRefused(f"{Path(path).name} has no Stage column")
+    return header.index("Stage")
 
 
 def check_lock(lock_path: Path, deviations_path: Path) -> list:
@@ -417,9 +483,11 @@ def check_lock(lock_path: Path, deviations_path: Path) -> list:
     runs = lock.get("runs", [])
     seen = runs[-1]["deviation_rows"] if runs else 0
     new = deviation_rows(deviations_path)[seen:]
-    if not any(re.search(r"scor", row, re.IGNORECASE) for row in new):
+    column = _stage_column(deviations_path) if new else 0
+    if not any(len(_cells(row)) > column and _cells(row)[column] == RESCORE_STAGE for row in new):
         raise ScoreRefused(
-            f"{Path(lock_path).name} exists: rerunning the scorer needs a new row in {Path(deviations_path).name} saying why"
+            f"{Path(lock_path).name} exists: rerunning the scorer needs a new row in {Path(deviations_path).name} "
+            f"with Stage '{RESCORE_STAGE}' saying why"
         )
     return runs
 
@@ -498,6 +566,7 @@ def dry_run(
     deviations_path: Path = DEVIATIONS,
     clock: Callable[[], float] = time.monotonic,
     limit_hours: float = LIMIT_HOURS,
+    label_names: Optional[Mapping[str, list]] = None,
 ) -> dict:
     """End to end on validation predictions, gold permuted (seed 2026), writing only to runs/dryrun/.
 
@@ -526,7 +595,7 @@ def dry_run(
     permuted = {dataset: permute_gold(frame) for dataset, frame in val_gold.items()}
     return _score(
         val_stage, permuted, settings, runs_root=runs_root, out_dir=out / "results", lock_path=out / "scored.lock",
-        deviations_path=deviations_path, label_names=None, val_stage=val_stage, clock=clock, limit_hours=limit_hours,
+        deviations_path=deviations_path, label_names=label_names, val_stage=val_stage, clock=clock, limit_hours=limit_hours,
         record=False, extra_not_run=absent,
     )  # fmt: skip
 
@@ -554,7 +623,12 @@ def _score(
     unknown = set(gold) - set(DATASETS)
     if unknown:
         raise ScoreRefused(f"unknown datasets {sorted(unknown)}")
+    if (Path(out_dir) / "results.json").exists() and not Path(lock_path).exists():
+        raise ScoreRefused(f"{Path(out_dir).name}/results.json exists without {Path(lock_path).name}; find out why before scoring")
     prior_runs = check_lock(lock_path, deviations_path)
+    for d in DATASETS:
+        if d not in gold and any((Path(runs_root) / stage).glob(f"*__{d}.parquet")):
+            raise ScoreRefused(f"{d} has prediction files but no gold was given")
 
     # 1. Every arm accounted for, and every file in gold's row order. Only row ids are compared here.
     not_run = {**predictions.read_not_run(stage, runs_root), **(extra_not_run or {})}
@@ -562,17 +636,28 @@ def _score(
     golds = {d: gold_names(gold[d], (label_names or {}).get(d)) for d in inputs}
     for d in inputs:
         check_row_order(golds[d], inputs[d])
+        check_labels(golds[d], inputs[d], (label_names or {}).get(d))
+
+    # 2. Arrays, and every input a metric will need, checked now: nothing may refuse once the lock is down.
     sizes_path = Path(runs_root) / stage / "bank_sizes.json"
     all_sizes = json.loads(sizes_path.read_text()) if sizes_path.exists() else {}
-    if any(PRIMARY_FAMILY in inputs[d].families and d not in all_sizes for d in inputs):
-        raise ScoreRefused(f"{sizes_path.name} is missing a dataset with LR predictions; the chart needs real counts")
-
-    # 2. Arrays.
-    arms, fams = {}, {}
+    size_tables = {}
+    for d in inputs:
+        if PRIMARY_FAMILY not in inputs[d].families:
+            continue
+        if d not in all_sizes:
+            raise ScoreRefused(f"{sizes_path.name} is missing {d}, which has LR predictions; the chart needs real counts")
+        size_tables[d] = bank_size_table(all_sizes[d], max(v["classes"] for v in all_sizes[d].values()))
+    arms, fams, val_rows = {}, {}, {}
     for d, data in inputs.items():
         labels = golds[d]["label"].to_numpy()
         arms[d] = {name: build_arm(name, loaded, labels) for name, loaded in data.single.items()}
         fams[d] = {f: {name: build_arm(name, loaded, labels) for name, loaded in files.items()} for f, files in data.families.items()}
+        for name, arm in list(arms[d].items()) + [item for fam in fams[d].values() for item in fam.items()]:
+            check_arm(d, arm)
+            got = predictions.read(name, d, val_stage, runs_root)
+            val_rows[(d, name)] = None if got is None else got[0]
+    probes = latency_probes(runs_root)
 
     # 3. The bootstrap work, projected from 100 replicates before any of it runs.
     jobs: list[Job] = []
@@ -584,7 +669,7 @@ def _score(
         for f in fams[d]:
             lr = lr_input(fams[d][f], f)
             coverages = (settings.coverage,)
-            if d == "banking77" and f == PRIMARY_FAMILY:
+            if f == PRIMARY_FAMILY:  # Banking77's set the headline note; AG News's are a table only
                 coverages += SECONDARY_COVERAGES
             for c in coverages:
                 jobs.append(_ds_job((d, f, c), lr, jev, classes, settings, c))
@@ -628,12 +713,12 @@ def _score(
     write_lock(lock_path, prior_runs, entry)
 
     full = {job.name: job.run() for job in jobs}
-    if record:  # belt and braces: every result of record ran the full B at its own coverage
+    if record:  # a bug guard, not a refusal: check_record already held before the lock
         for (d, f, c), ds in full.items():
             if ds.b != RECORD.b or ds.n_replicates != RECORD.b or ds.partial or ds.coverage != c:
-                raise ScoreRefused(f"{d} {f} at {c} did not run at the settings of record")
+                raise RuntimeError(f"bug: {d} {f} at {c} did not run at the settings of record")
             if f == PRIMARY_FAMILY and c == settings.coverage and ds.coverage != RECORD.coverage:
-                raise ScoreRefused("the primary contrast must be at 80% coverage")
+                raise RuntimeError("bug: the primary contrast must be at 80% coverage")
 
     results = {
         "stage": stage,
@@ -645,7 +730,8 @@ def _score(
         "datasets": {},
     }
     for d, data in inputs.items():
-        results["datasets"][d] = dataset_results(d, data, arms[d], fams[d], golds[d], full, settings, runs_root, val_stage, stage, all_sizes.get(d))
+        results["datasets"][d] = dataset_results(d, arms[d], fams[d], golds[d], full, settings, size_tables.get(d), val_rows)
+    results["latency_probes"] = probes
 
     b77r = results["datasets"]["banking77"]
     primary = b77r.get("primary")
@@ -675,16 +761,15 @@ def _s(text: str):
     return text if text in ("all", "none") else int(text)
 
 
-def dataset_results(d, data, arms, fams, gold, full, settings, runs_root, val_stage, stage, sizes) -> dict:
+def dataset_results(d, arms, fams, gold, full, settings, size_table, val_rows) -> dict:
     out: dict = {"n_rows": int(len(gold)), "n_classes": int(gold["label"].nunique())}
     flagged = sorted(
         [name for name, arm in arms.items() if failure_flag(d, arm.failed.sum())]
         + [name for fam in fams.values() for name, arm in fam.items() if failure_flag(d, arm.failed.sum())]
     )
     out["failure_flags"] = flagged
-    if sizes is not None:
-        n_classes = max(v["classes"] for v in sizes.values())
-        out["bank_sizes"] = bank_size_table(sizes, n_classes)
+    if size_table is not None:
+        out["bank_sizes"] = size_table
     primary_key = (d, PRIMARY_FAMILY, settings.coverage)
     if primary_key in full:
         ds = full[primary_key]
@@ -694,15 +779,19 @@ def dataset_results(d, data, arms, fams, gold, full, settings, runs_root, val_st
     else:
         out["primary"] = None
         out["primary_status"] = NOT_RUN
-    if d == "banking77" and primary_key in full:
+    if primary_key in full:
         rows = {}
         out["coverages"] = []
         for c in SECONDARY_COVERAGES:
             dsc = full[(d, PRIMARY_FAMILY, c)]
-            dec = decide(dsc)
-            rows[c] = dec["verdict_row"]
-            out["coverages"].append({"coverage": c, **dec, "differs_from_80": dec["verdict_row"] != out["primary"]["verdict_row"]})
-        out["coverage_notes"] = coverage_notes(rows, out["primary"]["verdict_row"])
+            s_star, s_j = lr_ahead(dsc), jev_ahead(dsc)
+            entry = {"coverage": c, "ds_coverage": dsc.coverage, "s_star": str(s_star), "s_j": str(s_j), "jev_acc": dsc.jev_acc}
+            if d == "banking77":  # the verdict-row comparison is Banking77's only; no sentence, since row 1 names 80%
+                rows[c] = verdict_row(s_star, s_j)
+                entry.update(verdict_row=rows[c], differs_from_80=rows[c] != out["primary"]["verdict_row"])
+            out["coverages"].append(entry)
+        if d == "banking77":
+            out["coverage_notes"] = coverage_notes(rows, out["primary"]["verdict_row"])
     out["secondary_families"] = {}
     for f in FAMILIES:
         if f == PRIMARY_FAMILY:
@@ -715,13 +804,9 @@ def dataset_results(d, data, arms, fams, gold, full, settings, runs_root, val_st
         else:
             out["secondary_families"][f] = {"status": NOT_RUN}
 
-    # Per-arm tables: accuracy, failures and flags, calibration, cost and latency, realised coverage.
-    def val_rows(name):
-        got = predictions.read(name, d, val_stage, runs_root)
-        return None if got is None else got[0]
-
+    # Per-arm tables: accuracy, failures and flags, calibration, cost and pipeline time, realised coverage.
     every = list(arms.items()) + [(name, arm) for fam in fams.values() for name, arm in fam.items()]
-    out["arms"] = [arm_row(d, arm, settings.coverage, val_rows(name)) for name, arm in every]
+    out["arms"] = [arm_row(d, arm, settings.coverage, val_rows[(d, name)]) for name, arm in every]
     out["risk_coverage"] = {"coverage": list(RISK_COVERAGE_POINTS), "arms": {name: risk_coverage(arm) for name, arm in arms.items()}}
     for f, fam in fams.items():
         for s in GRID:
@@ -801,15 +886,15 @@ def assert_no_vectors(out_dir: Path) -> None:
         if not path.is_file():
             continue
         if path.suffix in (".npz", ".npy", ".pkl", ".pickle"):
-            raise ScoreRefused(f"{path.name}: array files are never published")
+            raise PublishGuardError(f"{path.name}: array files are never published")
         if path.suffix == ".parquet":
             frame = pd.read_parquet(path)
             extra = set(frame.columns) - set(PUBLISHED_COLUMNS)
             if extra:
-                raise ScoreRefused(f"{path.name} has columns outside the published set: {sorted(extra)}")
+                raise PublishGuardError(f"{path.name} has columns outside the published set: {sorted(extra)}")
             for col in frame.columns:
                 if frame[col].map(lambda v: isinstance(v, (list, tuple, dict, np.ndarray))).any():
-                    raise ScoreRefused(f"{path.name}: column {col} holds arrays")
+                    raise PublishGuardError(f"{path.name}: column {col} holds arrays")
 
 
 # --------------------------------------------------------------------------- command line
@@ -839,7 +924,21 @@ def _test_gold() -> tuple[dict, dict]:
     return gold, names
 
 
-def main(argv=None, *, runs_root: Path = RUNS, load_val_gold: Callable[[], dict] = _validation_gold, settings: Settings = RECORD) -> int:
+def _label_names() -> dict:
+    """Every class name, from the committed label files (validation lacks some Banking77 classes)."""
+    from labels import label_texts
+
+    return {dataset: list(label_texts(dataset, bare=True)) for dataset in DATASETS}
+
+
+def main(
+    argv=None,
+    *,
+    runs_root: Path = RUNS,
+    load_val_gold: Callable[[], dict] = _validation_gold,
+    load_label_names: Callable[[], dict] = _label_names,
+    settings: Settings = RECORD,
+) -> int:
     p = argparse.ArgumentParser(prog="score", description="The one-shot scorer.")
     what = p.add_mutually_exclusive_group(required=True)
     what.add_argument("--dry-run", action="store_true", help="validation predictions, gold permuted; prints DRY RUN OK or a failure")
@@ -847,7 +946,7 @@ def main(argv=None, *, runs_root: Path = RUNS, load_val_gold: Callable[[], dict]
     args = p.parse_args(argv)
     if args.dry_run:
         try:
-            dry_run(load_val_gold(), runs_root=runs_root, settings=settings)
+            dry_run(load_val_gold(), runs_root=runs_root, settings=settings, label_names=load_label_names())
         except Exception as error:  # noqa: BLE001 - the dry run reports pass or fail and nothing else
             print(f"DRY RUN FAILED: {type(error).__name__}: {error}")
             return 1

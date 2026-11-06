@@ -35,6 +35,7 @@ def make_fake_runs(
     gold: dict | None = None,
     classes_by_dataset: dict | None = None,
     blind: bool = False,
+    int_ids: bool = False,
 ) -> dict:
     """Write every expected arm for each dataset; return {dataset: gold frame}.
 
@@ -60,6 +61,8 @@ def make_fake_runs(
             n = n_per * k
             labels = np.array([classes[i % k] for i in range(n)])
             ids = row_ids[dataset] if row_ids and dataset in row_ids else [f"{dataset}:train:v{i}" for i in range(n)]
+            if int_ids:  # the firewall's row ids: positions in the official file, as integers
+                ids = list(range(n))
         gold_idx = np.array([classes.index(c) for c in labels])
         golds[dataset] = pd.DataFrame({"row_id": ids, "label": gold_idx if gold_as_ids else labels})
 
