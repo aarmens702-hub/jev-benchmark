@@ -798,13 +798,13 @@ def test_key_usage_reads_data_usage_strictly():
 # ------------------------------------------------------------------ the small LLM
 
 
-def test_llm_sends_max_tokens_16_and_reasoning_off(tmp_path):
+def test_llm_sends_max_tokens_16_and_no_reasoning_field(tmp_path):
     client, transport, _, _ = make_client(tmp_path, lambda body, n: llm_ok(body))
     decision = llm_pick("r0", "text", OPTIONS, "openai/gpt-oss-20b", "Darkbloom", client=client)
     assert decision.failed is False
     body = transport.calls[0]
     assert body["max_tokens"] == 16
-    assert body["reasoning"] == {"effort": "none"}
+    assert "reasoning" not in body
     assert body["logprobs"] is True
     assert body["stream"] is False
     schema = body["response_format"]["json_schema"]["schema"]
@@ -816,6 +816,12 @@ def test_llm_sends_max_tokens_16_and_reasoning_off(tmp_path):
     documented = fixture("chat_logprobs_request.json")
     assert set(documented) == set(body)
     assert documented["provider"].keys() == body["provider"].keys()
+
+
+def test_llm_sends_a_reasoning_field_only_when_the_candidate_sets_one(tmp_path):
+    client, transport, _, _ = make_client(tmp_path, lambda body, n: llm_ok(body))
+    llm_pick("r0", "text", OPTIONS, "openai/gpt-oss-20b", "Darkbloom", client=client, reasoning={"effort": "low"})
+    assert transport.calls[0]["reasoning"] == {"effort": "low"}
 
 
 def test_llm_refuses_batch_variant(tmp_path):
@@ -2077,6 +2083,22 @@ def test_llm_model_suffix_pattern_is_exact(tmp_path, reply, allowed):
     else:
         with pytest.raises(ModelChanged):
             llm_pick("r0", "t", OPTIONS, "openai/gpt-oss-20b", "Darkbloom", client=client)
+
+
+@pytest.mark.parametrize("model, provider", [
+    ("mistralai/mistral-nemo", "DekaLLM"),
+    ("mistralai/mistral-small-3.2-24b-instruct", "Parasail"),
+    ("meta-llama/llama-3.1-8b-instruct", "CoreWeave"),
+])
+def test_candidate_ids_are_accepted_plain_and_with_a_dated_suffix_only(tmp_path, model, provider):
+    for reply, allowed in [(model, True), (model + "-20261105", True), (model + "-2026", False), (model + "-v2", False),
+                           (model + "-202611051", False), (model + "x", False)]:
+        client, _, _, _ = make_client(tmp_path, lambda body, n, r=reply: llm_ok(body, model=r))
+        if allowed:
+            assert llm_pick("r0", "t", OPTIONS, model, provider, client=client).model == reply
+        else:
+            with pytest.raises(ModelChanged):
+                llm_pick("r0", "t", OPTIONS, model, provider, client=client)
 
 
 def test_llm_tagged_request_matches_reply_with_or_without_the_tag(tmp_path):

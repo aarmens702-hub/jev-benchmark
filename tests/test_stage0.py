@@ -16,6 +16,7 @@ import prompts
 import stage0
 import stage0_fields as fields
 from ledger import Ledger
+from llm_client import build_request
 from openrouter import Client, TransportResponse
 from stage0 import Runtime, Stage0, mass_and_cut, repeat_stats, sample_rows, summarize
 from test_clients import jev_ok, llm_ok
@@ -43,7 +44,7 @@ class FakeApi:
     """A transport that answers like the documented API, with knobs for each failure the runner must catch."""
 
     def __init__(self, *, accuracy=0.9, cost=0.0001, llm_cost=0.00003, top=None, llm_misses=None, flip_rows=(), jev_model=jev_client.JEV_MODEL + "-20261014",
-                 mutate_jev=None, bad_fraction=0.0, bad_after=0, reject_null=False, ok_models=("openai/gpt-oss-20b", "z-ai/glm-5.3-flash")):
+                 mutate_jev=None, bad_fraction=0.0, bad_after=0, reject_null=False, ok_models=("mistralai/mistral-nemo", "mistralai/mistral-small-3.2-24b-instruct")):
         self.accuracy, self.cost, self.llm_cost, self.top = accuracy, cost, llm_cost, top
         self.llm_misses = llm_misses or {}  # model -> set of texts that come back without logprobs; "all" for every row
         self.flip_rows, self.jev_model, self.mutate_jev = set(flip_rows), jev_model, mutate_jev
@@ -230,7 +231,7 @@ def test_report_holds_the_allowed_fields(happy):
     assert "1.0 mass" in report and "Score at the 80% cut" in report
     assert "Label agreement: 100.0%" in report and "Median top-probability range" in report
     assert "Latency median s" in report and "Failure rate" in report
-    assert "Selected: openai/gpt-oss-20b on Darkbloom" in report
+    assert "Selected: mistralai/mistral-nemo on DekaLLM" in report
 
 
 def test_report_holds_no_row_text_or_ids(happy):
@@ -251,8 +252,8 @@ def test_frozen_yaml_records_the_selections(happy):
     _, _, stage, _, _ = happy
     frozen = yaml.safe_load((Path(stage.rt.report_dir) / "frozen.yaml").read_text())
     assert frozen["jev"]["build"] == "jev-1.14-20261014" and frozen["jev"]["request_model"] == "typesafe/jev-1.14"
-    assert frozen["small_llm"]["model"] == "openai/gpt-oss-20b" and frozen["small_llm"]["provider"] == "Darkbloom"
-    assert frozen["small_llm"]["provider_options"] == {"only": ["Darkbloom"], "allow_fallbacks": False, "require_parameters": True}
+    assert frozen["small_llm"]["model"] == "mistralai/mistral-nemo" and frozen["small_llm"]["provider"] == "DekaLLM"
+    assert frozen["small_llm"]["provider_options"] == {"only": ["DekaLLM"], "allow_fallbacks": False, "require_parameters": True}
     assert frozen["small_llm"]["reply_model_suffix_pattern"] == r"(?:-\d{8})?"
     assert frozen["nli"] == {"model": "MoritzLaurer/deberta-v3-large-zeroshot-v2.0-c", "revision": "b2730f16019076bb0009481121efbe4705e0e378",
                              "pairs_per_second": 20.7,
@@ -283,8 +284,8 @@ def test_call_counts_match_the_plan(happy):
     _, _, _, api, _ = happy
     jev = [b for u, b in api.calls if u.endswith("decisions")]
     llm = [b for u, b in api.calls if "chat" in u]
-    assert len(llm) == 50  # gpt-oss passes, so GLM is never called
-    assert all(b["model"] == "openai/gpt-oss-20b" and b["provider"]["only"] == ["Darkbloom"] for b in llm)
+    assert len(llm) == 50  # nemo passes, so Small is never called
+    assert all(b["model"] == "mistralai/mistral-nemo" and b["provider"]["only"] == ["DekaLLM"] for b in llm)
     # smoke 20 + bare 3 + 231 + 160 validation (20 smoke rows are cached) + 300 repeats + 20 examples
     assert len(jev) == 20 + 3 + (231 - 20) + 160 + 300 + 20
     examples = [b for b in jev if isinstance(b["state"], dict)]
@@ -464,38 +465,38 @@ def sel_texts(tmp_path_unused, k):
     return [r["text"] for r in sample_rows(split.val, 50, "stage0:select:")][:k]
 
 
-def test_first_candidate_passing_means_glm_is_never_called(happy):
+def test_first_candidate_passing_means_small_is_never_called(happy):
     _, _, _, api, _ = happy
-    assert selection_calls(api, "z-ai/glm-5.3-flash") == []
+    assert selection_calls(api, "mistralai/mistral-small-3.2-24b-instruct") == []
 
 
 def test_one_miss_in_fifty_still_passes(tmp_path):
-    api = FakeApi(llm_misses={"openai/gpt-oss-20b": set(sel_texts(None, 1))})
+    api = FakeApi(llm_misses={"mistralai/mistral-nemo": set(sel_texts(None, 1))})
     code, report, stage, _, _ = run(tmp_path, api)
-    assert stage.selected["requested"] == "openai/gpt-oss-20b" and stage.selected["valid"] == 49
+    assert stage.selected["requested"] == "mistralai/mistral-nemo" and stage.selected["valid"] == 49
     assert "49 of 50 usable" in report
 
 
-def test_two_misses_fail_the_candidate_and_glm_is_tried_next(tmp_path):
-    api = FakeApi(llm_misses={"openai/gpt-oss-20b": set(sel_texts(None, 2))})
+def test_two_misses_fail_the_candidate_and_small_is_tried_next(tmp_path):
+    api = FakeApi(llm_misses={"mistralai/mistral-nemo": set(sel_texts(None, 2))})
     code, report, stage, _, _ = run(tmp_path, api)
-    assert stage.selected["requested"] == "z-ai/glm-5.3-flash" and stage.selected["provider"] == "Wafer"
+    assert stage.selected["requested"] == "mistralai/mistral-small-3.2-24b-instruct" and stage.selected["provider"] == "Parasail"
     assert code == stage0.EXIT_OK
-    assert stage.candidates["openai/gpt-oss-20b"]["valid"] <= 48
+    assert stage.candidates["mistralai/mistral-nemo"]["valid"] <= 48
     frozen = yaml.safe_load((Path(stage.rt.report_dir) / "frozen.yaml").read_text())
-    assert frozen["small_llm"]["model"] == "z-ai/glm-5.3-flash" and frozen["small_llm"]["provider"] == "Wafer"
-    assert all(b["provider"]["only"] == ["Wafer"] for b in selection_calls(api, "z-ai/glm-5.3-flash"))
+    assert frozen["small_llm"]["model"] == "mistralai/mistral-small-3.2-24b-instruct" and frozen["small_llm"]["provider"] == "Parasail"
+    assert all(b["provider"]["only"] == ["Parasail"] for b in selection_calls(api, "mistralai/mistral-small-3.2-24b-instruct"))
 
 
 def test_cheapest_candidate_is_tried_first(tmp_path):
-    api = FakeApi(llm_misses={"openai/gpt-oss-20b": "all", "z-ai/glm-5.3-flash": "all"})
+    api = FakeApi(llm_misses={m: "all" for m, *_ in stage0.CANDIDATES})
     run(tmp_path, api)
     models = [b["model"] for u, b in api.calls if "chat" in u]
-    assert models.index("openai/gpt-oss-20b") < models.index("z-ai/glm-5.3-flash")
+    assert models.index("mistralai/mistral-nemo") < models.index("mistralai/mistral-small-3.2-24b-instruct")
 
 
 def test_no_candidate_passing_marks_the_arm_not_run_and_the_rest_continues(tmp_path):
-    api = FakeApi(llm_misses={"openai/gpt-oss-20b": "all", "z-ai/glm-5.3-flash": "all"})
+    api = FakeApi(llm_misses={m: "all" for m, *_ in stage0.CANDIDATES})
     code, report, stage, _, _ = run(tmp_path, api)
     assert stage.selected is None
     assert code == stage0.EXIT_OK
@@ -507,10 +508,10 @@ def test_no_candidate_passing_marks_the_arm_not_run_and_the_rest_continues(tmp_p
 
 
 def test_a_candidate_that_fails_to_return_logprobs_is_cheap(tmp_path):
-    api = FakeApi(llm_misses={"openai/gpt-oss-20b": "all"})
+    api = FakeApi(llm_misses={"mistralai/mistral-nemo": "all"})
     _, _, stage, _, _ = run(tmp_path, api)
     # The allowance is spent, then the arm stops: a handful of calls, nowhere near 50, on a hopeless candidate.
-    assert len(selection_calls(api, "openai/gpt-oss-20b")) <= 8
+    assert len(selection_calls(api, "mistralai/mistral-nemo")) <= 8
 
 
 def test_reply_model_outside_the_suffix_pattern_stops_and_asks(tmp_path):
@@ -519,7 +520,7 @@ def test_reply_model_outside_the_suffix_pattern_stops_and_asks(tmp_path):
 
     def renamed(body):
         payload = json.loads(real(body).body)
-        payload["model"] = "openai/gpt-oss-20b-bf16-turbo"
+        payload["model"] = "mistralai/mistral-nemo-bf16-turbo"
         return TransportResponse(200, {}, json.dumps(payload).encode())
 
     api.llm = renamed
@@ -532,7 +533,7 @@ def test_hidden_reasoning_fails_the_candidate(tmp_path):
     real = api.llm
 
     def thinking(body):
-        if body["model"].startswith("openai"):
+        if body["model"].startswith("mistralai/mistral-nemo"):
             payload = json.loads(real(body).body)
             payload["usage"]["completion_tokens_details"]["reasoning_tokens"] = 12
             return TransportResponse(200, {}, json.dumps(payload).encode())
@@ -540,7 +541,7 @@ def test_hidden_reasoning_fails_the_candidate(tmp_path):
 
     api.llm = thinking
     _, _, stage, _, _ = run(tmp_path, api)
-    assert stage.selected["requested"] == "z-ai/glm-5.3-flash"
+    assert stage.selected["requested"] == "mistralai/mistral-small-3.2-24b-instruct"
     assert any(f.number == 12 and f.status == fields.MISMATCH for f in stage.findings)
 
 
@@ -718,7 +719,7 @@ def test_one_client_per_step_and_none_shared_across_arms(tmp_path):
     rt.make_client = counting
     stage = Stage0(rt)
     assert stage.run_all() == stage0.EXIT_OK
-    # smoke, bare check, gpt-oss selection, B77 validation, AG validation, repeatability, examples
+    # smoke, bare check, first-candidate selection, B77 validation, AG validation, repeatability, examples
     assert len(made) == 7 and len({id(c) for c in made}) == 7
 
 
@@ -738,7 +739,7 @@ def test_field_7_is_confirmed_only_when_every_reply_names_the_pin(happy):
 
 def test_field_7_is_a_mismatch_for_another_provider():
     obs = fields.Observations()
-    for surface, provider, pin in (("jev", "TypeSafe", "TypeSafe"), ("chat", "SomeoneElse", "Darkbloom")):
+    for surface, provider, pin in (("jev", "TypeSafe", "TypeSafe"), ("chat", "SomeoneElse", "DekaLLM")):
         obs.add(fields.Obs(surface=surface, phase="x", status=200, provider=provider, provider_only=(pin,), allow_fallbacks=False,
                            ok_shape=True, model="m", cost=0.1))
     assert {f.number: f for f in fields.evaluate(obs, None, {})}[7].status == fields.MISMATCH
@@ -788,11 +789,11 @@ def test_failure_rate_is_checked_every_100_rows_and_stops_early(tmp_path):
 def test_an_outage_stop_on_a_candidate_is_reported_as_an_outage(tmp_path):
     api = FakeApi()
     real = api.llm
-    api.llm = lambda body: TransportResponse(500, {}, b"{}") if body["model"].startswith("openai") else real(body)
+    api.llm = lambda body: TransportResponse(500, {}, b"{}") if body["model"].startswith("mistralai/mistral-nemo") else real(body)
     _, report, stage, _, _ = run(tmp_path, api)
-    assert stage.candidates["openai/gpt-oss-20b"]["outage"] is True
+    assert stage.candidates["mistralai/mistral-nemo"]["outage"] is True
     assert "stopped by an outage" in report
-    assert stage.selected["requested"] == "z-ai/glm-5.3-flash"
+    assert stage.selected["requested"] == "mistralai/mistral-small-3.2-24b-instruct"
 
 
 def test_frozen_nli_records_where_the_rate_was_measured(happy):
@@ -808,13 +809,13 @@ def test_reasoning_on_the_first_contact_row_only_still_fails_the_candidate(tmp_p
     """attack9 on the real runner: a stop on first contact must hold for the rest of that candidate's arm."""
     api = FakeApi()
     real = api.llm
-    seen = {"openai": 0}
+    seen = {"nemo": 0}
 
     def first_row_thinks(body):
         reply = real(body)
-        if body["model"].startswith("openai"):
-            seen["openai"] += 1
-            if seen["openai"] == 1:
+        if body["model"].startswith("mistralai/mistral-nemo"):
+            seen["nemo"] += 1
+            if seen["nemo"] == 1:
                 payload = json.loads(reply.body)
                 payload["usage"]["completion_tokens_details"]["reasoning_tokens"] = 12
                 return TransportResponse(200, {}, json.dumps(payload).encode())
@@ -822,10 +823,10 @@ def test_reasoning_on_the_first_contact_row_only_still_fails_the_candidate(tmp_p
 
     api.llm = first_row_thinks
     _, _, stage, api, _ = run(tmp_path, api)
-    gpt = stage.candidates["openai/gpt-oss-20b"]
+    gpt = stage.candidates["mistralai/mistral-nemo"]
     assert gpt["passed"] is False and gpt["stop"] == "HiddenReasoning" and gpt["valid"] < stage0.SELECT_PASS
-    assert len(selection_calls(api, "openai/gpt-oss-20b")) == 1  # the other 49 rows were never sent
-    assert stage.selected["requested"] == "z-ai/glm-5.3-flash"
+    assert len(selection_calls(api, "mistralai/mistral-nemo")) == 1  # the other 49 rows were never sent
+    assert stage.selected["requested"] == "mistralai/mistral-small-3.2-24b-instruct"
 
 
 def test_a_jev_first_contact_arm_not_run_is_not_re_sent(tmp_path, monkeypatch):
@@ -848,13 +849,30 @@ def test_a_jev_first_contact_arm_not_run_is_not_re_sent(tmp_path, monkeypatch):
     assert "ArmNotRun" in report
 
 
+def test_candidates_are_the_three_reasoning_free_endpoints_and_send_no_reasoning_field():
+    assert [(m, p, price) for m, p, price, _, _ in stage0.CANDIDATES] == [
+        ("mistralai/mistral-nemo", "DekaLLM", (0.018, 0.030)),
+        ("mistralai/mistral-small-3.2-24b-instruct", "Parasail", (0.09, 0.30)),
+        ("meta-llama/llama-3.1-8b-instruct", "CoreWeave", (0.22, 0.22)),
+    ]
+    models = " ".join(m for m, *_ in stage0.CANDIDATES)
+    assert "gpt-oss" not in models and "glm" not in models
+    options = {"a": None, "b": None}
+    for model, provider, _, _, reasoning in stage0.CANDIDATES:
+        body = build_request("t", ["a", "b"], options, model, provider, "i", reasoning)
+        assert "reasoning" not in body and body["max_tokens"] == 16 and body["temperature"] == 0 and body["logprobs"] is True
+        assert body["provider"]["only"] == [provider] and body["provider"]["allow_fallbacks"] is False
+        assert body["provider"]["require_parameters"] is True and body["response_format"]["type"] == "json_schema"
+        assert "top_logprobs" not in body
+
+
 def test_grace_from_lag_rounds_up_with_floor_and_cap():
-    assert stage0.grace_from_lag(0.0) == 30 and stage0.grace_from_lag(29.1) == 30
-    assert stage0.grace_from_lag(44.2) == 45 and stage0.grace_from_lag(180.0) == 180
+    assert stage0.grace_from_lag(0.0) == 120 and stage0.grace_from_lag(29.1) == 120 and stage0.grace_from_lag(119.0) == 120
+    assert stage0.grace_from_lag(120.2) == 121 and stage0.grace_from_lag(180.0) == 180
     assert stage0.grace_from_lag(500.0) == stage0.GRACE_CAP_SECONDS == 180
 
 
-@pytest.mark.parametrize("lag, grace", [(9, 30), (44, 45)])
+@pytest.mark.parametrize("lag, grace", [(9, 120), (44, 120)])
 def test_measured_lag_sets_the_grace_for_every_later_client_and_frozen_yaml(tmp_path, lag, grace):
     clock = Clock()
     rt, api, _ = build(tmp_path, FakeApi(), reported=lambda ledger, clock_: (lambda: ledger.confirmed() if clock.now >= lag else 0.0), clock=clock)

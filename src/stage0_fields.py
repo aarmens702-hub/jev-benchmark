@@ -26,7 +26,7 @@ FIELD_NAMES = {
     8: "Jev reads criteria in the order sent",
     9: "Jev accepts the provider pin with require_parameters",
     10: "logprobs come back under json_schema",
-    11: "reasoning effort none is accepted",
+    11: "requests without a reasoning field are accepted",
     12: "reasoning tokens stay zero",
     13: "key usage reflects spend",
     14: "usage.cost matches what the key is billed",
@@ -53,7 +53,7 @@ class Obs:
     provider_only: tuple = ()
     require_parameters: bool = False
     allow_fallbacks: bool = True
-    reasoning_none: bool = False
+    no_reasoning_field: bool = False
     # Reply side, only for HTTP 200 with a JSON object body.
     ok_shape: bool = False
     problems: list = field(default_factory=list)
@@ -208,7 +208,7 @@ def observe(url: str, content, reply, phase: str) -> Obs:
             obs.null_criteria = any(v is None for v in raw.values())
             obs.state_is_object = isinstance(body.get("state"), dict)
         else:
-            obs.reasoning_none = (body.get("reasoning") or {}).get("effort") == "none"
+            obs.no_reasoning_field = "reasoning" not in body
     except Exception:
         criteria = []
         obs.problems.append("request: could not be read back")
@@ -326,8 +326,8 @@ def evaluate(obs: Observations, usage: UsageCheck | None, candidates: dict) -> l
         put(10, UNCONFIRMED, "replies came back with no usable logprobs")
     else:
         put(10, NOT_TESTED, "no chat reply was seen")
-    none_effort = [o for o in chat if o.reasoning_none]
-    put(11, CONFIRMED if none_effort else UNCONFIRMED, "accepted" if none_effort else "no chat reply with effort none was seen")
+    plain = [o for o in chat if o.no_reasoning_field]
+    put(11, CONFIRMED if plain else UNCONFIRMED, "accepted" if plain else "no chat reply to a request without a reasoning field was seen")
     hidden = [o for o in chat if (o.reasoning_tokens or 0) > 0]
     if not chat:
         put(12, NOT_TESTED, "no chat reply was seen")

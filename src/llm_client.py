@@ -38,19 +38,19 @@ _ID_SPAN = re.compile(r'\s*\{\s*"id"\s*:\s*(\d+)\s*\}\s*')
 _LOGPROB_SLACK = 1e-6
 
 
-def build_request(text, ordered, descriptions, model, provider, instructions) -> dict:
+def build_request(text, ordered, descriptions, model, provider, instructions, reasoning=None) -> dict:
+    """reasoning is the candidate's own setting: None sends no reasoning field at all."""
     lines = []
     for option_id, label in enumerate(ordered, start=1):
         description = descriptions[label]
         lines.append(f"{option_id}. {label}" if description is None else f"{option_id}. {label}: {description}")
-    return {
+    body = {
         "model": model,
         "messages": [
             {"role": "system", "content": instructions},
             {"role": "user", "content": f"Text: {text}\n\nOptions:\n" + "\n".join(lines)},
         ],
         "max_tokens": MAX_TOKENS,
-        "reasoning": {"effort": "none"},
         "logprobs": True,
         "temperature": 0,
         "stream": False,
@@ -69,6 +69,9 @@ def build_request(text, ordered, descriptions, model, provider, instructions) ->
         },
         "provider": pinned_provider(provider),
     }
+    if reasoning is not None:
+        body["reasoning"] = reasoning
+    return body
 
 
 def top_prob_from_logprobs(content: str, logprobs, row_id) -> float:
@@ -164,11 +167,12 @@ def llm_pick(
     client: Client,
     order_seed=ORDER_SEED,
     instructions=DEFAULT_INSTRUCTIONS,
+    reasoning=None,
 ) -> Decision:
     if ":batch" in model:
         raise ValueError("the :batch variant is not allowed (DESIGN.md)")
     options = normalize_options(options)
     ordered = option_order(row_id, options, order_seed)
     id_to_label = dict(enumerate(ordered, start=1))
-    body = build_request(text, ordered, options, model, provider, instructions)
+    body = build_request(text, ordered, options, model, provider, instructions, reasoning)
     return client.call(row_id, CHAT_URL, body, lambda data: parse_answer(data, id_to_label, model, provider, client, row_id))
