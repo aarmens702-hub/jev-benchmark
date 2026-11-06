@@ -30,7 +30,7 @@ A failed check may lead to a **bug fix only**, logged with a reason.
 
 ## Guards
 - **Fetch by file.** All data arrives by `hf_hub_download` of the named train parquet at the pinned revision. No `load_dataset`.
-- **`src/firewall.py`** is the only module that may load test. `load_test(token)` raises unless the token equals SHA-256 of the frozen `manifest.json`, the manifest holds an OSF id, the git tree is clean, and HEAD is at the freeze tag.
+- **`src/firewall.py`** is the only module that may load test. `load_test(token)` raises unless the token equals SHA-256 of the frozen `manifest.json`, the manifest holds a registration (the public GitHub repo URL and the tagged commit), the git tree is clean, and HEAD is at the freeze tag.
 - **`tests/test_firewall.py`** runs in CI and fails if:
   - any test parquet exists under `data/` or the HF cache before the freeze;
   - `split="test"`, `test-0000` or `load_dataset(` appears outside `firewall.py`;

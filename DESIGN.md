@@ -112,7 +112,7 @@ Invalid, and reported as such, if: rules or text change after any arm output on 
 Build order: routing is built last. If it comes out invalid or isn't ready, it is reported that way and does not hold up the Banking77 result.
 
 ## Freeze
-Code, lock file, model ids and pins, label text, prompts, seeds, grid, coverage, tie and failure rules, bootstrap code, outcome rules, routing rules. Register on OSF with the git tag, SHA-256 manifest and the frozen archive, or make the repo public at that moment. Needs Aarmen's yes. Keep a deviations table.
+Code, lock file, model ids and pins, label text, prompts, seeds, grid, coverage, tie and failure rules, bootstrap code, outcome rules, routing rules. Registration: make the GitHub repo aarmens702-hub/jev-benchmark public at the freeze, with the tag `freeze-v1` and the SHA-256 manifest; the manifest records the public repo URL and tagged commit as its registration. No OSF (Aarmen's decision, 2026-11-05). Aarmen pre-approved making the repo public at the freeze and starting Stage 1 right after. Keep a deviations table.
 
 **Disclosure, in the registration and the post:** the analyst read prior Banking77 and AG News results before registering, including Jev at about 83% on a test sample, LR matching it near 5 labels per class, and about half of answers at confidence 1.0 (Jev 1.13, tallied from a third party's cached outputs on a mixed sample, with no text or gold). The 80% coverage, grid, bins and prediction were set after reading them. Registration prevents later changes; it does not make the design blind. Inherited choices used labels this study does not count: C=100 (1,500 training messages, 19.5 per class) and the retrieved-24 recipe (770 messages, 10 per class, on a larger bank). Jev's training data is not disclosed, so memorisation of public datasets cannot be ruled out.
 
@@ -157,7 +157,7 @@ Computer time estimated at 3-7 hours (267,560 NLI pairs, plus routing). Time 5,0
 PASS, validation only. Jev 1.14 build jev-1.14-20261014: 0 failures on 756 Banking77 and 800 AG News rows; confidence 1.0 on 41.1% and 67.1%; 98.0% label agreement over 3 calls on 100 rows. Small LLM selected: mistralai/mistral-nemo on DekaLLM (49 of 50 usable, about 10 output tokens, no reasoning). Usage posts in about 24 s; reconcile grace 120 s. Stage 0 spend US$0.146; projected Stage 1 US$1.60 with fee. Full detail in stage0_report.md and frozen.yaml.
 
 ## Needed from Aarmen
-The OpenRouter key is in the macOS Keychain under service `jev-benchmark-openrouter`, entered by Aarmen. Claude never sees or prints the value; code reads it at run time. An OSF account, created by him, before the freeze. The original post's article is useful background for the post but doesn't block the freeze.
+The OpenRouter key is in the macOS Keychain under service `jev-benchmark-openrouter`, entered by Aarmen. Claude never sees or prints the value; code reads it at run time. The original post's article is useful background for the post but doesn't block the freeze.
 
 ## Deliverables
 Public repo, OSF registration, about 800-word blog post on GitHub Pages with the gap-vs-labels chart, LinkedIn post, reply to him.
