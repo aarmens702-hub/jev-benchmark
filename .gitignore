@@ -9,3 +9,5 @@ runs/
 .env.*
 .ruff_cache/
 *.egg-info/
+.cache/
+.mypy_cache/

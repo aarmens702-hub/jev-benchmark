@@ -47,6 +47,10 @@ from openrouter import (
 from retrieval import Example, retrieve
 
 STAGE = "stage0"
+# Stage 0's outputs are frozen inputs: tracked in stage0/ and hashed by the freeze manifest.
+STAGE0_DIR = REPO_ROOT / "stage0"
+FROZEN_YAML = STAGE0_DIR / "frozen.yaml"
+REPORT_MD = STAGE0_DIR / "stage0_report.md"
 CAD_PER_USD = 1.3994
 CREDIT_FEE = 0.055
 SMOKE_ROWS, SELECT_ROWS, REPEAT_ROWS, REPEATS, EXAMPLES_ROWS, BARE_ROWS = 20, 50, 100, 3, 20, 3
@@ -103,7 +107,7 @@ class Runtime:
     make_client: Callable[..., Client]
     load_split: Callable[[str], data.Split] = lambda dataset: data.split(data.load_train(dataset), dataset)
     runs_root: Path = REPO_ROOT / "runs"
-    report_dir: Path = REPO_ROOT
+    report_dir: Path = STAGE0_DIR
     clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
 
@@ -541,8 +545,9 @@ class Stage0:
 
     def write_outputs(self, stop, projection) -> None:
         report_dir = Path(self.rt.report_dir)
-        (report_dir / "stage0_report.md").write_text(render_report(self, stop, projection), encoding="utf-8")
-        (report_dir / "frozen.yaml").write_text(yaml.safe_dump(frozen_values(self, stop), sort_keys=False), encoding="utf-8")
+        report_dir.mkdir(parents=True, exist_ok=True)
+        (report_dir / REPORT_MD.name).write_text(render_report(self, stop, projection), encoding="utf-8")
+        (report_dir / FROZEN_YAML.name).write_text(yaml.safe_dump(frozen_values(self, stop), sort_keys=False), encoding="utf-8")
 
 
 def grace_from_lag(seconds: float) -> int:

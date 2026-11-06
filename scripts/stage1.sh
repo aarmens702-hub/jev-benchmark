@@ -7,4 +7,8 @@
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
-PYTHONPATH="$root/src" exec caffeinate -ims uv run --frozen python -m stage1 "$@"
+# Bytecode goes to a fresh folder for this run only, so no .pyc left in the repo (stale or forged) is ever loaded.
+# -P keeps the repo root off sys.path, so only src/ is importable and nothing ignored at the root can shadow it.
+p="$(mktemp -d)"
+export PYTHONPYCACHEPREFIX="$p"
+PYTHONPATH="$root/src" exec caffeinate -ims uv run --frozen python -P -m stage1 "$@"

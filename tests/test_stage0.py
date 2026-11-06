@@ -925,3 +925,35 @@ def test_rerun_with_accept_when_the_ledger_agrees_stops_cleanly_and_sends_nothin
     assert "STOPPED at 1 Jev smoke" in out and "nothing to accept" in out and "Traceback" not in out
     assert paid["posts"] == []
     assert "nothing to accept" in (tmp_path / "out" / "stage0_report.md").read_text()
+
+
+# --------------------------------------------------------------------------- tracked Stage 0 outputs
+
+STAGE0_REPO = Path(__file__).resolve().parents[1]
+
+
+def test_stage0_outputs_live_in_the_tracked_stage0_folder():
+    assert stage0.STAGE0_DIR == STAGE0_REPO / "stage0"
+    assert stage0.FROZEN_YAML == stage0.STAGE0_DIR / "frozen.yaml"
+    assert stage0.REPORT_MD == stage0.STAGE0_DIR / "stage0_report.md"
+    assert Runtime(make_client=lambda **_: None).report_dir == stage0.STAGE0_DIR
+    # That both files are tracked there, and not at the repo root, is checked in test_freeze.py (this file blocks git).
+
+
+def test_tracked_frozen_yaml_records_the_completed_selection():
+    frozen = yaml.safe_load(stage0.FROZEN_YAML.read_text())
+    assert frozen["stage0_complete"] is True
+    assert frozen["jev"]["build"] == jev_client.EXPECTED_JEV_BUILD
+    llm = frozen["small_llm"]
+    assert (llm["status"], llm["model"], llm["provider"]) == ("selected", "mistralai/mistral-nemo", "DekaLLM")
+    assert llm["provider_options"] == {"only": ["DekaLLM"], "allow_fallbacks": False, "require_parameters": True}
+    assert "Overall: PASS" in stage0.REPORT_MD.read_text()
+
+
+def test_outputs_are_written_into_a_missing_report_dir(tmp_path, monkeypatch):
+    stage = Stage0.__new__(Stage0)
+    stage.rt = Runtime(make_client=lambda **_: None, report_dir=tmp_path / "new" / "stage0")
+    monkeypatch.setattr(stage0, "render_report", lambda *a: "# report\n")
+    monkeypatch.setattr(stage0, "frozen_values", lambda *a: {"stage0_complete": False})
+    stage.write_outputs(None, None)
+    assert sorted(p.name for p in (tmp_path / "new" / "stage0").iterdir()) == ["frozen.yaml", "stage0_report.md"]

@@ -2,7 +2,7 @@
 
 Pre-registered benchmark. See DESIGN.md for the study, VALIDATION.md for the rules every session follows, and PLAN.md for the build order.
 
-Private until Aarmen says otherwise.
+Built in private and made public at the freeze tag `freeze-v1`. The registration is [registration.md](registration.md); `manifest.json` at that tag holds the SHA-256 of every frozen input, and `scripts/freeze.sh --verify` checks them.
 
 ## Setup
 
