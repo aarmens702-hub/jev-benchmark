@@ -171,6 +171,7 @@ class Decision:
     n_examples: int | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
+    latency_s: float | None = None  # wall-clock seconds for the whole decision, retries and backoff included
 
 
 @dataclass(frozen=True)
@@ -391,6 +392,7 @@ class Client:
         reserve_usd: float = DEFAULT_RESERVE_USD,
         reconcile_grace_seconds: float = DEFAULT_RECONCILE_GRACE_SECONDS,
         accept_key_usage_usd: float | None = None,
+        clock: Callable[[], float] = time.perf_counter,
     ):
         if not 1 <= max_concurrency <= MAX_CONCURRENCY:
             raise ValueError(f"max_concurrency must be 1 to {MAX_CONCURRENCY}")
@@ -406,6 +408,7 @@ class Client:
         self.stop: RunStop | None = None
         self.consecutive_failures = 0
         self._sleep = sleep
+        self.clock = clock
         self._reserve_usd = reserve_usd
         self._grace = reconcile_grace_seconds
         self._in_arm = False
@@ -674,6 +677,7 @@ class Client:
         if self.is_paid and not self._in_arm:
             raise PaidOutsideArm("paid calls go through run_arm, which holds the ladder and the end-of-arm check")
         content = encode_body(body)
+        started = self.clock()
         model = body.get("model", "")
         total = 0.0
         reason = None
@@ -713,6 +717,7 @@ class Client:
                         attempts=attempts,
                         input_tokens=answer.input_tokens,
                         output_tokens=answer.output_tokens,
+                        latency_s=self.clock() - started,
                     )
             elif _is_retryable(reply.status):
                 reason = f"http_{reply.status}"
@@ -724,7 +729,7 @@ class Client:
             if attempt < MAX_RETRIES:
                 self._sleep(retry_after if retry_after is not None else min(MAX_BACKOFF_SECONDS, 2**attempt))
         self.note_row(failed=True)
-        return Decision(None, None, {}, model, total, True, attempts=attempts, reason=reason)
+        return Decision(None, None, {}, model, total, True, attempts=attempts, reason=reason, latency_s=self.clock() - started)
 
 
 def _is_retryable(status: int) -> bool:
@@ -765,6 +770,7 @@ def build_client(
     sleep=time.sleep,
     reconcile_grace_seconds=DEFAULT_RECONCILE_GRACE_SECONDS,
     accept_key_usage_usd=None,
+    max_concurrency=MAX_CONCURRENCY,
 ) -> Client:
     """The one way to get a client. `paid` is the value of --paid: None means a fake transport or nothing."""
     if paid is None:
@@ -776,7 +782,14 @@ def build_client(
             raise ValueError("a fake run needs its own ledger_path and reported_usage, so it cannot touch the real ledger")
         if Path(ledger_path).expanduser().resolve() == PAID_LEDGER_PATH.resolve():
             raise ValueError("a fake run cannot write to the real ledger")
-        return Client(fake_transport, Ledger(ledger_path), reported_usage, sleep=sleep, reconcile_grace_seconds=reconcile_grace_seconds)
+        return Client(
+            fake_transport,
+            Ledger(ledger_path),
+            reported_usage,
+            sleep=sleep,
+            reconcile_grace_seconds=reconcile_grace_seconds,
+            max_concurrency=max_concurrency,
+        )
     if paid not in STAGES:
         raise PaidFlagRequired(f"--paid must be one of {STAGES}")
     if fake_transport is not None or reported_usage is not None:
@@ -792,6 +805,7 @@ def build_client(
         sleep=sleep,
         reconcile_grace_seconds=reconcile_grace_seconds,
         accept_key_usage_usd=accept_key_usage_usd,
+        max_concurrency=max_concurrency,
     )
 
 

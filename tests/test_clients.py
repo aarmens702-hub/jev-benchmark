@@ -1,5 +1,6 @@
 """Spend guards for the paid clients. Every test uses a fake transport; nothing here spends or reads a key."""
 import argparse
+import dataclasses
 import json
 import logging
 import math
@@ -1124,6 +1125,8 @@ def test_jev_uses_the_probability_of_its_choice_not_confidence(tmp_path):
 
     client, _, _, _ = make_client(tmp_path, handler)
     decision = jev_decide("r0", "text", OPTIONS, client=client)
+    assert decision.latency_s is not None and decision.latency_s >= 0
+    decision = dataclasses.replace(decision, latency_s=None)  # timing is checked in test_latency.py
     assert decision == Decision(
         pred="card_arrival",
         top_prob=0.84,

@@ -188,8 +188,8 @@ def test_lr_cv_picks_c_from_inside_the_bank_and_fits_final_model_with_it(monkeyp
         arms_local, "cv_accuracies", lambda X, y, folds, grid: calls.append((folds, grid)) or {1: 0.5, 10: 0.9, 100: 0.6, 1000: 0.7}
     )
     fitted = []
-    real = arms_local.lr
-    monkeypatch.setattr(arms_local, "lr", lambda train, test, c=100, **kw: fitted.append(c) or real(train, test, c=c, **kw))
+    real = arms_local.lr_fitted
+    monkeypatch.setattr(arms_local, "lr_fitted", lambda train, c=100, **kw: fitted.append(c) or real(train, c=c, **kw))
     X, y = toy_xy()
     arms_local.lr_cv((X, y), X[:2], s=8)
     assert calls == [(5, (1, 10, 100, 1000))] and fitted == [10]
@@ -394,7 +394,13 @@ def test_real_loaders_pass_revision_explicitly_and_check_disk_first(monkeypatch)
 
 def rows_df(ids, preds=None, probs=None):
     return pd.DataFrame(
-        {"row_id": ids, "pred": preds or ["a"] * len(ids), "top_prob": probs or [0.5] * len(ids), "failed": [False] * len(ids)}
+        {
+            "row_id": ids,
+            "pred": preds or ["a"] * len(ids),
+            "top_prob": probs or [0.5] * len(ids),
+            "failed": [False] * len(ids),
+            "latency_s": [0.01] * len(ids),
+        }
     )
 
 
@@ -403,7 +409,7 @@ def test_predictions_write_one_parquet_per_arm_and_full_vector_in_private(tmp_pa
     path = predictions.write("lr_d0_s8", "ag_news", rows_df(["r1", "r2"]), stage="val", vectors=vec, classes=["a", "b"], root=tmp_path)
     assert path == tmp_path / "val" / "lr_d0_s8__ag_news.parquet"
     df = pd.read_parquet(path)
-    assert list(df.columns) == ["row_id", "pred", "top_prob", "failed"]
+    assert list(df.columns) == ["row_id", "pred", "top_prob", "failed", "latency_s"]
     rows, vecs, classes = predictions.read("lr_d0_s8", "ag_news", stage="val", root=tmp_path)
     assert rows.equals(df) and np.array_equal(vecs, vec) and classes == ["a", "b"]
     private = list((tmp_path / "private").rglob("*"))

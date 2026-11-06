@@ -153,6 +153,7 @@ def jev_decide(
     instructions=DEFAULT_INSTRUCTIONS,
     expected_build=EXPECTED_JEV_BUILD,
 ) -> Decision:
+    started = client.clock()
     options = normalize_options(options)
     body = build_request(text, options, row_id, order_seed, examples, instructions)
     n_examples = len(examples) if examples else 0
@@ -160,7 +161,8 @@ def jev_decide(
     key = cache_key(expected_build, body) if cache is not None else None
     if key is not None and (hit := cache.get(key)) is not None:
         client.pin_model(hit["model"])
-        return Decision(cost=0.0, failed=False, attempts=0, cached=True, n_examples=n_examples, **hit)
+        # A cache hit is timed too, but it is marked cached and left out of latency summaries.
+        return Decision(cost=0.0, failed=False, attempts=0, cached=True, n_examples=n_examples, latency_s=client.clock() - started, **hit)
 
     decision = client.call(row_id, DECISIONS_URL, body, lambda data: parse_answer(data, options, expected_build, client))
     decision = replace(decision, n_examples=n_examples)

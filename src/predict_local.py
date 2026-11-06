@@ -14,6 +14,7 @@ or saves an accuracy: the floor check prints PASS or FAIL and nothing else.
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -53,6 +54,7 @@ class Runtime:
     make_encoder: Callable[[], Callable] = lambda: arms_local.load_encoder()
     make_nli_scorer: Callable[[str], Callable] = lambda key: arms_local.load_nli_scorer(key)
     clock: Callable[[], float] = time.monotonic
+    timer: Callable[[], float] = time.perf_counter  # per-decision wall-clock in prediction files
     read_swap_gb: Callable[[], float] = guards.swap_used_gb
     read_free_disk_gb: Callable[..., float] = guards.free_disk_gb
 
@@ -82,7 +84,7 @@ class ArmRun:
     message: str = ""
 
 
-def _rows_frame(row_ids, vec: np.ndarray, classes, to_probs) -> pd.DataFrame:
+def _rows_frame(row_ids, vec: np.ndarray, classes, to_probs, latency=np.nan) -> pd.DataFrame:
     ok = np.isfinite(vec).all(axis=1)
     safe = np.where(ok[:, None], vec, 0.0)
     probs = to_probs(safe)
@@ -93,6 +95,7 @@ def _rows_frame(row_ids, vec: np.ndarray, classes, to_probs) -> pd.DataFrame:
             "pred": np.where(ok, cls[safe.argmax(axis=1)], ""),
             "top_prob": np.where(ok, probs.max(axis=1), 0.0),
             "failed": ~ok,
+            "latency_s": np.broadcast_to(np.asarray(latency, dtype=float), len(ok)).copy(),
         }
     )
 
@@ -109,17 +112,21 @@ def run_arm(
     chunk_size: int = NLI_CHECKPOINT_ROWS,
     guard: Optional[Callable[[], None]] = None,
     root: Path = predictions.RUNS,
+    prepare: Optional[Callable[[], None]] = None,
+    timer: Callable[[], float] = time.perf_counter,
 ) -> ArmRun:
     """Predict `rows` in chunks, saving after each chunk, and skip rows already saved (resume).
 
     `predict_fn` is handed only the list of texts for the chunk being predicted and returns one score
     vector per text. Rows may carry any other columns (a label, say); they are dropped here.
+    `prepare` (fitting a model, say) runs once before the first chunk and outside the timed span, so
+    each row's latency_s is the chunk's prediction time divided by its rows.
     """
     rows = rows[["row_id", "text"]]
     classes = list(classes)
     saved = predictions.read(arm, dataset, stage, root)
     if saved is None:
-        done_rows, done_vecs = rows.iloc[0:0][["row_id"]].assign(pred="", top_prob=0.0, failed=False), np.zeros((0, len(classes)))
+        done_rows, done_vecs = rows.iloc[0:0][["row_id"]].assign(pred="", top_prob=0.0, failed=False, latency_s=0.0), np.zeros((0, len(classes)))
     else:
         done_rows, done_vecs, prior_classes = saved
         if prior_classes != classes or done_vecs is None:
@@ -128,11 +135,19 @@ def run_arm(
     todo = rows[~rows["row_id"].isin(set(done_rows["row_id"]))]
     chunks = (todo.iloc[i : i + chunk_size] for i in range(0, len(todo), chunk_size))
 
+    prepared = []
+
     def process(chunk: pd.DataFrame) -> None:
+        if prepare is not None and not prepared:
+            prepare()
+            prepared.append(True)
+        started = timer()
         vec = np.asarray(predict_fn(chunk["text"].tolist()), dtype=np.float64)
+        per_row = (timer() - started) / len(chunk)
         if vec.shape != (len(chunk), len(classes)):
             raise ValueError(f"{arm}: predictor returned shape {vec.shape}, expected {(len(chunk), len(classes))}")
-        state["rows"] = pd.concat([state["rows"], _rows_frame(chunk["row_id"], vec, classes, to_probs)], ignore_index=True)
+        frame = _rows_frame(chunk["row_id"], vec, classes, to_probs, per_row)
+        state["rows"] = pd.concat([state["rows"], frame], ignore_index=True)
         state["vecs"] = np.vstack([state["vecs"], vec])
         predictions.write(arm, dataset, state["rows"], stage, state["vecs"], classes, root)
 
@@ -155,6 +170,20 @@ def _arm_name(kind: str, draw: int, s) -> str:
     return f"{kind}_d{draw}_s{s}"
 
 
+BANK_SIZES_FILE = "bank_sizes.json"
+
+
+def record_bank_size(root: Path, stage: str, dataset: str, draw: int, s, bank: pd.DataFrame) -> None:
+    """Keep each bank's row and class count, so the chart can label "all" with real counts."""
+    path = Path(root) / stage / BANK_SIZES_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sizes = json.loads(path.read_text()) if path.exists() else {}
+    sizes.setdefault(dataset, {})[f"d{draw}_s{s}"] = {"rows": int(len(bank)), "classes": int(bank["label"].nunique())}
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(sizes, indent=1, sort_keys=True))
+    os.replace(tmp, path)
+
+
 def run_embed_sim(rt: Runtime, dataset: str, stage: str, bare: bool, encode, guard) -> ArmRun:
     base = "embed_sim_bare" if bare else "embed_sim"
     sp = rt.load_split(dataset)
@@ -166,16 +195,17 @@ def run_embed_sim(rt: Runtime, dataset: str, stage: str, bare: bool, encode, gua
         lambda texts: arms_local.embed_cosine(texts, label_list, encode),
         classes,
         to_probs=lambda cos: arms_local.softmax(cos / arms_local.EMBED_TEMPERATURE),
-        guard=guard, root=rt.runs_root,
+        guard=guard, root=rt.runs_root, timer=rt.timer,
     )  # fmt: skip
     if res.stopped is None:
-        # Sensitivity rows come from the saved cosine scores, not a second pass over the model.
-        _, cos, saved_classes = predictions.read(base, dataset, stage, rt.runs_root)
-        ids = predictions.read(base, dataset, stage, rt.runs_root)[0]["row_id"]
+        # Sensitivity rows come from the saved cosine scores, not a second pass over the model, so they
+        # carry the primary run's latency.
+        saved_rows, cos, saved_classes = predictions.read(base, dataset, stage, rt.runs_root)
+        ids = saved_rows["row_id"]
         for suffix, view in arms_local.sensitivity_views(cos).items():
             if suffix == "":
                 continue
-            frame = _rows_frame(ids, view, saved_classes, lambda v: v)
+            frame = _rows_frame(ids, view, saved_classes, lambda v: v, saved_rows["latency_s"].to_numpy())
             predictions.write(base + suffix, dataset, frame, stage, view, saved_classes, rt.runs_root)
     return res
 
@@ -186,27 +216,26 @@ def run_supervised(rt: Runtime, kind: str, dataset: str, stage: str, draw: int, 
     rows = sp.val[["row_id", "text"]]
     fitted = {}
 
-    def bank_and_labels():
-        if not fitted:
-            bank = make_bank(sp, dataset, draw, s, stage)
-            fitted["bank"] = bank
-            if kind != "tfidf_lr":
-                fitted["X"] = encode(bank["text"].tolist())
-        return fitted["bank"]
-
-    def predict(texts):
-        bank = bank_and_labels()
+    def fit():
+        """Build the bank, embed it and fit the model, once and outside the timed span."""
+        bank = make_bank(sp, dataset, draw, s, stage)
+        record_bank_size(rt.runs_root, stage, dataset, draw, s, bank)
         y = bank["label"].to_numpy()
         if kind == "tfidf_lr":
-            return arms_local.tfidf_lr((bank["text"].tolist(), y), texts, classes=classes)
-        Xt = encode(texts)
-        if kind == "lr":
-            return arms_local.lr((fitted["X"], y), Xt, classes=classes)
-        return arms_local.lr_cv((fitted["X"], y), Xt, s, classes=classes)
+            fitted["predict"] = arms_local.tfidf_lr_fitted((bank["text"].tolist(), y), classes=classes)
+            return
+        X = encode(bank["text"].tolist())
+        model = arms_local.lr_fitted((X, y), classes=classes) if kind == "lr" else arms_local.lr_cv_fitted((X, y), s, classes=classes)
+        fitted["predict"] = lambda texts: model(encode(texts))
+
+    def predict(texts):
+        if "predict" not in fitted:
+            fit()
+        return fitted["predict"](texts)
 
     return run_arm(
         _arm_name(kind, draw, s), dataset, stage, rows, predict, classes,
-        chunk_size=max(len(rows), 1), guard=guard, root=rt.runs_root,
+        chunk_size=max(len(rows), 1), guard=guard, root=rt.runs_root, prepare=fit, timer=rt.timer,
     )  # fmt: skip
 
 
@@ -226,7 +255,7 @@ def run_nli(rt: Runtime, dataset: str, stage: str, key: str, guard) -> ArmRun:
     return run_arm(
         arm, dataset, stage, sp.val[["row_id", "text"]],
         lambda texts: np.stack(list(arms_local.nli(texts, hyps, arms_local.NLI_BATCH_SIZE, scorer))),
-        classes, chunk_size=NLI_CHECKPOINT_ROWS, guard=guard, root=rt.runs_root,
+        classes, chunk_size=NLI_CHECKPOINT_ROWS, guard=guard, root=rt.runs_root, timer=rt.timer,
     )  # fmt: skip
 
 

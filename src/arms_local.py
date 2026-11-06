@@ -224,15 +224,20 @@ def _full_columns(model: LogisticRegression, X, classes: Sequence[str]) -> np.nd
     return out
 
 
+def lr_fitted(train, c: float = LR_C, classes: Optional[Sequence[str]] = None, max_iter: int = LR_MAX_ITER) -> Callable:
+    """Fit embedding LR on the bank once; returns predict(X) -> probabilities in `classes` order."""
+    X, y = train
+    classes = list(classes) if classes is not None else sorted(set(y))
+    model, _ = fit_lr(X, y, c, max_iter)
+    return lambda test: _full_columns(model, test, classes)
+
+
 def lr(train, test, c: float = LR_C, classes: Optional[Sequence[str]] = None, max_iter: int = LR_MAX_ITER) -> np.ndarray:
     """Embedding LR. train = (X, y) from the bank, test = X for rows to predict (no labels needed).
 
     Returns probabilities with columns in `classes` order (default: sorted bank classes).
     """
-    X, y = train
-    classes = list(classes) if classes is not None else sorted(set(y))
-    model, _ = fit_lr(X, y, c, max_iter)
-    return _full_columns(model, test, classes)
+    return lr_fitted(train, c, classes, max_iter)(test)
 
 
 class CVPlan(NamedTuple):
@@ -276,24 +281,34 @@ def choose_c(acc: dict[float, float]) -> float:
     return max(acc, key=lambda c: (acc[c], c == LR_C, -c))
 
 
-def lr_cv(train, test, s, classes: Optional[Sequence[str]] = None) -> np.ndarray:
+def lr_cv_fitted(train, s, classes: Optional[Sequence[str]] = None) -> Callable:
+    """Choose C inside the bank, fit once; returns predict(X)."""
     X, y = train
     plan = cv_plan(s)
     c = plan.grid[0] if plan.folds == 0 else choose_c(cv_accuracies(X, y, plan.folds, plan.grid))
-    return lr(train, test, c=c, classes=classes)
+    return lr_fitted(train, c=c, classes=classes)
+
+
+def lr_cv(train, test, s, classes: Optional[Sequence[str]] = None) -> np.ndarray:
+    return lr_cv_fitted(train, s, classes)(test)
 
 
 def make_tfidf() -> TfidfVectorizer:
     return TfidfVectorizer(ngram_range=(1, 2), lowercase=True, stop_words=None, min_df=1)
 
 
-def tfidf_lr(train, test: Sequence[str], c: float = LR_C, classes: Optional[Sequence[str]] = None) -> np.ndarray:
-    """TF-IDF (word 1-2 grams) + LR. train = (texts, labels), test = texts to predict."""
+def tfidf_lr_fitted(train, c: float = LR_C, classes: Optional[Sequence[str]] = None) -> Callable:
+    """Fit TF-IDF + LR on the bank once; returns predict(texts)."""
     texts, y = train
     classes = list(classes) if classes is not None else sorted(set(y))
     vec = make_tfidf()
     model, _ = fit_lr(vec.fit_transform(texts), y, c)
-    return _full_columns(model, vec.transform(list(test)), classes)
+    return lambda test: _full_columns(model, vec.transform(list(test)), classes)
+
+
+def tfidf_lr(train, test: Sequence[str], c: float = LR_C, classes: Optional[Sequence[str]] = None) -> np.ndarray:
+    """TF-IDF (word 1-2 grams) + LR. train = (texts, labels), test = texts to predict."""
+    return tfidf_lr_fitted(train, c, classes)(test)
 
 
 # --------------------------------------------------------------------------- zero-shot NLI
