@@ -15,7 +15,16 @@ import pytest
 from huggingface_hub import constants as hf_constants
 
 import firewall
-from firewall import FirewallError, _hub_download, _load_test, freeze_token, load_test
+from firewall import (
+    REGISTRATION_REPO_URL,
+    FirewallError,
+    _hub_download,
+    _load_test,
+    canonical_bytes,
+    freeze_token,
+    load_test,
+    manifest_hash,
+)
 
 REPO = Path(__file__).resolve().parents[1]
 PINNED = ("PolyAI/banking77", "fancyzhx/ag_news")
@@ -124,15 +133,38 @@ def predict_files(repo):
     return [f for f in repo_files(repo) if f.endswith(".py") and PurePosixPath(f).name.startswith("predict")]
 
 
-def make_repo(tmp_path, *, manifest=None, tag=True):
+def write_manifest(path, manifest):
+    Path(path).write_bytes(canonical_bytes(manifest))
+
+
+def tag_commit(repo):
+    return git(repo, "rev-parse", f"refs/tags/{FREEZE_TAG}^{{commit}}").strip()
+
+
+def register(repo, *, url=REGISTRATION_REPO_URL, commit=None, commit_it=True):
+    """Fill the registration after tagging, as freeze.py --registration does, then commit it on the tag."""
+    manifest = json.loads((repo / "manifest.json").read_text())
+    manifest["registration"] = {"repo_url": url, "commit": tag_commit(repo) if commit is None else commit}
+    write_manifest(repo / "manifest.json", manifest)
+    if commit_it:
+        git(repo, "commit", "-q", "-am", "registration")
+    return manifest
+
+
+def make_repo(tmp_path, *, manifest=None, tag=True, registered=True):
+    """A temp repo frozen like the real one: manifest with registration null, tag, then a registration commit."""
     repo = tmp_path / "repo"
     repo.mkdir(parents=True)
     git(repo, "init", "-q")
-    (repo / "manifest.json").write_text(json.dumps({"osf_id": "abc12"} if manifest is None else manifest))
+    frozen_manifest = {"files": {"a.py": "0" * 64}, "registration": None} if manifest is None else manifest
+    write_manifest(repo / "manifest.json", frozen_manifest)
+    (repo / "a.py").write_text("x = 1\n")
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "freeze")
     if tag:
         git(repo, "tag", FREEZE_TAG)  # lightweight, so no identity is needed
+        if registered and manifest is None:
+            register(repo)
     return repo
 
 
@@ -279,10 +311,30 @@ def test_gold_reader_check_allows_clean_predictors(tmp_path, source):
 # ------------------------------------------------------------- load_test conditions
 
 
-def test_freeze_token_is_sha256_of_manifest(tmp_path):
+def test_freeze_token_is_sha256_of_frozen_manifest_bytes(tmp_path):
     path = tmp_path / "manifest.json"
-    path.write_bytes(b'{"osf_id": "x"}')
-    assert freeze_token(path) == hashlib.sha256(b'{"osf_id": "x"}').hexdigest()
+    raw = b'{\n  "files": {},\n  "registration": null\n}\n'
+    path.write_bytes(raw)
+    assert freeze_token(path) == hashlib.sha256(raw).hexdigest()
+
+
+def test_freeze_token_ignores_only_the_registration_field(tmp_path):
+    path = tmp_path / "manifest.json"
+    frozen = {"files": {"a.py": "1" * 64}, "registration": None}
+    write_manifest(path, frozen)
+    before = freeze_token(path)
+    write_manifest(path, {**frozen, "registration": {"repo_url": REGISTRATION_REPO_URL, "commit": "a" * 40}})
+    assert freeze_token(path) == before
+    write_manifest(path, {**frozen, "files": {"a.py": "2" * 64}})
+    assert freeze_token(path) != before
+
+
+@pytest.mark.parametrize("raw", [b'{"registration": null}', b'{\n  "registration": null\n}', b"[]\n", b"not json"])
+def test_freeze_token_refuses_non_canonical_or_non_object_manifest(tmp_path, raw):
+    path = tmp_path / "manifest.json"
+    path.write_bytes(raw)
+    with pytest.raises(FirewallError):
+        freeze_token(path)
 
 
 @pytest.mark.parametrize("token", ["", "not-a-token", None])
@@ -332,13 +384,125 @@ def test_load_test_rejects_wrong_token(tmp_path):
     assert dl.calls == []
 
 
-def test_load_test_rejects_manifest_without_osf_id(tmp_path):
-    for i, manifest in enumerate(({"osf_id": ""}, {"seeds": [1]})):
-        repo = make_repo(tmp_path / str(i), manifest=manifest)
-        dl = FakeDownloader(tmp_path)
-        with pytest.raises(FirewallError, match="OSF"):
-            _load_test(PINNED[0], token_for(repo), repo_dir=repo, downloader=dl)
-        assert dl.calls == []
+def assert_refused(repo, tmp_path, match, token=None):
+    dl = FakeDownloader(tmp_path)
+    with pytest.raises(FirewallError, match=match):
+        _load_test(PINNED[0], token_for(repo) if token is None else token, repo_dir=repo, downloader=dl)
+    assert dl.calls == []
+
+
+@pytest.mark.parametrize(
+    "registration",
+    [None, {"osf_id": "abc12"}, {"repo_url": REGISTRATION_REPO_URL}, {"commit": "TAG"}, "https://github.com/aarmens702-hub/jev-benchmark"],
+)
+def test_load_test_rejects_manifest_without_registration(tmp_path, registration):
+    repo = make_repo(tmp_path, registered=False)
+    manifest = json.loads((repo / "manifest.json").read_text())
+    if registration == {"commit": "TAG"}:
+        registration = {"commit": tag_commit(repo)}
+    manifest["registration"] = registration
+    if registration is not None:  # None is the frozen state itself, HEAD at the tag
+        write_manifest(repo / "manifest.json", manifest)
+        git(repo, "commit", "-q", "-am", "registration")
+    assert_refused(repo, tmp_path, "registration")
+
+
+def test_load_test_rejects_osf_only_manifest(tmp_path):
+    repo = make_repo(tmp_path, registered=False)
+    manifest = json.loads((repo / "manifest.json").read_text())
+    manifest["osf_id"] = "abc12"
+    write_manifest(repo / "manifest.json", manifest)
+    git(repo, "commit", "-q", "-am", "osf id only")
+    assert_refused(repo, tmp_path, "registration")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://github.com/aarmens702-hub/jev-benchmark/",
+        "https://github.com/aarmens702-hub/jev-benchmark.git",
+        "http://github.com/aarmens702-hub/jev-benchmark",
+        "https://github.com/someone/jev-benchmark",
+        "https://github.com/AARMENS702-HUB/jev-benchmark",
+        "",
+    ],
+)
+def test_load_test_rejects_a_different_repo_url(tmp_path, url):
+    repo = make_repo(tmp_path, registered=False)
+    register(repo, url=url)
+    assert_refused(repo, tmp_path, "repo_url")
+
+
+@pytest.mark.parametrize("which", ["earlier commit", "zeros", "short", "upper", "not a string"])
+def test_load_test_rejects_a_wrong_commit(tmp_path, which):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    (repo / "first.txt").write_text("before the freeze\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "earlier")
+    earlier = git(repo, "rev-parse", "HEAD").strip()
+    write_manifest(repo / "manifest.json", {"files": {}, "registration": None})
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "freeze")
+    git(repo, "tag", FREEZE_TAG)
+    sha = tag_commit(repo)
+    commit = {"earlier commit": earlier, "zeros": "0" * 40, "short": sha[:12], "upper": sha.upper(), "not a string": 123}[which]
+    register(repo, commit=commit)
+    assert_refused(repo, tmp_path, "commit")
+
+
+def test_load_test_rejects_registration_commit_that_changes_another_file(tmp_path):
+    repo = make_repo(tmp_path, registered=False)
+    register(repo, commit_it=False)
+    (repo / "a.py").write_text("x = 2\n")
+    git(repo, "commit", "-q", "-am", "registration plus a code change")
+    assert_refused(repo, tmp_path, "HEAD is not at freeze tag")
+
+
+def test_load_test_rejects_registration_commit_that_changes_a_frozen_hash(tmp_path):
+    repo = make_repo(tmp_path, registered=False)
+    manifest = register(repo, commit_it=False)
+    manifest["files"]["a.py"] = "f" * 64
+    write_manifest(repo / "manifest.json", manifest)
+    git(repo, "commit", "-q", "-am", "registration plus a changed hash")
+    assert_refused(repo, tmp_path, "more than the manifest's registration")
+
+
+def test_load_test_rejects_registration_two_commits_after_the_tag(tmp_path):
+    repo = make_repo(tmp_path, registered=False)
+    (repo / "notes.txt").write_text("a later commit\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "later")
+    register(repo)
+    assert_refused(repo, tmp_path, "HEAD is not at freeze tag")
+
+
+def test_load_test_rejects_registration_split_over_two_commits(tmp_path):
+    # Both commits touch only the registration, but HEAD's parent is not the tag.
+    repo = make_repo(tmp_path, registered=False)
+    register(repo, commit="0" * 40)
+    register(repo)
+    assert_refused(repo, tmp_path, "HEAD is not at freeze tag")
+
+
+def test_load_test_rejects_uncommitted_registration(tmp_path):
+    repo = make_repo(tmp_path, registered=False)
+    register(repo, commit_it=False)
+    assert_refused(repo, tmp_path, "dirty|clean")
+
+
+def test_load_test_rejects_frozen_manifest_with_registration_already_set(tmp_path):
+    # A registration in the tagged manifest can never name its own commit; refuse any non-null value there.
+    repo = make_repo(tmp_path, manifest={"files": {}, "registration": {"repo_url": REGISTRATION_REPO_URL, "commit": "0" * 40}})
+    register(repo)
+    assert_refused(repo, tmp_path, "registration null")
+
+
+def test_registered_repo_token_equals_sha256_of_tagged_manifest(tmp_path):
+    repo = make_repo(tmp_path)
+    tagged = subprocess.run(["git", "show", f"{FREEZE_TAG}:manifest.json"], cwd=repo, capture_output=True, check=True).stdout
+    assert token_for(repo) == hashlib.sha256(tagged).hexdigest() == manifest_hash(json.loads(tagged))
 
 
 def test_load_test_rejects_dirty_tree(tmp_path):
