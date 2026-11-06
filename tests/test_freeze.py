@@ -439,5 +439,56 @@ def test_firewall_catches_code_hidden_by_a_clean_filter(repo, hub, tmp_path):
     (repo / "src" / "code.py").write_text("x = 'changed after the freeze'\n")
     git(repo, "add", "src/code.py")
     assert git(repo, "status", "--porcelain") == ""
-    with pytest.raises(firewall.FirewallError, match="does not verify"):
+    with pytest.raises(firewall.FirewallError, match="differ from the committed bytes"):
         _firewall_load(repo, hub, tmp_path)
+    assert any("src/code.py: changed" in p for p in freeze.verify_manifest(repo, hf_cache_dir=hub))  # verify catches it too
+
+
+def _filter_hides(repo, tmp_path, rel):
+    """A clean filter that makes git store the current bytes of `rel` whatever is on disk."""
+    original = tmp_path / ("orig-" + rel.replace("/", "_"))
+    original.write_bytes((repo / rel).read_bytes())
+    git(repo, "config", "filter.hide.clean", f"cat {original}")
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "attributes").write_text(f"{rel} filter=hide\n")
+
+
+def _freeze_without_build_checks(repo, hub):
+    """What a build that trusted git status would have produced: hashes of the bytes on disk, committed, tagged."""
+    (repo / "manifest.json").write_bytes(canonical_bytes(freeze.compute_manifest(repo, hf_cache_dir=hub)))
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "manifest")
+    git(repo, "tag", FREEZE_TAG)
+
+
+def test_clean_filter_set_before_the_build_is_refused(repo, hub, tmp_path):
+    _filter_hides(repo, tmp_path, "src/code.py")
+    (repo / "src" / "code.py").write_text("x = 'what runs, not what is published'\n")
+    git(repo, "add", "src/code.py")
+    assert git(repo, "status", "--porcelain") == ""
+    with pytest.raises(FreezeError, match="differ from the committed bytes"):
+        freeze.build_manifest(repo, hf_cache_dir=hub)
+    _freeze_without_build_checks(repo, hub)
+    assert git(repo, "show", "HEAD:src/code.py") != (repo / "src" / "code.py").read_text()  # public differs from disk
+    with pytest.raises(firewall.FirewallError, match="differ from the committed bytes"):
+        _firewall_load(repo, hub, tmp_path)
+
+
+def test_eol_conversion_set_before_the_build_is_refused(repo, hub, tmp_path):
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "attributes").write_text("src/code.py text eol=crlf\n")
+    (repo / "src" / "code.py").write_bytes(b"x = 1\r\n")
+    git(repo, "add", "src/code.py")
+    assert git(repo, "status", "--porcelain") == ""
+    with pytest.raises(FreezeError, match="differ from the committed bytes"):
+        freeze.build_manifest(repo, hf_cache_dir=hub)
+    _freeze_without_build_checks(repo, hub)
+    with pytest.raises(firewall.FirewallError, match="differ from the committed bytes"):
+        _firewall_load(repo, hub, tmp_path)
+
+
+def test_stage1_reads_the_tracked_frozen_yaml():
+    import stage0
+    import stage1
+
+    assert stage1.FROZEN_YAML == stage0.FROZEN_YAML

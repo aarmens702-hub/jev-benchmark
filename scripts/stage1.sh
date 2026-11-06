@@ -7,4 +7,6 @@
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
+# Bytecode goes to a fresh folder for this run only, so no .pyc left in the repo (stale or forged) is ever loaded.
+export PYTHONPYCACHEPREFIX="$(mktemp -d)"
 PYTHONPATH="$root/src" exec caffeinate -ims uv run --frozen python -m stage1 "$@"

@@ -97,9 +97,15 @@ def forbidden_artifacts(repo, is_frozen):
     return bad
 
 
+# Every firewall name that reaches test text or gold, now or in an earlier version. A predictor using any of
+# them (as a name, an attribute or a string for getattr/import) after importing firewall is flagged.
+FIREWALL_GOLD_NAMES = {"load_test", "_load_test", "_hub_download", "_check_conditions", "PINNED_TEST_FILES",
+                       "cache_gold", "read_cached_gold"}
+
+
 def reads_gold(source):
-    """True if the source imports a module named gold, or imports firewall and uses load_test."""
-    imports_firewall = uses_load_test = False
+    """True if the source imports a module named gold, or imports firewall and uses any gold-reading name."""
+    imports_firewall = uses_gold_name = False
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Import):
             for a in node.names:
@@ -117,16 +123,25 @@ def reads_gold(source):
                 if "*" in names:
                     return True
             imports_firewall |= "firewall" in names
-            uses_load_test |= "load_test" in names
+            uses_gold_name |= bool(FIREWALL_GOLD_NAMES & set(names))
         elif isinstance(node, ast.Attribute):
-            uses_load_test |= node.attr == "load_test"
+            uses_gold_name |= node.attr in FIREWALL_GOLD_NAMES
         elif isinstance(node, ast.Name):
-            uses_load_test |= node.id == "load_test"
+            uses_gold_name |= node.id in FIREWALL_GOLD_NAMES
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
             if node.value == "gold":
                 return True  # importlib.import_module("gold"), __import__("gold")
-            uses_load_test |= node.value == "load_test"
-    return imports_firewall and uses_load_test
+            uses_gold_name |= node.value in FIREWALL_GOLD_NAMES
+    return imports_firewall and uses_gold_name
+
+
+def test_gold_names_cover_every_public_firewall_reader():
+    # Any firewall function whose source downloads or reads parquet must be listed.
+    for name, obj in vars(firewall).items():
+        if inspect.isfunction(obj) and obj.__module__ == "firewall":
+            src = inspect.getsource(obj)
+            if "read_parquet" in src or "hf_hub_download" in src:
+                assert name in FIREWALL_GOLD_NAMES, name
 
 
 def predict_files(repo):
@@ -323,6 +338,10 @@ def test_no_predict_file_reads_gold():
         "from data.gold import labels\n",
         "from data import gold\n",
         "import importlib\nimportlib.import_module('gold')\n",
+        "import firewall\ngold = firewall.read_cached_gold('banking77')\n",
+        "import firewall\nf = firewall._load_test\n",
+        "from firewall import _hub_download\n",
+        "import firewall\nf = getattr(firewall, 'PINNED_TEST_FILES')\n",
     ],
 )
 def test_gold_reader_check_flags_violations(tmp_path, source):
@@ -573,7 +592,7 @@ def test_load_test_rejects_disk_manifest_hidden_by_a_clean_filter(tmp_path):
     write_manifest(repo / "manifest.json", {**FROZEN_MANIFEST, "files": {}})
     git(repo, "add", "manifest.json")  # stores the filtered (tagged) bytes, so nothing is staged
     assert git(repo, "status", "--porcelain") == ""  # git is fooled
-    assert_refused(repo, tmp_path, "on disk is not the tagged manifest")
+    assert_refused(repo, tmp_path, "differ from the committed bytes")
 
 
 # 4. clean tree, nothing hidden from git
@@ -698,42 +717,120 @@ def test_ls_remote_is_credential_free_and_outside_the_repo(monkeypatch):
         seen.update(cmd=cmd, **kw)
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-    monkeypatch.setenv("GIT_ASKPASS", "/bin/echo")
+    for name, value in {"GIT_ASKPASS": "/bin/echo", "SSH_ASKPASS": "/bin/echo", "DISPLAY": ":0", "https_proxy": "http://p.invalid",
+                        "HTTPS_PROXY": "http://p.invalid", "SSL_CERT_FILE": "/x.pem", "CURL_CA_BUNDLE": "/x.pem",
+                        "XDG_CONFIG_HOME": "/tmp/xdg"}.items():
+        monkeypatch.setenv(name, value)
     monkeypatch.setattr(firewall.subprocess, "run", fake_run)
     firewall.ls_remote(REGISTRATION_REPO_URL, ["refs/heads/main"])
-    assert seen["cmd"][:3] == ["git", "-c", "credential.helper="]
-    assert REGISTRATION_REPO_URL in seen["cmd"] and "ls-remote" in seen["cmd"]
+    cmd = seen["cmd"]
+    for flag in ("credential.helper=", "core.askPass=", "http.extraHeader=", "http.sslVerify=true"):
+        assert flag in cmd and cmd[cmd.index(flag) - 1] == "-c", flag
+    assert REGISTRATION_REPO_URL in cmd and "ls-remote" in cmd
     env = seen["env"]
+    assert set(env) == {"PATH", "HOME", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_TERMINAL_PROMPT", "GIT_CEILING_DIRECTORIES"}
     assert env["GIT_TERMINAL_PROMPT"] == "0" and env["GIT_CONFIG_GLOBAL"] == os.devnull and env["GIT_CONFIG_NOSYSTEM"] == "1"
-    assert "GIT_ASKPASS" not in env
+    assert env["HOME"] != os.path.expanduser("~") and env["HOME"] == seen["cwd"]
+    assert env["GIT_CEILING_DIRECTORIES"] == str(Path(seen["cwd"]).parent)
     assert Path(seen["cwd"]).resolve() != REPO.resolve() and seen["timeout"] > 0
 
 
-# --------------------------------------------------------------------------- cached gold
+# A local git-over-HTTP stand-in, run as its own process (the test process has sockets blocked). It answers 401
+# unless a request carries credentials or an extra header, and logs what each request carried.
+SERVER = r"""
+import http.server, json, sys
+log = open(sys.argv[1], "a", buffering=1)
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        log.write(json.dumps({"path": self.path, "auth": self.headers.get("Authorization"),
+                              "extra": self.headers.get("X-Extra")}) + "\n")
+        if not self.headers.get("Authorization") and not self.headers.get("X-Extra"):
+            self.send_response(401); self.send_header("WWW-Authenticate", 'Basic realm="x"'); self.end_headers(); return
+        self.send_response(200); self.send_header("Content-Type", "application/x-git-upload-pack-advertisement")
+        self.end_headers(); self.wfile.write(b"001e# service=git-upload-pack\n0000")
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+print(srv.server_port, flush=True)
+srv.serve_forever()
+"""
 
 
-def test_gold_cache_round_trip_and_never_overwrites(tmp_path):
-    gold = pd.DataFrame({"row_id": [0, 1, 2], "label": [2, 0, 1]})
-    firewall.cache_gold("banking77", gold, tmp_path)
-    assert firewall.read_cached_gold("PolyAI/banking77", tmp_path).equals(gold)
-    with pytest.raises(FirewallError, match="never overwritten"):
-        firewall.cache_gold("banking77", gold, tmp_path)
+@pytest.fixture
+def git_server(tmp_path):
+    import sys
+
+    script, log = tmp_path / "server.py", tmp_path / "requests.jsonl"
+    script.write_text(SERVER)
+    log.touch()
+    proc = subprocess.Popen([sys.executable, "-I", str(script), str(log)], stdout=subprocess.PIPE, text=True)
+    port = int(proc.stdout.readline())
+
+    def requests():
+        return [json.loads(line) for line in log.read_text().splitlines() if line]
+
+    def clear():
+        log.write_text("")
+
+    try:
+        yield f"http://127.0.0.1:{port}", requests, clear
+    finally:
+        proc.kill()
+        proc.wait()
 
 
-def test_gold_cache_detects_tampering_and_bad_input(tmp_path):
-    firewall.cache_gold("ag_news", pd.DataFrame({"row_id": [0], "label": [3]}), tmp_path)
-    path = next(tmp_path.glob("*.gold.json"))
-    path.write_text(path.read_text().replace("3", "2"))
-    with pytest.raises(FirewallError, match="SHA-256"):
-        firewall.read_cached_gold("ag_news", tmp_path)
-    with pytest.raises(FirewallError, match="no cached gold"):
-        firewall.read_cached_gold("banking77", tmp_path)
-    with pytest.raises(FirewallError, match="columns"):
-        firewall.cache_gold("banking77", pd.DataFrame({"row_id": [0], "label": [1], "text": ["x"]}), tmp_path)
+def _ls_remote_refused(url):
+    with pytest.raises(FirewallError, match="is the repo public"):
+        firewall.ls_remote(url, ["refs/heads/main"])
 
 
-def test_gold_cache_lives_in_gitignored_runs():
-    assert firewall.GOLD_CACHE.relative_to(REPO).parts[0] == "runs"
+def test_ls_remote_sends_no_credentials_to_a_private_repo(tmp_path, monkeypatch, git_server):
+    base, requests, clear = git_server
+    url = f"{base}/aarmens702-hub/jev-benchmark"
+
+    _ls_remote_refused(url)  # baseline: the server is reached and refuses, so the checks below are not vacuous
+    assert requests() and not any(r["auth"] or r["extra"] for r in requests())
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".netrc").write_text("machine 127.0.0.1 login netrcuser password netrcpass\n")
+    (home / ".netrc").chmod(0o600)
+    (home / ".gitconfig").write_text("[http]\n\textraHeader = X-Extra: homegitconfig\n")
+    xdg = tmp_path / "xdg"
+    (xdg / "git").mkdir(parents=True)
+    (xdg / "git" / "config").write_text("[http]\n\textraHeader = X-Extra: xdg\n")
+    askpass = tmp_path / "askpass.sh"
+    askpass.write_text("#!/bin/sh\necho askpassed\n")
+    askpass.chmod(0o755)
+    for env in ({"HOME": str(home)}, {"XDG_CONFIG_HOME": str(xdg)},
+                {"SSH_ASKPASS": str(askpass), "GIT_ASKPASS": str(askpass), "DISPLAY": ":0", "SSH_ASKPASS_REQUIRE": "force"}):
+        clear()
+        with monkeypatch.context() as m:
+            for k, v in env.items():
+                m.setenv(k, v)
+            _ls_remote_refused(url)
+        assert requests() and not any(r["auth"] or r["extra"] for r in requests()), env
+
+
+def test_ls_remote_ignores_a_repo_around_tmpdir_and_proxies(tmp_path, monkeypatch, git_server):
+    import tempfile
+
+    base, requests, clear = git_server
+    evil = tmp_path / "evilrepo"
+    subprocess.run(["git", "init", "-q", str(evil)], check=True)
+    git(evil, "config", f"url.{base}/.insteadOf", "https://example.invalid/")
+    git(evil, "config", "http.extraHeader", "X-Extra: repo-local")
+    (evil / "tmp").mkdir()
+    monkeypatch.setenv("TMPDIR", str(evil / "tmp"))
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    _ls_remote_refused("https://example.invalid/aarmens702-hub/jev-benchmark")
+    assert requests() == []  # the repo's insteadOf never applied
+
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    monkeypatch.delenv("TMPDIR")
+    for name in ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"):
+        monkeypatch.setenv(name, base)
+    _ls_remote_refused("http://example.invalid/aarmens702-hub/jev-benchmark")
+    assert requests() == []  # no proxy was used
 
 
 def test_pinned_revisions_match_design():

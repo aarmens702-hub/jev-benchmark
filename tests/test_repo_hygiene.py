@@ -22,9 +22,18 @@ def commit_candidates(repo=REPO):
     return sorted(f for f in out.split("\0") if f and (Path(repo) / f).is_file())
 
 
+HEX64 = re.compile(r"[0-9a-fA-F]{64}")
+
+
 def is_fake(match: re.Match) -> bool:
-    """A clearly fake fixture: the matched key part itself says FAKE or TEST, or is one short unit repeated."""
+    """A clearly fake fixture: the matched key part says FAKE or TEST, or is one short unit repeated.
+
+    A run of 64 hex characters (a real key's length) that is not a repeated unit is never fake, whatever
+    else is stuck on, so a real key with FAKE added before or after is still caught.
+    """
     key = match.group(1)
+    if any(REPEATED.fullmatch(run) is None for run in HEX64.findall(key)):
+        return False
     return "FAKE" in key or "TEST" in key or REPEATED.fullmatch(key) is not None
 
 
@@ -66,6 +75,8 @@ PREFIX = "sk-or" + "-v1-"
         '{"key": "' + PREFIX + "Zq8" + _fake_hex(40) + '"}',
         "Authorization: Bearer " + PREFIX + _fake_hex(48).upper(),
         PREFIX + _fake_hex(64) + "-FAKE",  # FAKE outside the matched key does not excuse it
+        PREFIX + _fake_hex(64) + "FAKE",  # nor does FAKE stuck onto a real-length key
+        PREFIX + "TEST" + _fake_hex(64),
         "TEST " + PREFIX + _fake_hex(64),
     ],
 )
@@ -130,3 +141,11 @@ def test_gitignore_ignores(path):
 )
 def test_gitignore_keeps_what_must_be_committed(path):
     assert git("check-ignore", "-q", "--no-index", path).returncode == 1, path
+
+
+def test_stage1_script_uses_a_fresh_bytecode_folder():
+    text = (REPO / "scripts" / "stage1.sh").read_text()
+    lines = text.splitlines()
+    prefix = next(i for i, line in enumerate(lines) if line.startswith('export PYTHONPYCACHEPREFIX="$(mktemp -d)"'))
+    run = next(i for i, line in enumerate(lines) if "python -m stage1" in line)
+    assert prefix < run

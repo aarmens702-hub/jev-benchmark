@@ -183,7 +183,7 @@ From VALIDATION.md, "What stops the project":
 
 ## Budget
 
-Hard cap CA$10 (about US$7.15 at 1.3994), everything included, enforced by a limit on the key and in code. Stage 0, before the freeze and on validation rows only, was capped at US$0.50 and spent US$0.146. Projected Stage 1 spend from measured tokens is US$1.60 with the 5.5% credit fee (about CA$2.23), routing excluded.
+Hard cap CA$10 (about US$7.15 at 1.3994), everything included, enforced by a limit on the key and in code. Stage 0, before the freeze and on validation rows only, was capped at US$0.50 and spent US$0.146. A full run of the Stage 1 pipeline on validation rows only, ending in the blind dry run, cost about US$0.34 more before the freeze (see deviations.md). Projected Stage 1 spend from measured tokens is US$1.60 with the 5.5% credit fee (about CA$2.23), routing excluded.
 
 - **Stage 1, after freeze, approved all at once, in order:** Jev Banking77; Jev AG News; Jev + examples; routing; small LLM Banking77; small LLM AG News; Jev bare-name runs.
 
@@ -197,7 +197,7 @@ Full detail is in `stage0/stage0_report.md` and `stage0/frozen.yaml`, both hashe
 
 ## Deviations so far
 
-All four were decided and written into DESIGN.md before the freeze, before any test data was on disk. They are rows in `deviations.md` with Stage "pre-freeze".
+All four were decided and written into DESIGN.md before the freeze, before any test data was on disk. They are rows in `deviations.md` with Stage "pre-freeze". A fifth row records the pre-freeze validation run of the full pipeline, which used no test data.
 
 1. **Small LLM candidates replaced.** The first candidates, openai/gpt-oss-20b on Darkbloom and z-ai/glm-5.3-flash on Wafer, returned HTTP 400 "Reasoning is mandatory for this endpoint and cannot be disabled" in Stage 0, so neither could run with reasoning off. They were replaced by mistralai/mistral-nemo on DekaLLM, mistralai/mistral-small-3.2-24b-instruct on Parasail and meta-llama/llama-3.1-8b-instruct on CoreWeave, tried cheapest first with no reasoning field. Selection used no labels and picked mistralai/mistral-nemo on DekaLLM.
 2. **LR-CV folds.** Embedding LR-CV picks C by stratified k-fold inside the bank with k = min(s, 5), not leave-one-out, because leave-one-out could take many hours on the Mac. It is a secondary arm, and it uses no outside labels either way.

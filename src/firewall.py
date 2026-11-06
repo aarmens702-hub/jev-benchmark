@@ -10,19 +10,19 @@ below holds. All are checked before any download.
    pending hash, equals manifest.json on disk, and `freeze.verify_manifest` finds no difference between
    it and the tree, the settings in the code and the pinned train parquets.
 4. The tree is clean, untracked files included, and nothing hides a change from git: no assume-unchanged
-   or skip-worktree entries, no replace refs, no untracked file hidden by info/exclude or a global
-   excludes file, no ignored file inside a frozen folder (bytecode of tracked sources excepted), and the
-   repo's top level is this directory.
-5. The public repo shows the tag: a credential-free `git ls-remote` of REGISTRATION_REPO_URL reports the
-   peeled freeze tag and main both at HEAD. That works only once the repo is public, so registration is the
-   public tag, and the manifest at the tag names the repo it is published in.
+   or skip-worktree entries, no replace refs, every tracked file's raw bytes on disk equal its committed
+   blob (so no clean filter or eol conversion can differ from what is published), no untracked file
+   hidden by info/exclude or a global excludes file, no ignored file inside a frozen folder (bytecode of
+   tracked sources excepted), and the repo's top level is this directory.
+5. The public repo shows the tag: `git ls-remote` of REGISTRATION_REPO_URL, run with no credentials (an
+   empty HOME, no helpers, askpass, extra headers, proxies or CA overrides, and no repo above its
+   directory), reports the peeled freeze tag and main both at HEAD. That works only once the repo is
+   public, so registration is the public tag, and the manifest at the tag names the repo it is in.
 
 Every git call is hardened: all GIT_* variables removed, global and system config ignored, replace
 objects off, fsmonitor off and untracked files always listed.
 
 Files come by `hf_hub_download` of a named file at a pinned revision, never by a dataset loader.
-After the first load the scorer may keep gold in gitignored runs/ (`cache_gold`, `read_cached_gold`),
-so a rescore after results are committed never needs `load_test` again.
 """
 import hashlib
 import hmac
@@ -68,6 +68,7 @@ _GIT_CONFIG = (
     "-c", "core.untrackedCache=false",
     "-c", "status.showUntrackedFiles=all",
     "-c", "core.ignoreStat=false",
+    "-c", "core.fileMode=true",
 )
 
 
@@ -78,9 +79,10 @@ def git_env() -> dict:
     return env
 
 
-def git_bytes(repo_dir: Path, *args: str, error=FirewallError) -> bytes:
+def git_bytes(repo_dir: Path, *args: str, error=FirewallError, stdin: bytes | None = None) -> bytes:
     try:
-        done = subprocess.run(["git", *_GIT_CONFIG, *args], cwd=repo_dir, capture_output=True, check=True, env=git_env())
+        done = subprocess.run(["git", *_GIT_CONFIG, *args], cwd=repo_dir, capture_output=True, check=True, env=git_env(),
+                              input=stdin)
     except (subprocess.CalledProcessError, FileNotFoundError, NotADirectoryError) as exc:
         raise error(f"git {' '.join(args)} failed in {repo_dir}") from exc
     return done.stdout
@@ -113,6 +115,38 @@ def _allowed_ignored(rel: str, tracked: set) -> bool:
     return False
 
 
+def _content_problems(repo_dir: Path, allow_changed, error) -> list[str]:
+    """Raw bytes on disk against HEAD's blobs, with no filters or eol conversion.
+
+    A clean filter or an eol rule makes `git status` compare converted bytes, so the code that runs can differ
+    from the committed code while the tree looks clean. Hashing the raw bytes closes that.
+    """
+    files, links, missing = [], [], []
+    for entry in _z(git_bytes(repo_dir, "ls-tree", "-r", "-z", "HEAD", error=error)):
+        meta, path = entry.split("\t", 1)
+        mode, kind, blob = meta.split()
+        if path in allow_changed or kind != "blob":
+            continue
+        disk = repo_dir / path
+        if mode == "120000":
+            links.append((path, blob))
+        elif disk.is_symlink() or not disk.is_file():
+            missing.append(path)
+        else:
+            files.append((path, blob))
+    differ = list(missing)
+    if files:
+        out = git_bytes(repo_dir, "hash-object", "--no-filters", "--stdin-paths", error=error,
+                        stdin="".join(p + "\n" for p, _ in files).encode()).decode().split()
+        differ += [p for (p, blob), got in zip(files, out) if got != blob]
+    for path, blob in links:
+        disk = repo_dir / path
+        target = os.readlink(disk).encode() if disk.is_symlink() else None
+        if target is None or hashlib.sha1(b"blob %d\0" % len(target) + target).hexdigest() != blob:
+            differ.append(path)
+    return [f"files on disk differ from the committed bytes (filters or eol conversion?): {sorted(differ)[:5]}"] if differ else []
+
+
 def worktree_problems(repo_dir: Path, frozen_dirs, *, allow_changed=(), error=FirewallError) -> list[str]:
     """Everything that makes the tree not clean, or could hide a change from `git status`. Empty means clean.
 
@@ -134,6 +168,7 @@ def worktree_problems(repo_dir: Path, frozen_dirs, *, allow_changed=(), error=Fi
     status = [line for line in status if line[3:] not in allow_changed]
     if status:
         problems.append(f"git tree is dirty; it must be clean: {status[:5]}")
+    problems += _content_problems(repo_dir, allow_changed, error)
     # Untracked files hidden by .git/info/exclude or a global excludes file: only the repo's .gitignore counts.
     hidden = [p for p in _z(git_bytes(repo_dir, "ls-files", "-z", "--others", "--exclude-per-directory=.gitignore", error=error))
               if p not in allow_changed]
@@ -207,14 +242,32 @@ def pending_entries(manifest: dict) -> list[str]:
 # --------------------------------------------------------------------------- public repo check
 
 
+def ls_remote_env(home: str) -> dict:
+    """A minimal environment: no credentials, proxies, CA overrides or askpass, and a HOME holding nothing."""
+    return {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": home,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_CEILING_DIRECTORIES": str(Path(home).parent),
+    }
+
+
 def ls_remote(url: str, refs: list[str]) -> str:
-    """Credential-free `git ls-remote`, run outside any repo so no local config can redirect the URL."""
+    """Credential-free `git ls-remote`.
+
+    It runs in a fresh empty directory that is also HOME, so no ~/.netrc or user config is read, and git
+    may not search above it for a repo whose config could redirect the URL or add headers. Credential
+    helpers, askpass and extra headers are switched off, and only PATH passes through from the environment.
+    """
     with tempfile.TemporaryDirectory() as empty:
+        empty = str(Path(empty).resolve())
+        cmd = ["git", "-c", "credential.helper=", "-c", "core.askPass=", "-c", "http.extraHeader=",
+               "-c", "http.sslVerify=true", "ls-remote", url, *refs]
         try:
-            done = subprocess.run(
-                ["git", "-c", "credential.helper=", "-c", "http.sslVerify=true", "ls-remote", url, *refs],
-                cwd=empty, capture_output=True, text=True, check=True, env=git_env(), timeout=LS_REMOTE_TIMEOUT_SECONDS,
-            )
+            done = subprocess.run(cmd, cwd=empty, capture_output=True, text=True, check=True,
+                                  env=ls_remote_env(empty), timeout=LS_REMOTE_TIMEOUT_SECONDS)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
             raise FirewallError(f"git ls-remote {url} failed: is the repo public?") from exc
     return done.stdout
@@ -335,45 +388,3 @@ def load_test(dataset: str, token: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     row_id is the row's position in the official file.
     """
     return _load_test(dataset, token, repo_dir=REPO_ROOT, freeze_tag=FREEZE_TAG)
-
-
-# --------------------------------------------------------------------------- gold kept for the scorer
-
-GOLD_CACHE = REPO_ROOT / "runs" / "private" / "test_gold"
-
-
-def cache_gold(dataset: str, gold: pd.DataFrame, cache_dir: Path = GOLD_CACHE) -> Path:
-    """Keep the gold frame from the first load in gitignored runs/, with its SHA-256 beside it. Never overwrites.
-
-    Call it only after every prediction file is written (the scorer's first run). A rescore then reads it
-    with `read_cached_gold` and needs no `load_test`, which refuses once results are committed past the tag.
-    """
-    if list(gold.columns) != ["row_id", "label"]:
-        raise FirewallError("gold must have exactly the columns row_id, label")
-    repo_id = _ALIASES.get(dataset, dataset)
-    if repo_id not in PINNED_TEST_FILES:
-        raise FirewallError(f"unknown dataset {dataset!r}")
-    name = repo_id.replace("/", "--")
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    path, digest_path = cache_dir / f"{name}.gold.json", cache_dir / f"{name}.gold.sha256"
-    raw = json.dumps({"row_id": [int(x) for x in gold["row_id"]], "label": [int(x) for x in gold["label"]]}).encode()
-    if path.exists() or digest_path.exists():
-        raise FirewallError(f"gold for {repo_id} is already cached; it is never overwritten")
-    path.write_bytes(raw)
-    digest_path.write_text(hashlib.sha256(raw).hexdigest() + "\n")
-    return path
-
-
-def read_cached_gold(dataset: str, cache_dir: Path = GOLD_CACHE) -> pd.DataFrame:
-    """The gold frame kept by `cache_gold`, refused if its bytes no longer match the recorded SHA-256."""
-    repo_id = _ALIASES.get(dataset, dataset)
-    name = repo_id.replace("/", "--")
-    path, digest_path = Path(cache_dir) / f"{name}.gold.json", Path(cache_dir) / f"{name}.gold.sha256"
-    if not path.is_file() or not digest_path.is_file():
-        raise FirewallError(f"no cached gold for {repo_id}")
-    raw = path.read_bytes()
-    if hashlib.sha256(raw).hexdigest() != digest_path.read_text().strip():
-        raise FirewallError(f"cached gold for {repo_id} does not match its recorded SHA-256")
-    data = json.loads(raw)
-    return pd.DataFrame({"row_id": data["row_id"], "label": data["label"]})
