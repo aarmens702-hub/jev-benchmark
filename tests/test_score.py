@@ -17,7 +17,7 @@ import predictions
 import report
 import score
 import verdict as verdict_module
-from fake_runs import CLASSES, make_fake_runs
+from fake_runs import CLASSES, make_fake_routing, make_fake_runs
 from metrics import GRID, DsResult
 from score import RECORD, ScoreRefused, Settings
 
@@ -192,7 +192,9 @@ def test_lock_is_written_before_results_so_a_crash_counts_as_a_run(fresh, monkey
 def test_deviation_rows_skip_the_header_and_rule(tmp_path):
     write_deviations(tmp_path / "d.md", [("one", "stage1"), ("two", "rescore")])
     assert len(score.deviation_rows(tmp_path / "d.md")) == 2
-    assert score.deviation_rows(REPO / "deviations.md") == []  # the real table is empty before Stage 1
+    # Before Stage 1 the real table holds no Stage 1 or rescore rows (the pre-freeze validation run's row is allowed).
+    stages = {score._cells(row)[3] for row in score.deviation_rows(REPO / "deviations.md")}
+    assert not stages & {"stage1", "rescore"}
     assert score.deviation_rows(tmp_path / "missing.md") == []
 
 
@@ -209,6 +211,8 @@ def test_gold_read_only_inside_score():
         imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) for a in n.names}
         if path.name not in ("score.py", "firewall.py", "stage1.py"):
             assert "load_test" not in names | imported, path.name
+        if path.name != "firewall.py":  # the private, redirectable loader belongs to the firewall and its tests alone
+            assert "_load_test" not in names | imported, path.name
     report_src = (SRC / "report.py").read_text()
     report_tree = ast.parse(report_src)
     report_imports = {a.name for n in ast.walk(report_tree) if isinstance(n, ast.Import) for a in n.names}
@@ -664,3 +668,105 @@ def test_firewall_integer_row_ids_round_trip_through_prediction_files(tmp_path):
     gold = pd.DataFrame({"row_id": pd.RangeIndex(3, name="row_id"), "label": [0, 1, 0]})  # firewall shape
     data = score.DatasetInput("banking77", single={"x": score.Loaded(got, vec, ["a", "b"])})
     score.check_row_order(score.gold_names(gold, ["a", "b"]), data)  # no error
+
+
+# --------------------------------------------------------------------------- the routing test
+
+
+ROUTING_CLASSES = {"banking77": ["card_arrival", "lost_or_stolen_card", "top_up_failed", "exchange_rate"], "ag_news": CLASSES["ag_news"]}
+
+
+def routing_set(tmp_path, n=40, **kwargs):
+    runs = tmp_path / "runs"
+    val_gold = make_fake_runs(runs, "val", per_class={"banking77": 15, "ag_news": 4}, families=("lr",), classes_by_dataset=ROUTING_CLASSES)
+    validity = tmp_path / "validity.json"
+    text = make_fake_routing(runs, "val", val_gold["banking77"], n, validity_path=validity, **kwargs)
+    return runs, val_gold, text, validity
+
+
+def routed_dry_run(tmp_path, runs, val_gold, text, validity, n=40, monkeypatch=None):
+    return score.dry_run(val_gold, runs_root=runs, settings=FAST, deviations_path=tmp_path / "d.md", routing_text=text, validity_path=validity)
+
+
+def test_routing_is_scored_end_to_end_without_gold_vectors(tmp_path, monkeypatch):
+    monkeypatch.setattr(score, "DRY_RUN_ROUTING_ROWS", 40)
+    runs, val_gold, text, validity = routing_set(tmp_path)
+    results = routed_dry_run(tmp_path, runs, val_gold, text, validity)
+    r = results["routing"]
+    assert r["status"] in ("valid", "invalid") and r["n_rows"] == 40 and r["invalid"] == []
+    assert "gold_A" not in r and "gold_B" not in r
+    assert set(r["accuracy"]) == {"Jev", "small LLM", "NLI", "LR-A", "Intent LR + code"}
+    assert set(r["accuracy"]["Jev"]) == {"A", "B"} and "acc@80" in r["accuracy"]["Jev"]["A"]
+    assert "lower" in r["jev_vs_code_B"] and r["claims"]
+    out = runs / "dryrun" / "results"
+    saved = json.loads((out / "results.json").read_text())["routing"]
+    assert saved["status"] == r["status"] and "gold_A" not in json.dumps(saved)
+    table = pd.read_csv(out / "routing.csv")
+    assert len(table) == 10 and set(table["rule"]) == {"A", "B"}
+    assert len(list((out / "predictions" / "routing").glob("*.parquet"))) == 9
+    assert any("s=all" in d for d in results["disclosures"])
+
+
+def test_a_routing_arm_not_run_is_none_and_reported(tmp_path, monkeypatch):
+    monkeypatch.setattr(score, "DRY_RUN_ROUTING_ROWS", 40)
+    runs, val_gold, text, validity = routing_set(tmp_path, not_run=("small_llm_rule_B",))
+    r = routed_dry_run(tmp_path, runs, val_gold, text, validity)["routing"]
+    assert r["accuracy"]["small LLM"] == "not run" and r["vs_jev_B"]["small LLM"] == "not run"
+    assert {"file": "small_llm_rule_B", "reason": "not part of this fake"} in r["not_run"]
+
+
+def test_a_changed_fingerprint_makes_routing_invalid(tmp_path, monkeypatch):
+    monkeypatch.setattr(score, "DRY_RUN_ROUTING_ROWS", 40)
+    runs, val_gold, text, validity = routing_set(tmp_path)
+    (runs / "val_routing" / score.FINGERPRINT_FILE).write_text(json.dumps({"fingerprint": "0" * 64}))
+    r = routed_dry_run(tmp_path, runs, val_gold, text, validity)["routing"]
+    assert r["status"] == "invalid" and r["rules_changed"] and r["claims"] == []
+    # A logged change counts too, even if the fingerprint now matches again.
+    runs2, val_gold2, text2, validity2 = routing_set(tmp_path / "again")
+    (runs2 / "val_routing" / score.FINGERPRINT_CHANGES).write_text("{}\n")
+    assert routed_dry_run(tmp_path / "again", runs2, val_gold2, text2, validity2)["routing"]["status"] == "invalid"
+
+
+def test_missing_validity_record_makes_routing_invalid_but_scores_banking77(tmp_path, monkeypatch):
+    monkeypatch.setattr(score, "DRY_RUN_ROUTING_ROWS", 40)
+    runs, val_gold, text, validity = routing_set(tmp_path)
+    validity.unlink()
+    results = routed_dry_run(tmp_path, runs, val_gold, text, validity)
+    assert results["routing"]["status"] == "invalid" and score.VALIDITY_MISSING in results["routing"]["invalid"]
+    assert results["datasets"]["banking77"]["primary"] is not None
+
+
+def test_routing_outputs_without_a_fingerprint_are_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(score, "DRY_RUN_ROUTING_ROWS", 40)
+    runs, val_gold, text, validity = routing_set(tmp_path, fingerprint=False)
+    with pytest.raises(ScoreRefused, match="fingerprint"):
+        routed_dry_run(tmp_path, runs, val_gold, text, validity)
+    assert not (runs / "dryrun" / "scored.lock").exists()
+
+
+def test_misordered_or_partial_routing_files_are_refused_before_the_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(score, "DRY_RUN_ROUTING_ROWS", 40)
+    runs, val_gold, text, validity = routing_set(tmp_path)
+    rows, _, _ = predictions.read("nli_rule_A", "banking77", "val_routing", runs)
+    predictions.write("nli_rule_A", "banking77", rows.iloc[::-1].reset_index(drop=True), "val_routing", root=runs)
+    with pytest.raises(ScoreRefused, match="nli_rule_A row ids differ from the routing sample's order"):
+        routed_dry_run(tmp_path, runs, val_gold, text, validity)
+    predictions.write("nli_rule_A", "banking77", rows.iloc[:10], "val_routing", root=runs)
+    with pytest.raises(ScoreRefused, match="nli_rule_A row ids differ .* rows"):
+        routed_dry_run(tmp_path, runs, val_gold, text, validity)
+    assert not (runs / "dryrun" / "scored.lock").exists()
+
+
+def test_the_record_refuses_a_missing_routing_file(tmp_path):
+    base = tmp_path
+    gold = make_fake_runs(base / "runs", "stage1", per_class={"banking77": 200, "ag_news": 4}, families=("lr",), classes_by_dataset=ROUTING_CLASSES)
+    text = make_fake_routing(base / "runs", "stage1", gold["banking77"], 800, skip=("lr_a",), validity_path=tmp_path / "v.json")
+    with pytest.raises(ScoreRefused, match="lr_a has neither predictions nor a not-run record"):
+        score.score("stage1", gold, **paths(base), label_names=ROUTING_CLASSES, routing_text=text, validity_path=tmp_path / "v.json")
+    assert not (base / "scored.lock").exists()
+
+
+def test_not_unique_to_jev_adds_the_correction():
+    res = {"claims": ["Not unique to Jev"]}
+    assert score.ROUTING_CORRECTION in score.corrections({}, res)
+    assert score.ROUTING_CORRECTION not in score.corrections({}, {"claims": ["no new capability shown here"]})

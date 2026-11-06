@@ -10,7 +10,8 @@ and ends with the scorer's dry run, which prints only DRY RUN OK or a failure. V
 only inside that dry run, where it is permuted. The pool and banks exclude validation rows, and s=all is
 the pool alone, because the validation rows are the rows being predicted.
 
-`--stage test` refuses unless `firewall.load_test` succeeds for both datasets (freeze token, manifest
+`--stage test` refuses unless the validation run passed its dry run (runs/val/dry_run_ok.json) with every arm
+accounted for, and then unless `firewall.load_test` succeeds for both datasets (freeze token, manifest
 with its registration, clean tree, HEAD at the freeze tag). It keeps the text frames and drops the gold frames
 unread (in `_test_text`, the one place this module reaches the firewall). It records the test hashes and duplicate counts, removes pool and validation rows that share
 normalized text with a test row before any bank is built (s=all included), writes bank_sizes.json, runs
@@ -21,13 +22,17 @@ deviations rows (test hashes, duplicates, every arm not run) are appended to dev
 Order, one thing at a time:
   1. Paid, needing --paid stage1 and Aarmen's yes: latency probes first, then DESIGN's Stage 1 list in
      order: Jev Banking77; Jev AG News; Jev + examples (Banking77, bank draw 0, s=8); routing (Jev rule A,
-     rule B, small LLM rule A, rule B); small LLM Banking77; small LLM AG News; Jev bare-name runs. One
+     rule B, small LLM rule A, rule B; a 20-row smoke each at validation, the 800 rows at test); small LLM
+     Banking77; small LLM AG News; Jev bare-name runs. One
      client per arm, with the grace from frozen.yaml. Before each arm, its unfinished rows times Stage 0's
      measured cost per row (with a 25% margin) is compared with what the ledger has left; if it does not
-     fit, that arm and every later one are logged not run.
+     fit, or the ledger refuses, that arm and every later one are logged not run. A rejected key or empty
+     credits, a changed model, 10 failures in a row or failures above 1% halt instead: nothing more is
+     marked, nothing is scored, and a rerun resumes. A routing rule change logs the routing arms not run.
   2. Free, under --max-hours, guards and checkpoints, inside one model-job lock: NLI first (it is the long
      one), then routing NLI, embedding similarity and its sensitivity rows, the LR, LR-CV and TF-IDF grids
-     (draws 0-9, s=all fit once as draw 0), the routing LR arms, and the local latency probes.
+     (draws 0-9, s=all fit once as draw 0), the routing LR arms, routing's validation-draw checks
+     (validation stage only, frozen in routing/validity.json), and the local latency probes.
   3. The scorer, once every arm has a prediction file or a logged "not run".
 
 Rerunning resumes: finished arms are skipped, finished rows are never sent again (openrouter.run_arm keeps
@@ -72,6 +77,10 @@ from retrieval import Example, retrieve
 log = logging.getLogger("stage1")
 
 REPO = Path(__file__).resolve().parents[1]
+# Stage 0's frozen choices. The freeze tooling moves Stage 0's outputs into a tracked stage0/ folder and adds
+# stage0.FROZEN_YAML; this single constant is switched to that at the merge.
+FROZEN_YAML = REPO / "stage0" / "frozen.yaml"
+DRY_RUN_OK = "dry_run_ok.json"  # written in runs/val/ when the validation run's dry run passes
 PAID = "stage1"  # the ledger stage for both runs, and the folder of the test run's predictions
 STAGE_DIRS = {"val": "val", "test": PAID}
 DATASETS = ("banking77", "ag_news")
@@ -82,8 +91,9 @@ PROBE_ROWS, PROBE_WARMUP = latency_probe.DEFAULT_ROWS, latency_probe.DEFAULT_WAR
 DEFAULT_MAX_HOURS = 12.0
 # Stops that end an arm for good: it is logged not run and the next arm goes ahead.
 FINAL_ARM_STOPS = {"ArmNotRun", "HiddenReasoning", "ProviderChanged"}
-# Stops about money: this arm and every later paid arm are logged not run (DESIGN.md, Budget).
-BUDGET_STOPS = {"BudgetExceeded", "KeyOrCreditsStop"}
+# Stops about the cap: this arm and every later paid arm are logged not run (DESIGN.md, Budget). A key or
+# credits stop (401, 402, 403) is not one: it halts and resumes, since a key problem must not use up the run.
+BUDGET_STOPS = {"BudgetExceeded"}
 EXIT_OK, EXIT_FAIL, EXIT_STOPPED, EXIT_REFUSED = 0, 1, 2, 3
 
 
@@ -283,7 +293,9 @@ class Runtime:
 
     make_client: Optional[Callable[..., openrouter.Client]] = None
     runs_root: Path = predictions.RUNS
-    frozen_path: Path = REPO / "frozen.yaml"
+    frozen_path: Path = FROZEN_YAML
+    validity_path: Path = score.VALIDITY_PATH
+    routing_validity: Callable = routing.run_validity
     stage0_dir: Path = predictions.RUNS / "private" / "stage0"
     deviations_path: Path = REPO / "deviations.md"
     load_split: Callable[[str], data.Split] = lambda dataset: data.split(data.load_train(dataset), dataset)
@@ -324,6 +336,27 @@ def _sha256_text(target: pd.DataFrame) -> str:
     return h.hexdigest()
 
 
+def rows_to_send(results_path: Path, row_ids: list) -> list:
+    """Rows openrouter.run_arm would still send: never finished, or failed on an outage with a pass left."""
+    path = Path(results_path)
+    finished, outage = {}, {}
+    if path.exists():
+        lines, _ = split_torn_tail(path.read_bytes())
+        for r in map(json.loads, lines):
+            if r.get("status") not in ("done", "failed"):
+                continue
+            finished[r["row_id"]] = r
+            if r.get("failed") and openrouter.is_outage_reason(r.get("reason")):
+                outage[r["row_id"]] = outage.get(r["row_id"], 0) + 1
+    out = []
+    for row_id in row_ids:
+        r = finished.get(row_id)
+        retriable = r is not None and r.get("failed") and openrouter.is_outage_reason(r.get("reason")) and outage.get(row_id, 0) < openrouter.OUTAGE_PASS_LIMIT
+        if r is None or retriable:
+            out.append(row_id)
+    return out
+
+
 def _atomic_json(path: Path, obj) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -342,7 +375,9 @@ class Stage1:
         self.rt, self.stage = rt, stage
         self.max_hours, self.region, self.give_up_reason = max_hours, region, give_up_reason
         self.pred_stage = STAGE_DIRS[stage]
-        self.routing_stage = f"{self.pred_stage}_routing"
+        self.routing_stage = score.routing_stage(self.pred_stage)
+        # Validation needs only a smoke of each routing arm; the test run uses the full 800.
+        self.routing_n = score.DRY_RUN_ROUTING_ROWS if stage == "val" else routing.N_SAMPLE
         self.root = Path(rt.runs_root)
         self.private = self.root / "private" / self.pred_stage
         self.data: dict[str, Prepared] = {}
@@ -355,7 +390,7 @@ class Stage1:
         self._raw_encoder = self._encoder = self._nli = None
         self._cache: Optional[JevCache] = None
         self._splits: dict = {}
-        self._fingerprint_checked = False
+        self._fingerprint_ok: Optional[bool] = None
         self.last_ledger = None
 
     # ------------------------------------------------------------------ setup
@@ -373,6 +408,7 @@ class Stage1:
         self.grace = float(self.frozen["key_usage"]["reconcile_grace_seconds"])
         texts = {}
         if self.stage == "test":
+            self.check_val_ready()
             for dataset in DATASETS:
                 try:
                     texts[dataset] = text_only(self.rt.load_test_text(dataset))
@@ -395,6 +431,16 @@ class Stage1:
                 "text_sha256": _sha256_text(target),
                 "duplicates_removed": {"pool": n_pool, "validation": n_val},
             }
+
+    def check_val_ready(self) -> None:
+        """The test run needs the validation run done: its dry run passed, and every arm there accounted for."""
+        if not (self.root / "val" / DRY_RUN_OK).exists():
+            raise Refused("the validation run has not passed its dry run; run --stage val first")
+        targets = {d: text_only(self.split(d).val) for d in DATASETS}
+        rows = routing.sample_rows(targets["banking77"], score.DRY_RUN_ROUTING_ROWS)
+        missing = self.unaccounted_in("val", targets, rows)
+        if missing:
+            raise Refused(f"the validation run is missing {len(missing)} arms (first {missing[0][0]}__{missing[0][1]}); rerun --stage val")
 
     def write_records(self) -> None:
         """Test hashes and duplicate counts (test stage), then every bank's size, before any bank is used."""
@@ -428,9 +474,9 @@ class Stage1:
         return data.bank(p.pool, draw, s)
 
     def routing_rows(self) -> pd.DataFrame:
-        """The routing sample: the first 800 Banking77 rows by routing hash, read from text only."""
+        """The routing sample: the first 800 Banking77 rows by routing hash (20 at validation), from text only."""
         if self._routing_rows is None:
-            self._routing_rows = routing.sample_rows(self.data["banking77"].target)
+            self._routing_rows = routing.sample_rows(self.data["banking77"].target, self.routing_n)
         return self._routing_rows
 
     def probe_texts(self) -> list:
@@ -450,22 +496,37 @@ class Stage1:
 
     # ------------------------------------------------------------------ routing fingerprint
 
-    def ensure_fingerprint(self, first_arm: str) -> None:
-        """Recorded before the first routing arm writes anything; later runs compare against it."""
-        path = self.root / self.routing_stage / "fingerprint.json"
+    def ensure_fingerprint(self, first_arm: str) -> bool:
+        """Record the rule fingerprint before the first routing arm writes anything; later, compare against it.
+
+        False means the rules or text changed since the first routing output: the routing test is invalid, so
+        no more is spent or computed on it, and the change is logged for the scorer.
+        """
+        path = self.root / self.routing_stage / score.FINGERPRINT_FILE
+        changes = path.with_name(score.FINGERPRINT_CHANGES)
         current = routing.rule_fingerprint()
         if not path.exists():
             _atomic_json(path, {"fingerprint": current, "first_arm": first_arm, "recorded_at": self.rt.now().isoformat(timespec="seconds")})
-            self._fingerprint_checked = True
-            return
-        if self._fingerprint_checked:
-            return
-        self._fingerprint_checked = True
+            self._fingerprint_ok = True
+            return True
         recorded = json.loads(path.read_text())["fingerprint"]
-        if routing.rules_changed_since(recorded):
-            with open(path.with_name("fingerprint_changes.jsonl"), "a", encoding="utf-8") as f:
-                f.write(json.dumps({"recorded": recorded, "now": current, "at": self.rt.now().isoformat(timespec="seconds")}) + "\n")
-            print("WARNING: routing rules or text changed after the first routing arm output; the routing test is invalid")
+        if changes.exists() or routing.rules_changed_since(recorded):
+            if not changes.exists() or self._fingerprint_ok is None:
+                with open(changes, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"recorded": recorded, "now": current, "at": self.rt.now().isoformat(timespec="seconds")}) + "\n")
+                print("routing rules or text changed after the first routing output: the routing test is invalid; no more routing arms run")
+            self._fingerprint_ok = False
+            return False
+        self._fingerprint_ok = True
+        return True
+
+    def routing_not_run(self, name: str, reason: str) -> None:
+        if not predictions.paths(name, "banking77", self.routing_stage, self.root)[0].exists() and \
+                (name, "banking77") not in predictions.read_not_run(self.routing_stage, self.root):  # fmt: skip
+            predictions.mark_not_run(name, "banking77", self.routing_stage, reason, self.root)
+            print(f"routing {name}: not run ({reason})")
+
+    RULES_CHANGED = "routing rules or text changed after the first routing output; the routing test is invalid"
 
     # ------------------------------------------------------------------ paid
 
@@ -538,13 +599,30 @@ class Stage1:
         """The test run's probes go where score.py reads them; the validation run keeps its own."""
         return self.root / "latency" / "probes.jsonl" if self.stage == "test" else self.root / self.pred_stage / "latency" / "probes.jsonl"
 
-    def save_probe(self, arm: str, result: dict) -> None:
-        result["condition"] = latency_probe.condition(region=self.region, concurrency=1, hardware=self.rt.hardware())
-        path = self.probes_file()
+    PROBE_ORDER = (*latency_probe.API_ARMS, "network", *latency_probe.LOCAL_ARMS)
+
+    def save_probe(self, arm: str, result: Optional[dict], status: Optional[str] = None) -> None:
+        """The marker holds the result itself, written atomically; probes.jsonl is rebuilt from the markers,
+        so a crash at any point leaves neither a lost nor a doubled probe."""
+        if result is not None:
+            result = {**result, "condition": latency_probe.condition(region=self.region, concurrency=1, hardware=self.rt.hardware()),
+                      "stage": self.pred_stage}  # fmt: skip
+        marker = {"status": status or (result or {}).get("status", "run"), "result": result}
+        path = self.probe_marker(arm)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({**result, "stage": self.pred_stage}, default=str) + "\n")
-        _atomic_json(self.probe_marker(arm), {"status": result.get("status", "run")})
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(marker, default=str))
+        os.replace(tmp, path)
+        lines = []
+        for name in self.PROBE_ORDER:
+            m = self.probe_marker(name)
+            if m.exists() and (saved := json.loads(m.read_text()).get("result")) is not None:
+                lines.append(json.dumps(saved, default=str))
+        out = self.probes_file()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_name(out.name + ".tmp")
+        tmp.write_text("".join(line + "\n" for line in lines))
+        os.replace(tmp, out)
 
     def api_probes_pending(self) -> bool:
         return any(not self.probe_marker(a).exists() for a in ("jev", "small_llm", "network"))
@@ -556,13 +634,13 @@ class Stage1:
             if self.probe_marker(arm).exists():
                 continue
             if arm == "small_llm" and self.llm is None:
-                _atomic_json(self.probe_marker(arm), {"status": "not run: no small LLM selected"})
+                self.save_probe(arm, None, "not run: no small LLM selected")
                 continue
             per_row = costs[(f"probe_{arm}", "banking77")] * SAFETY
             client = self.new_client(f"the {arm} latency probe", max_concurrency=1)
             if len(rows) * per_row > client.ledger.remaining():
                 print(f"latency probe {arm}: not run, its projected cost does not fit what is left")
-                _atomic_json(self.probe_marker(arm), {"status": "not run: does not fit"})
+                self.save_probe(arm, None, "not run: does not fit")
                 continue
             if arm == "jev":
                 options, instructions = label_texts("banking77", bare=False), prompts.jev_instructions("banking77")
@@ -586,6 +664,9 @@ class Stage1:
             for arm in plan:
                 if not self.paid_done(arm):
                     self.not_run(arm, f"unfinished, given up: {self.give_up_reason}")
+            for probe in (*latency_probe.API_ARMS, "network"):
+                if not self.probe_marker(probe).exists():
+                    self.save_probe(probe, None, f"not run: given up: {self.give_up_reason}")
         todo = [arm for arm in plan if not self.paid_done(arm)]
         if not todo and not self.api_probes_pending():
             print("paid arms: every one is finished or logged not run")
@@ -594,8 +675,13 @@ class Stage1:
             raise PaidHalt(f"paid work is unfinished ({len(todo)} arms, latency probes {'pending' if self.api_probes_pending() else 'done'}); "
                            f"rerun with --paid {PAID} (needs Aarmen's yes)")
         costs = stage0_costs(self.rt.stage0_dir, self.llm)
-        projected = sum(len(self.paid_rows(a)) * costs.get((a.kind, a.dataset), 0.0) * SAFETY for a in todo if not a.uses_llm or self.llm)
-        print(f"projected paid spend for {len(todo)} unfinished arms, at most: US${projected:.4f} (Stage 0 costs plus 25%)")
+        projected = sum(len(rows_to_send(self.results_path(a), [r["row_id"] for r in self.paid_rows(a)])) * costs.get((a.kind, a.dataset), 0.0)
+                        for a in todo if not a.uses_llm or self.llm)  # fmt: skip
+        for probe in latency_probe.API_ARMS:
+            if not self.probe_marker(probe).exists() and (f"probe_{probe}", "banking77") in costs:
+                projected += PROBE_ROWS * costs[(f"probe_{probe}", "banking77")]
+        print(f"projected paid spend for {len(todo)} unfinished arms and the pending latency probes, at most: "
+              f"US${projected * SAFETY:.4f} (Stage 0 costs plus 25%)")  # fmt: skip
         self.run_api_probes(costs)
         for i, arm in enumerate(plan):
             if not self.paid_done(arm):
@@ -609,19 +695,16 @@ class Stage1:
             return
         rows = self.paid_rows(arm)
         path = self.results_path(arm)
-        finished = set()
-        if path.exists():
-            lines, _ = split_torn_tail(path.read_bytes())
-            finished = {r["row_id"] for r in map(json.loads, lines) if r.get("status") in ("done", "failed")}
-        n_todo = sum(1 for r in rows if r["row_id"] not in finished)
+        n_todo = len(rows_to_send(path, [r["row_id"] for r in rows]))
         per_row = costs[(arm.kind, arm.dataset)] * SAFETY
         client = self.new_client(arm.label)
         need, left = n_todo * per_row, client.ledger.remaining()
         if need > left:
             self.budget_stop([arm, *rest], f"projected US${need:.4f} for {n_todo} rows of {arm.label} is more than the US${left:.4f} left under the cap")
             return
-        if arm.routing:
-            self.ensure_fingerprint(arm.name)
+        if arm.routing and not self.ensure_fingerprint(arm.name):
+            self.not_run(arm, self.RULES_CHANGED)
+            return
         decide = self.decider(arm, client)
         self.event(what="paid_start", arm=arm.label, rows=len(rows), todo=n_todo, projected=need)
         report = openrouter.run_arm(rows, decide, client=client, results_path=path, expected_per_row=per_row)
@@ -643,6 +726,9 @@ class Stage1:
             self.budget_stop([arm, *rest], f"{stop}: {report.reason}")
         elif report.status == "arm_not_run" or stop in FINAL_ARM_STOPS:
             self.not_run(arm, f"{stop}: {report.reason}")
+        elif stop == "KeyOrCreditsStop":
+            raise PaidHalt(f"{arm.label} stopped: the key was rejected or credits ran out ({report.reason}). Nothing is marked not run "
+                           "and nothing is scored; fix the key or balance (never past the cap) and rerun to resume.")
         elif stop == "ModelChanged":
             raise PaidHalt(f"PAUSE: {arm.label}: the model changed mid-run (VALIDATION.md): {report.reason}. Ask Aarmen and log a "
                            "deviations row; do not rerun selectively. Finished rows are kept.")
@@ -684,9 +770,15 @@ class Stage1:
         got = predictions.read(arm, dataset, stage, self.root)
         return got is not None and got[0]["row_id"].astype(str).tolist() == rows["row_id"].astype(str).tolist()
 
+    def settled(self, arm: str, dataset: str, stage: str, rows: pd.DataFrame) -> bool:
+        """Complete, or logged not run (itself or its family): either way a free step leaves it alone."""
+        logged = predictions.read_not_run(stage, self.root)
+        family = next((f for f in score.FAMILIES if arm.startswith(f + "_d")), None)
+        return (arm, dataset) in logged or (family, dataset) in logged or self.complete(arm, dataset, stage, rows)
+
     def free_nli(self, dataset: str):
         target = self.data[dataset].target
-        if self.complete(score.NLI, dataset, self.pred_stage, target):
+        if self.settled(score.NLI, dataset, self.pred_stage, target):
             return None
         hyps = arms_local.nli_hypotheses(dataset, bare=False)
         scorer = self.nli_scorer()
@@ -705,7 +797,7 @@ class Stage1:
         target = self.data[dataset].target
         base = score.EMBED_BARE if bare else score.EMBED
         names = [base] if bare else [score.EMBED, *score.EMBED_SENSITIVITY]
-        if all(self.complete(n, dataset, self.pred_stage, target) for n in names):
+        if all(self.settled(n, dataset, self.pred_stage, target) for n in names):
             return None
         texts = label_texts(dataset, bare=bare)
         classes, label_list = list(texts), list(texts.values())
@@ -726,7 +818,7 @@ class Stage1:
     def free_supervised(self, kind: str, dataset: str, draw: int, s):
         target = self.data[dataset].target
         name = f"{kind}_d{draw}_s{s}"
-        if self.complete(name, dataset, self.pred_stage, target):
+        if self.settled(name, dataset, self.pred_stage, target):
             return None
         classes = list(label_texts(dataset, bare=False))
         fitted = {}
@@ -755,9 +847,11 @@ class Stage1:
         rows = self.routing_rows()
         name = f"nli_rule_{rule}"
         premises = pd.DataFrame({"row_id": rows["row_id"].to_numpy(), "text": [routing.nli_premise(r) for r in rows.to_dict("records")]})
-        if self.complete(name, "banking77", self.routing_stage, premises):
+        if self.settled(name, "banking77", self.routing_stage, premises):
             return None
-        self.ensure_fingerprint(name)
+        if not self.ensure_fingerprint(name):
+            self.routing_not_run(name, self.RULES_CHANGED)
+            return None
         hyps = routing.nli_hypotheses(rule)
         scorer = self.nli_scorer()
         return predict_local.run_arm(
@@ -782,8 +876,9 @@ class Stage1:
         """LR-A (rule A labels, never retrained) and Intent LR + code, both on the de-duplicated pool."""
         rows = self.routing_rows()
         pool = self.data["banking77"].pool
-        if not self.complete("lr_a", "banking77", self.routing_stage, rows):
-            self.ensure_fingerprint("lr_a")
+        if not self.settled("lr_a", "banking77", self.routing_stage, rows) and not self.ensure_fingerprint("lr_a"):
+            self.routing_not_run("lr_a", self.RULES_CHANGED)
+        elif not self.settled("lr_a", "banking77", self.routing_stage, rows):
             self.guard()
             encode = self.encoder()
             model = routing.fit_lr_a(routing.lr_a_bank(pool), encode)
@@ -791,12 +886,35 @@ class Stage1:
             pred, top = routing.predict_lr_a(model, rows, encode)
             self._write_routing("lr_a", rows, pred, top, (self.rt.timer() - started) / max(1, len(rows)))
         names = {rule: f"intent_lr_code_rule_{rule}" for rule in routing.RULES}
-        if not all(self.complete(n, "banking77", self.routing_stage, rows) for n in names.values()):
-            self.ensure_fingerprint("intent_lr_code")
+        unfinished = not all(self.settled(n, "banking77", self.routing_stage, rows) for n in names.values())
+        if unfinished and not self.ensure_fingerprint("intent_lr_code"):
+            for name in names.values():
+                self.routing_not_run(name, self.RULES_CHANGED)
+        elif unfinished:
             self.guard()
             out = routing.intent_lr_code(pool, rows, self.encoder(), classes=list(label_texts("banking77", bare=False)))
             for rule, name in names.items():
-                self._write_routing(name, rows, *out[rule], float("nan"))
+                if not self.settled(name, "banking77", self.routing_stage, rows):
+                    self._write_routing(name, rows, *out[rule], float("nan"))
+        return None
+
+    def routing_validity(self):
+        """Validation stage only: routing.run_validity on the validation draw, frozen in routing/validity.json.
+
+        The generator checks read validation gold (VALIDATION.md, use 6); LR-A's floor is kept as pass/fail only.
+        """
+        if self.stage != "val":
+            return None
+        path = Path(self.rt.validity_path)
+        current = routing.rule_fingerprint()
+        if path.exists() and json.loads(path.read_text()).get("fingerprint") == current:
+            return None
+        self.guard()
+        stats, checks = self.rt.routing_validity(self.split("banking77"), self.encoder())
+        record = {"fingerprint": current, "computed_at": self.rt.now().isoformat(timespec="seconds"),
+                  "rows": int(len(self.split("banking77").val)), "stats": stats, "checks": {k: bool(v) for k, v in checks.items()}}  # fmt: skip
+        _atomic_json(path, record)
+        print("routing validity: " + ", ".join(f"{k} {'PASS' if v else 'FAIL'}" for k, v in record["checks"].items()))
         return None
 
     def local_probe_loader(self, arm: str) -> Callable[[], Callable[[str], object]]:
@@ -848,6 +966,7 @@ class Stage1:
                 steps += [(f"{name}__{d}", lambda f=family, d=d, r=draw, s=s: self.free_supervised(f, d, r, s))
                           for draw, s, name in score.family_files(family)]  # fmt: skip
         steps.append(("routing lr_a and intent_lr_code", self.free_routing_lr))
+        steps.append(("routing validity", self.routing_validity))
         steps.append(("local latency probes", self.run_local_probes))
         return steps
 
@@ -872,24 +991,40 @@ class Stage1:
     # ------------------------------------------------------------------ finish
 
     def unaccounted(self) -> list[tuple[str, str]]:
-        """(arm, dataset) that the scorer expects and that has neither full predictions nor a not-run record."""
-        logged = predictions.read_not_run(self.pred_stage, self.root)
+        return self.unaccounted_in(self.pred_stage, {d: p.target for d, p in self.data.items()}, self.routing_rows())
+
+    def unaccounted_in(self, stage: str, targets: dict, routing_rows: pd.DataFrame) -> list[tuple[str, str]]:
+        """(arm, dataset) that the scorer expects and that has neither full predictions nor a not-run record.
+        Routing files come back as (name, "routing")."""
+        logged = predictions.read_not_run(stage, self.root)
         missing = []
         for d in DATASETS:
-            target = self.data[d].target
+            target = targets[d]
             for arm in score.expected_single_arms(d):
-                if (arm, d) not in logged and not self.complete(arm, d, self.pred_stage, target):
+                if (arm, d) not in logged and not self.complete(arm, d, stage, target):
                     missing.append((arm, d))
             for family in score.FAMILIES:
                 if (family, d) in logged:
                     continue
-                missing += [(n, d) for _, _, n in score.family_files(family) if not self.complete(n, d, self.pred_stage, target)]
+                missing += [(n, d) for _, _, n in score.family_files(family) if not self.complete(n, d, stage, target)]
+        rstage = score.routing_stage(stage)
+        rlogged = predictions.read_not_run(rstage, self.root)
+        for name in score.ROUTING_FILES:
+            if (name, "banking77") not in rlogged and not self.complete(name, "banking77", rstage, routing_rows):
+                missing.append((name, "routing"))
         return missing
 
     def give_up(self, missing: list[tuple[str, str]]) -> None:
         """Log every unfinished arm not run. A partial file is set aside, so the scorer never sees both."""
         families = {}
+        reason = f"unfinished, given up: {self.give_up_reason}"
         for arm, d in missing:
+            if d == "routing":
+                for path in predictions.paths(arm, "banking77", self.routing_stage, self.root):
+                    if path.exists():
+                        os.replace(path, path.with_name(path.name + ".partial"))
+                predictions.mark_not_run(arm, "banking77", self.routing_stage, reason, self.root)
+                continue
             family = next((f for f in score.FAMILIES if arm.startswith(f + "_d")), None)
             if family is not None:
                 families.setdefault((family, d), []).append(arm)
@@ -917,9 +1052,15 @@ class Stage1:
                   "rerun to finish them, or pass --mark-unfinished-not-run REASON")  # fmt: skip
             return EXIT_STOPPED
         if self.stage == "val":
-            return self.rt.dry_run(self.root)
+            marker = self.root / self.pred_stage / DRY_RUN_OK
+            marker.unlink(missing_ok=True)
+            code = self.rt.dry_run(self.root)
+            if code == EXIT_OK:
+                _atomic_json(marker, {"at": self.rt.now().isoformat(timespec="seconds")})
+            return code
         code = self.rt.score_test(self.root)
-        self.write_deviations()
+        if code == EXIT_OK:  # a refused scorer leaves the tree clean, so it can be run again after a fix
+            self.write_deviations()
         return code
 
     def write_deviations(self) -> None:

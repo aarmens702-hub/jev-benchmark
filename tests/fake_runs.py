@@ -125,3 +125,41 @@ def make_fake_runs(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(sizes))
     return golds
+
+
+def make_fake_routing(root: Path, stage: str, gold_b77: pd.DataFrame, n: int, *, skip=(), not_run=(), fingerprint=True,
+                      validity_path: Path | None = None, checks=None, seed: int = 0, strong=("Jev",)) -> pd.DataFrame:
+    """Write the 9 routing files under runs/<stage>_routing/ for the first n rows by routing hash.
+
+    Text is made up from the row id. Returns the text frame the scorer samples from. Arms in `strong` are
+    right on most rows; the rest guess. `skip` leaves files out; `not_run` logs them not run.
+    """
+    import routing
+
+    rng = np.random.default_rng(seed)
+    text = pd.DataFrame({"row_id": gold_b77["row_id"].to_numpy(), "text": [f"message number {r}" for r in gold_b77["row_id"]]})
+    sample = routing.sample_rows(text, n)
+    by_id = dict(zip(gold_b77["row_id"].astype(str), gold_b77["label"]))
+    keyed = sample.assign(label=[by_id[str(r)] for r in sample["row_id"]])
+    golds = {rule: routing.gold_queues(keyed, rule) for rule in routing.RULES}
+    rstage = score.routing_stage(stage)
+    for name, (arm, rule) in score.ROUTING_FILES.items():
+        if name in skip:
+            continue
+        if name in not_run:
+            predictions.mark_not_run(name, "banking77", rstage, "not part of this fake", root)
+            continue
+        right = golds[rule or "A"]
+        guess = rng.choice(list(routing.QUEUES), size=len(sample))
+        pred = np.where(rng.random(len(sample)) < (0.9 if arm in strong else 0.3), right, guess)
+        frame = pd.DataFrame({"row_id": sample["row_id"].to_numpy(), "pred": pred.astype(str), "top_prob": rng.uniform(0.3, 1.0, len(sample)),
+                              "failed": np.zeros(len(sample), dtype=bool), "latency_s": rng.uniform(0.01, 0.2, len(sample))})
+        predictions.write(name, "banking77", frame, rstage, root=root)
+    folder = Path(root) / rstage
+    folder.mkdir(parents=True, exist_ok=True)
+    if fingerprint:
+        (folder / score.FINGERPRINT_FILE).write_text(json.dumps({"fingerprint": routing.rule_fingerprint(), "first_arm": "jev_rule_A"}))
+    if validity_path is not None:
+        checks = checks or {k: True for k in score.VALIDITY_KEYS}
+        Path(validity_path).write_text(json.dumps({"checks": checks}))
+    return text

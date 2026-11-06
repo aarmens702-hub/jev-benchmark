@@ -4,8 +4,11 @@ Nothing here spends, reads a key, touches the network or loads test data. The va
 real scorer's dry run, so arm names and row order are checked by the code that will score them.
 """
 import hashlib
+import io
 import json
+import shutil
 import threading
+from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -60,6 +63,11 @@ def make_splits(mark_val=""):
         "banking77": data.Split(val=frame("banking77", "v", 1, mark=mark_val), pool=frame("banking77", "p", 5)),
         "ag_news": data.Split(val=frame("ag_news", "v", 5, mark=mark_val), pool=frame("ag_news", "p", 20)),
     }
+
+
+def unpoisoned(split):
+    """The validation split with true labels: routing's generator checks may read validation gold."""
+    return data.Split(val=split.val.assign(label=split.val["label"].str.removeprefix(GOLD_MARK)), pool=split.pool)
 
 
 def clean_val_gold(splits):
@@ -225,7 +233,10 @@ def build(tmp, splits, *, api=None, cap=7.15, graces=None, stage0_costs=STAGE0_C
         read_swap_gb=lambda: 1.0,
         read_free_disk_gb=lambda path=".": 500.0,
         hardware=lambda: "test-mac",
-        dry_run=lambda root: score.main(["--dry-run"], runs_root=root, load_val_gold=lambda: clean_val_gold(splits), settings=FAST),
+        dry_run=lambda root: score.main(["--dry-run"], runs_root=root, load_val_gold=lambda: clean_val_gold(splits), settings=FAST,
+                                        load_val_text=lambda: splits["banking77"].val[["row_id", "text"]], validity_path=tmp / "validity.json"),
+        validity_path=tmp / "validity.json",
+        routing_validity=lambda split, encode: routing.run_validity(unpoisoned(split), encode),
         now=lambda: NOW,
     )
     for key, value in overrides.items():
@@ -267,9 +278,6 @@ def val_run(tmp_path_factory):
     rt, api, watch = build(tmp, splits, api=api, graces=graces)
     with pytest.MonkeyPatch.context() as mp:
         record_run_arm(mp, order)
-        import io
-        from contextlib import redirect_stdout
-
         out = io.StringIO()
         with redirect_stdout(out):
             code = stage1.main(["--stage", "val"], runtime=rt)
@@ -315,7 +323,15 @@ def test_routing_fingerprint_is_recorded_before_the_first_routing_output(val_run
     for name in ("jev_rule_A", "jev_rule_B", "small_llm_rule_A", "small_llm_rule_B", "nli_rule_A", "nli_rule_B", "lr_a",
                  "intent_lr_code_rule_A", "intent_lr_code_rule_B"):  # fmt: skip
         rows, _, _ = predictions.read(name, "banking77", "val_routing", runs)
-        assert len(rows) == min(n, routing.N_SAMPLE), name
+        assert len(rows) == score.DRY_RUN_ROUTING_ROWS, name  # validation runs a 20-row smoke of each routing arm
+
+
+def test_validation_run_scores_routing_and_freezes_the_validity_checks(val_run):
+    results = json.loads((val_run["tmp"] / "runs" / "dryrun" / "results" / "results.json").read_text())
+    assert results["routing"]["n_rows"] == score.DRY_RUN_ROUTING_ROWS and results["routing"]["not_run"] == []
+    validity = json.loads((val_run["tmp"] / "validity.json").read_text())
+    assert set(validity["checks"]) == set(score.VALIDITY_KEYS) and validity["fingerprint"] == routing.rule_fingerprint()
+    assert (val_run["tmp"] / "runs" / "val" / stage1.DRY_RUN_OK).exists()
 
 
 def test_no_validation_label_reaches_a_predictor(val_run):
@@ -404,23 +420,44 @@ def test_without_the_paid_flag_paid_arms_wait(tmp_path):
 # --------------------------------------------------------------------------- the test stage
 
 
-def test_test_stage_refuses_without_the_freeze_token(tmp_path, capsys):
+def val_ready(val_run, tmp):
+    """A copy of the finished validation run, which the test stage requires."""
+    shutil.copytree(val_run["tmp"] / "runs", tmp / "runs")
+    return make_splits()  # same rows and text as the validation run, true labels
+
+
+def test_test_stage_refuses_without_the_freeze_token(val_run, tmp_path, capsys):
     made = []
-    rt, api, _ = build(tmp_path, make_splits(), load_test_text=stage1._test_text)
+    rt, api, _ = build(tmp_path, val_ready(val_run, tmp_path), load_test_text=stage1._test_text)
     real_make = rt.make_client
     rt.make_client = lambda **kw: made.append(1) or real_make(**kw)
     assert stage1.main(["--stage", "test"], runtime=rt) == EXIT_REFUSED
-    assert "refused" in capsys.readouterr().out
-    assert not (tmp_path / "runs").exists() and made == [] and api.calls == []
+    assert "firewall" in capsys.readouterr().out
+    assert not (tmp_path / "runs" / "stage1").exists() and made == [] and api.calls == []
 
 
-def test_test_stage_refuses_a_wrong_token_before_downloading(tmp_path):
+def test_test_stage_refuses_a_wrong_token_before_downloading(val_run, tmp_path):
+    splits = val_ready(val_run, tmp_path)
     repo = make_repo(tmp_path)
     downloader = FakeDownloader(tmp_path)
     load = lambda d: firewall._load_test(d, "0" * 64, repo_dir=repo, downloader=downloader)[0]  # noqa: E731
-    rt, api, _ = build(tmp_path, make_splits(), load_test_text=load)
+    rt, api, _ = build(tmp_path, splits, load_test_text=load)
     assert stage1.main(["--stage", "test"], runtime=rt) == EXIT_REFUSED
-    assert downloader.calls == [] and api.calls == [] and not (tmp_path / "runs").exists()
+    assert downloader.calls == [] and api.calls == [] and not (tmp_path / "runs" / "stage1").exists()
+
+
+def test_test_stage_refuses_until_the_validation_run_passed(val_run, tmp_path, capsys):
+    loads = []
+    splits = val_ready(val_run, tmp_path)
+    (tmp_path / "runs" / "val" / stage1.DRY_RUN_OK).unlink()
+    rt, api, _ = build(tmp_path, splits, load_test_text=lambda d: loads.append(d))
+    assert stage1.main(["--stage", "test"], runtime=rt) == EXIT_REFUSED
+    assert "dry run" in capsys.readouterr().out and loads == []
+    # The marker alone is not enough: every validation arm must be there too.
+    (tmp_path / "runs" / "val" / stage1.DRY_RUN_OK).write_text("{}")
+    predictions.paths("nli", "ag_news", "val", tmp_path / "runs")[0].unlink()
+    assert stage1.main(["--stage", "test"], runtime=rt) == EXIT_REFUSED
+    assert "nli__ag_news" in capsys.readouterr().out and loads == []
 
 
 class Poison:
@@ -459,14 +496,15 @@ def make_test_frames(splits):
 
 
 @pytest.fixture(scope="module")
-def test_run(tmp_path_factory):
+def test_run(tmp_path_factory, val_run):
     tmp = tmp_path_factory.mktemp("test")
-    splits = make_splits()
+    splits = val_ready(val_run, tmp)
     texts, gold, dup = make_test_frames(splits)
-    scored = []
+    scored, banks = [], []
 
     def score_test(root):
         # What score.py checks first: every arm present, in gold's row order. Gold appears only here.
+        assert (tmp / "deviations.md").read_text() == initial, "deviations.md changed before scoring"
         logged = predictions.read_not_run("stage1", root)
         for d in stage1.DATASETS:
             score.check_row_order(score.gold_names(gold[d], None), score.load_arms("stage1", d, root, logged))
@@ -474,8 +512,13 @@ def test_run(tmp_path_factory):
         return 0
 
     rt, api, watch = build(tmp, splits, load_test_text=lambda d: texts[d], score_test=score_test)
-    code = stage1.main(["--stage", "test"], runtime=rt)
-    return {"tmp": tmp, "code": code, "scored": scored, "splits": splits, "texts": texts, "dup": dup, "api": api, "watch": watch}
+    initial = (tmp / "deviations.md").read_text()
+    real_bank = data.bank
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(data, "bank", lambda *a, **k: banks.append(real_bank(*a, **k)) or banks[-1])
+        code = stage1.main(["--stage", "test"], runtime=rt)
+    return {"tmp": tmp, "code": code, "scored": scored, "splits": splits, "texts": texts, "dup": dup, "api": api, "watch": watch,
+            "banks": banks}  # fmt: skip
 
 
 def test_test_stage_runs_text_only_and_hands_over_to_the_scorer(test_run):
@@ -503,14 +546,174 @@ def test_test_stage_records_hashes_duplicates_and_writes_probes_where_the_scorer
     assert (test_run["tmp"] / "runs" / "latency" / "probes.jsonl").exists()
 
 
+def sent_text(body):
+    """The row text a request carries: Jev's state, the chat message, or the routing message's first line."""
+    if "messages" in body:
+        text = body["messages"][1]["content"].split("\n\nOptions:")[0].removeprefix("Text: ")
+    else:
+        state = body["state"]
+        text = state["text"] if isinstance(state, dict) else state
+    return text.split("\n")[0].removeprefix("Message: ") if text.startswith("Message: ") else text
+
+
 def test_test_stage_predictors_see_only_test_text(test_run):
     texts = set(test_run["texts"]["banking77"]["text"]) | set(test_run["texts"]["ag_news"]["text"])
-    sent = set()
-    for _, body in test_run["api"].calls:
-        if "messages" in body:
-            continue
-        state = body["state"]
-        sent.add(state["text"] if isinstance(state, dict) else state)
     probe = set(test_run["splits"]["banking77"].val["text"][: stage1.PROBE_ROWS])
-    routed = {t for t in sent if t.startswith("Message: ")}
-    assert sent - routed <= texts | probe  # arm rows are test text; probes use validation text
+    kinds = {test_run["api"].kind(body) for _, body in test_run["api"].calls}
+    assert {"llm", "jev routing", "jev examples", "jev banking77", "jev ag_news"} <= kinds
+    assert {sent_text(body) for _, body in test_run["api"].calls} <= texts | probe  # probes use validation text
+    routed = [sent_text(b) for _, b in test_run["api"].calls if test_run["api"].kind(b) == "jev routing"]
+    assert set(routed) <= texts and len(set(routed)) == min(routing.N_SAMPLE, len(test_run["texts"]["banking77"]))
+
+
+def test_no_bank_holds_test_text(test_run):
+    norms = {data.normalize(t) for d in stage1.DATASETS for t in test_run["texts"][d]["text"]}
+    sizes = {len(b) for b in test_run["banks"]}
+    assert len(test_run["banks"]) > 100 and sizes  # every family bank, LR-A's s=35 and Intent LR's s=8 among them
+    assert all(not (set(b["norm"]) & norms) for b in test_run["banks"])
+
+
+def test_test_stage_leaves_deviations_alone_when_the_scorer_refuses(test_run, tmp_path):
+    rt, _, _ = build(tmp_path, test_run["splits"], load_test_text=lambda d: test_run["texts"][d], score_test=lambda root: 1)
+    runner = Stage1(rt, "test")
+    runner.unaccounted = lambda: []
+    before = (tmp_path / "deviations.md").read_text()
+    assert runner.finish() == 1
+    assert (tmp_path / "deviations.md").read_text() == before
+    assert not (tmp_path / "runs" / "stage1" / "deviations_written.json").exists()
+
+
+# --------------------------------------------------------------------------- stops in the paid part
+
+
+class Twisted(FakeApi):
+    """Answers one kind of request (by shape) with `reply(body)` instead, once the probes are done."""
+
+    def __init__(self, kind, reply):
+        super().__init__()
+        self.twist_kind, self.reply = kind, reply
+
+    def send(self, method, url, content=None):
+        if method == "POST":
+            body = json.loads(content)
+            if self.kind(body) == self.twist_kind:
+                with self.lock:
+                    self.calls.append((url, body))
+                answer = self.reply(body)
+                if answer is not None:
+                    return answer
+        return super().send(method, url, content)
+
+
+def logged_not_run(runs):
+    return {**predictions.read_not_run("val", runs), **predictions.read_not_run("val_routing", runs)}
+
+
+def test_a_rejected_key_halts_and_resumes_without_using_up_the_run(tmp_path):
+    api = Twisted("jev ag_news", lambda body: TransportResponse(401, {}, b'{"error":{"message":"No auth credentials found"}}'))
+    runner, api = paid_only(tmp_path, make_splits(), api=api)
+    with pytest.raises(PaidHalt, match="key was rejected or credits ran out"):
+        runner.run_paid()
+    runs = tmp_path / "runs"
+    assert logged_not_run(runs) == {}  # nothing is given up on a key problem
+    assert predictions.paths("jev", "banking77", "val", runs)[0].exists()
+    api.reply = lambda body: None  # the key is fixed
+    runner.run_paid()
+    assert logged_not_run(runs) == {}
+    assert all(runner.paid_done(a) for a in stage1.paid_plan()) and max(api.ok.values()) == 1
+
+
+def test_failures_above_one_percent_pause_after_saving_the_arm(tmp_path):
+    bad = {}
+
+    def malformed(body):
+        text = body["state"]
+        if text not in bad and len(bad) < 1:
+            bad[text] = True
+        return jev_ok(body, choice="not an option") if text in bad else None
+
+    api = Twisted("jev ag_news", malformed)
+    runner, api = paid_only(tmp_path, make_splits(), api=api)
+    with pytest.raises(PaidHalt, match="PAUSE: jev__ag_news has 1 failed rows of 20, above 1%"):
+        runner.run_paid()
+    runs = tmp_path / "runs"
+    rows, _, _ = predictions.read("jev", "ag_news", "val", runs)
+    assert rows["failed"].sum() == 1
+    assert not predictions.paths("jev_examples", "banking77", "val", runs)[0].exists()
+    runner.run_paid()  # a rerun continues with the next arm; the paused arm is not redone
+    assert all(runner.paid_done(a) for a in stage1.paid_plan()) and logged_not_run(runs) == {}
+
+
+def test_a_changed_model_pauses_without_marking_anything_not_run(tmp_path):
+    api = Twisted("jev ag_news", lambda body: jev_ok(body, model="typesafe/jev-1.14-20991231"))
+    runner, api = paid_only(tmp_path, make_splits(), api=api)
+    with pytest.raises(PaidHalt, match="PAUSE: jev__ag_news: the model changed mid-run"):
+        runner.run_paid()
+    runs = tmp_path / "runs"
+    assert not predictions.paths("jev", "ag_news", "val", runs)[0].exists() and logged_not_run(runs) == {}
+
+
+def test_a_rule_change_stops_spending_on_routing_arms(tmp_path, monkeypatch):
+    runner, api = paid_only(tmp_path, make_splits())
+    path = tmp_path / "runs" / "val_routing" / "fingerprint.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"fingerprint": "0" * 64, "first_arm": "jev_rule_A"}))
+    runner.run_paid()
+    logged = predictions.read_not_run("val_routing", tmp_path / "runs")
+    assert set(logged) == {(a.name, "banking77") for a in stage1.paid_plan() if a.routing}
+    assert "jev routing" not in {api.kind(b) for _, b in api.calls}
+    assert (path.parent / score.FINGERPRINT_CHANGES).exists()
+
+
+def test_rows_to_send_counts_outage_rows_with_a_pass_left(tmp_path):
+    path = tmp_path / "runs" / "private" / "r.jsonl"
+    path.parent.mkdir(parents=True)
+    lines = [{"row_id": "a", "status": "done", "failed": False}, {"row_id": "b", "status": "failed", "failed": True, "reason": "http_503"},
+             {"row_id": "c", "status": "failed", "failed": True, "reason": "malformed"},
+             {"row_id": "d", "status": "failed", "failed": True, "reason": "network"}, {"row_id": "d", "status": "failed", "failed": True, "reason": "network"}]
+    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    assert stage1.rows_to_send(path, ["a", "b", "c", "d", "e"]) == ["b", "e"]
+
+
+def test_giving_up_skips_pending_probes_and_logs_every_unfinished_paid_arm(tmp_path):
+    runner, api = paid_only(tmp_path, make_splits())
+    runner.give_up_reason = "credits gone"
+    runner.run_paid()
+    assert api.calls == [] and set(logged_not_run(tmp_path / "runs")) == {(a.name, a.dataset) for a in stage1.paid_plan()}
+    assert all(json.loads(runner.probe_marker(p).read_text())["result"] is None for p in ("jev", "small_llm", "network"))
+
+
+# --------------------------------------------------------------------------- free arms: --max-hours stop and resume
+
+
+def test_free_arms_stop_on_max_hours_and_resume_without_redoing_saved_work(tmp_path):
+    splits = make_splits()
+    pairs = []
+    scorer = fake_scorer(pairs)
+    runner, _ = paid_only(tmp_path, splits, make_nli_scorer=lambda key: scorer)
+    done_marker = predictions.paths("embed_sim", "banking77", "val", tmp_path / "runs")[0]
+    runner.rt.clock = lambda: 1e9 if done_marker.exists() else 0.0  # the limit passes once embed_sim is saved
+    runner.max_hours = 1.0
+    with redirect_stdout(io.StringIO()) as out:
+        assert runner.run_free() is False
+    assert "max-hours" in out.getvalue()
+    nli_pairs = sum(pairs)
+    assert nli_pairs > 0 and not predictions.paths("lr_d0_s1", "banking77", "val", tmp_path / "runs")[0].exists()
+    runner.rt.clock = lambda: 0.0
+    assert runner.run_free() is True
+    assert sum(pairs) - nli_pairs == stage1.PROBE_ROWS * 77  # only the local NLI latency probe: no NLI row is redone
+    paid = {(a.name, "routing" if a.routing else a.dataset) for a in stage1.paid_plan()}
+    assert set(runner.unaccounted()) == paid  # every free arm is done, routing's included; only the paid ones wait
+
+
+def test_giving_up_sets_aside_a_partial_routing_file_and_logs_it(tmp_path):
+    runner, _ = paid_only(tmp_path, make_splits())
+    rows = runner.routing_rows().head(5)
+    frame = pd.DataFrame({"row_id": rows["row_id"], "pred": "amber", "top_prob": 0.5, "failed": False, "latency_s": 0.1})
+    public = predictions.write("nli_rule_A", "banking77", frame, "val_routing", root=runner.root)
+    assert ("nli_rule_A", "routing") in runner.unaccounted()
+    runner.give_up_reason = "out of time"
+    runner.give_up([("nli_rule_A", "routing")])
+    assert not public.exists() and public.with_name(public.name + ".partial").exists()
+    assert "out of time" in predictions.read_not_run("val_routing", runner.root)[("nli_rule_A", "banking77")]
+    assert ("nli_rule_A", "routing") not in runner.unaccounted()
