@@ -25,7 +25,7 @@ At equal coverage, how many labels per class does a light classifier need to bea
 
 Both sequences use the same 2-point margin, so neither side has an easier path to a claim. Each is a fixed-sequence procedure with family-wise one-sided error at most 2.5%. A dip breaks the run, so a non-monotone result cannot produce a low crossover. Report any s below s* that passed in isolation, labelled as not a claim. For each s, also report the range across draws and how many of the 10 beat Jev.
 
-**Secondary.** Risk-coverage curve. s* and s_J at 50, 70, 90 and 100% coverage; if the verdict row changes at 70 or 90, the headline says so. Realised coverage when each arm's threshold is the 80% quantile of its unlabelled validation scores. ECE with noise floor (15 equal-width bins closed on the right, with 0 in the first bin; the floor is the mean ECE over 1,000 outcome sets drawn as Bernoulli(confidence), seed 2026; a failed row counts as gold probability 0 in NLL and as all-zero probabilities in Brier, and is left out of ECE, with the number left out reported), NLL (clip all probabilities to [0.005, 1], since Jev rounds to 2 decimals and returns 0.0), Brier, cost and latency (no headline speed ratio). Chart labels "all" with real counts (129.9 per class on average on Banking77, imbalanced; 119,852 total on AG News, about 29,960 per class) and has a total-labels axis.
+**Secondary.** Risk-coverage curve. s* and s_J at 50, 70, 90 and 100% coverage; if the Banking77 verdict row changes at 70 or 90, the headline says so, and AG News s* and s_J at those coverages are reported as a table with no headline effect. Realised coverage uses each arm's threshold at the 20th percentile of its unlabelled validation scores (keeping the top 80%). Realised coverage when each arm's threshold is the 80% quantile of its unlabelled validation scores. ECE with noise floor (15 equal-width bins closed on the right, with 0 in the first bin; the floor is the mean ECE over 1,000 outcome sets drawn as Bernoulli(confidence), seed 2026; a failed row counts as gold probability 0 in NLL and as all-zero probabilities in Brier, and is left out of ECE, with the number left out reported), NLL (clip all probabilities to [0.005, 1], since Jev rounds to 2 decimals and returns 0.0), Brier, cost and latency (no headline speed ratio). Chart labels "all" with real counts (129.9 per class on average on Banking77, imbalanced; 119,852 total on AG News, about 29,960 per class) and has a total-labels axis.
 
 ## Data
 - **Primary, sets the verdict:** Banking77 official test, 3,080 rows. `PolyAI/banking77` at `1846984189f2bc0ac51c6fc3a600fa9e1714e0c6`.
@@ -97,11 +97,13 @@ Arms: Jev; small LLM; NLI with state in the premise and rule conditions in the h
 
 Metric: accuracy on all 800 rows under rule A and under rule B. acc@80 is secondary. Margin 5 points. Bootstrap as above, 95% CI. The share of rows where rule A and rule B agree is published as the floor: LR-A scoring near it is by construction, not a finding.
 
-Claims:
+Claims ("Not unique to Jev" is computed under rule B and reported next to the result of the first claim; "Otherwise" means neither claim holds; the bootstrap resamples within the gold queue of the rule compared):
 - "Jev follows a changed rule from text with no labels" only if Jev minus Intent LR + code has lower limit above -5 under rule B and Jev's accuracy falls by 5 points or less from rule A to rule B.
 - "Not unique to Jev" if small LLM or NLI minus Jev has lower limit above -5.
 - Otherwise: "no new capability shown here".
 - Say that an engineer can also get a rule change by editing code, at the cost of intent labels.
+
+Validation draw results, recorded before the freeze: rule agreement 49.6%; state-blind best guess 44.3% and 44.8%; text-blind best guess 68.5% and 69.1% in sample (about 63% cross-fitted); LR-A rule-A floor PASS. About 55% of rows are routed by state alone, so this test mostly measures whether an arm follows a text rule over categorical state, with topic understanding tested on under half the rows; Intent LR + code has a small edge on Banking77's confusable intents. The post says both. Queue names are neutral colours, so no arm can route from a name's meaning (compare Sun et al. 2026, arXiv 2609.26758, on decision models following option names).
 
 Scope: rules avoid numbers, dates and double negatives, so the result says nothing about rules that need them. Say why in the post.
 
@@ -150,6 +152,9 @@ Computer time estimated at 3-7 hours (267,560 NLI pairs, plus routing). Time 5,0
 - Personal account, no employer data, and the author's employer is not discussed. Disclose AI help. Aarmen must be able to explain every line.
 - Aarmen's yes needed for: each paid stage, OSF registration, public repo, each post and reply.
 - Public text follows the author's writing rules.
+
+## Stage 0 result (2026-11-05)
+PASS, validation only. Jev 1.14 build jev-1.14-20261014: 0 failures on 756 Banking77 and 800 AG News rows; confidence 1.0 on 41.1% and 67.1%; 98.0% label agreement over 3 calls on 100 rows. Small LLM selected: mistralai/mistral-nemo on DekaLLM (49 of 50 usable, about 10 output tokens, no reasoning). Usage posts in about 24 s; reconcile grace 120 s. Stage 0 spend US$0.146; projected Stage 1 US$1.60 with fee. Full detail in stage0_report.md and frozen.yaml.
 
 ## Needed from Aarmen
 The OpenRouter key is in the macOS Keychain under service `jev-benchmark-openrouter`, entered by Aarmen. Claude never sees or prints the value; code reads it at run time. An OSF account, created by him, before the freeze. The original post's article is useful background for the post but doesn't block the freeze.
