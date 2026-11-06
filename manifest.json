@@ -1,0 +1,269 @@
+{
+  "files": {
+    ".gitignore": "603bd62877a30694cc30e269a7b29a85cf6ba433a6161a0e64a0de46793d9615",
+    ".python-version": "7b55f8e67b5623c4bef3fa691288da9437d79d3aba156de48d481db32ac7d16d",
+    "DESIGN.md": "243174969e9ca506ca0345cc01578e5eed789d9f13586e17917addd48b339c16",
+    "PLAN.md": "af6fcd255fb715435fb2b53aff4dd8eab0194ace116327e9a9f45bc4cd41eb04",
+    "VALIDATION.md": "430fa228a2e221bc391646bdff5d37644c2b1b1d9c2a1b1035187095f41bf710",
+    "deviations.md": "5a4ad02c9d866486fe865a5d65035d712c8348a0a0c3e5ad9f3593c4116b3103",
+    "prompts/jev_examples_state.v1.json": "6aebaaa44857d79f73d9a71449c3404f95db324a5d7128a415743a799141b88d",
+    "prompts/jev_instructions.v1.json": "eb3cf58272e6a6fc395deb8cafe7d85735e79edebce890846d826e535d6a91f9",
+    "prompts/small_llm.v1.json": "b10ff2ac623d532c92a584178a72923deb98985aefe4ae2f4fd9ca9c2d766128",
+    "pyproject.toml": "315c6845ee4a3322f97c441b7e2107cea88ca3afd0f86108de4dc34318be0b6c",
+    "registration.md": "dcb9c8bdec26fcbbd44953d3b1f9f52bb9c2a1aac6c7a208350494e71b306259",
+    "routing/arm_text.md": "b309421e385dbcae7223627287e20e86699a34df890fb0bd30f648293deb7f62",
+    "routing/families.yaml": "0070914a159fcbb2bb8c45f91b055704f92f48c6baf2a5e0b117f9b20f6fdeb0",
+    "routing/rules.py": "8194ef990fc67d92df4e0554bb1577ff3853210161d41ce207beba96873afe5b",
+    "routing/tuning_log.md": "05bc12b0621e8ea11a161dc67ee5efd9d077e490fc621417f064a8af3d74540e",
+    "routing/validity.json": "245b41ea1491c73090454a6b87fea3f8bdf5073786158d90afd432e6c9ad78a4",
+    "scripts/check_key.sh": "378c18278a2b1ec6ecc782a99be146b60f4370582f5b0e2fededabc4acb2fd6e",
+    "scripts/freeze.sh": "76a3f0fa9406564635dc8a4195cff0f18c95fdef7b43946ed8a6cf78ab7616eb",
+    "scripts/predict_local.sh": "dd09510c22b72a383fe980ce8d0d5667e2db522132c0a480578a0b8758ee656a",
+    "scripts/set_key.command": "d51bf2b59aef79f044a44e862c8b39d7a5e207668f4effa76694fce503d3c92a",
+    "scripts/stage0.sh": "2e0d47e2ac9d69f09cfc5422c2b4c44fdfa2828ca5fb591779137f21a60731dc",
+    "scripts/stage1.sh": "cd7b35a570d057a5d5e27cd3ecc898128527f083000000c0a689a25df85d0d77",
+    "src/arms_local.py": "5b4ab88c37694ad2e7a8948f1eff5f513220d336293c3d3134596f7948a9cfe9",
+    "src/data.py": "d2abc31d02e7e570cea4aaac31cd454567101561fb9ab9aca88540269a6a2399",
+    "src/firewall.py": "decbc1b9e1c09f9e22cee84340af276e366dc4623204593dfbad743b07f69f8b",
+    "src/freeze.py": "5e05c31a6a507f955223a8eeead450406a7a28610715f8d70b2f4d0b10fe24ea",
+    "src/guards.py": "de9fb0b2dfe88999bab177483cca16a6eec9ec2eaa109ea5e4d01cd36f60f5b2",
+    "src/jev_client.py": "a8aef99e16bc9bbd0c70fdf077b4b33481fdf0db241787f17cda16c2de109a31",
+    "src/labels.py": "f56c059b8f0b5487853815958e2f80f7ec4751af00ebc33020bb472c2da6b422",
+    "src/latency_probe.py": "d9ca8e58835e0ed880190cdbb3601ee86deeae71c72d2a2824f1de45ca6853e7",
+    "src/ledger.py": "d76df5dc7928c01210e4588eed2e5ad1d42397247c828a5471f1fae868221649",
+    "src/llm_client.py": "17b1e920cffdd376376c802f747c6b61407fdfd3d8d0809a5e13d12d89a918ee",
+    "src/metrics.py": "ab35614d94a2a7bd0ffb9bb018141f73e7711a9f5b86d4789e6193e65f4b5c16",
+    "src/openrouter.py": "b47e0b5683b79294a029605550dfac45ee3f7915e66095fea1f1ba17e55e72dd",
+    "src/predict_local.py": "262e621b8eecc92ff6577a01a3545b9675034963ae4f1269cc5565f3f6530e23",
+    "src/predictions.py": "60a931638eef1efc376e36f384a531b61fb4beb0047773bb802fe04633d413c8",
+    "src/prompts.py": "2946c202ee2d23c35b731de54127725d37e18e36d969a73ad14e9557adb8afe6",
+    "src/report.py": "9a7c22593d8457cca7d99ffb90f2fc1916556af75965966eff017e2f404752c3",
+    "src/retrieval.py": "cf3aee8fafb5d37acdad68e5592b01dbe5543bb9026c921ff0ea998b3a5bc1e4",
+    "src/routing.py": "cdee2de94721b50a9fa8fb4ada5e7e4d577f3613b2ff4fd4690707ade639b3e3",
+    "src/score.py": "54be1b40deb31d86a75bdba796afa0ce54c6b0a20afc6e1ef878a0751d22ac65",
+    "src/secrets_mac.py": "a7d6a77c90bbd9a016d8a7700f90a3ba2c0627f108eacc43c946f7b49df3252b",
+    "src/stage0.py": "971ffedb0661786a40732df36d7e4f1e6a39d8cca2024eca064e3a172db8560e",
+    "src/stage0_fields.py": "3610554dfcda2558bfc36a6c757b066ca945a1582caa3e54254f055c15a2e641",
+    "src/stage1.py": "ae8863b1af625e402754c3f4fc1c0b238ea933adcf2ffcea68fdbbd5fa580746",
+    "src/verdict.py": "51606a7ea9a7267a14a0266e129b6db780ce8540e838103a36e42a77a539d11b",
+    "stage0/frozen.yaml": "e8ca2479916841cfc8cf27caec97be6cfcc49a7f748f3850002e35d17f71e78c",
+    "stage0/stage0_report.md": "9be7bdbe8fbdcb92cdf23fc4cc08cc6fef4c44a1dbb92d71248312e892198523",
+    "tests/conftest.py": "b620b0dc751a6d51e2ce10c0e46efb22bda146c5b3734aa937a9555393562b13",
+    "tests/fake_runs.py": "c2d68bf219de9d925265a10186fc9743ea1e9a371f19bb8d7ac0e8704ad199b6",
+    "tests/fixtures/chat_logprobs_request.json": "111cc1f5062fb69b9773dd52c239bb033a749f07d45ea3ab616cc96a5e61d61a",
+    "tests/fixtures/chat_logprobs_response.json": "88788589ab2f06449fdfb3596fec2feb274a4e808d9e6a1403c2a929b163ae17",
+    "tests/fixtures/decisions_choice_request.json": "3d0b477351baf75940c117500ec45117c52c26db75038eb1eb79e2ddde65e43b",
+    "tests/fixtures/decisions_choice_response.json": "8234a2c4b24da04485c3eb3f6b1640abb5fa2429951325d9aa23621fcb6ca4a5",
+    "tests/fixtures/decisions_refusal_response.json": "5743fa6b069877673308a76848d480cb04498a7cfca0abe991e76f08bd42d882",
+    "tests/fixtures/error_402.json": "7d5ea1227dbff97c9ee448f2386e739da42c5a1f77c0ed8c4ba587ec6f2e921b",
+    "tests/fixtures/error_402_in_flight.json": "eaa968f51fcb30bd9d5809c558aa8614f3d57bda58815b5333e9200bc5ad907d",
+    "tests/fixtures/key_response.json": "29bdf14d3f6369e6ce454ed5b447a5ef8133d60f526ce988fd1440dc1a49331f",
+    "tests/fixtures/sources.json": "c42a1da07ada98ba2fc0627290e46b7d3cc99c88bf8f97fb71617c7d9176260d",
+    "tests/test_arms_local.py": "57a61663f10508ce33ecc4e003a4d6ea7f4e46c7046250ab0f93871fb4fc1128",
+    "tests/test_clients.py": "24a1f3847a2994a5a9d40a8070328a84eac03cd4f78f365b1b8170db0a962cef",
+    "tests/test_data.py": "2328fe13788fed11b139c513905c82fbf12b2b16f3e41f6d5cef69a4c8f8f35e",
+    "tests/test_firewall.py": "006d0807f2e4f32213f5a3627041f25f721b40ecd910d35584675bb35048f685",
+    "tests/test_freeze.py": "ac9952205ab59d1e9934ee1c2886d920f06bd7c8b9fe4ab1f162b9490f00e0a0",
+    "tests/test_harness.py": "a2917a1c3504408525dcd25c19139f2daea62eec4ff8a315c4328fc59332ee88",
+    "tests/test_latency.py": "b7cb88b05d969c7a81ad9b99d8a17cd3013e9e244954cc1653e6e1b398dddf2d",
+    "tests/test_metrics.py": "e777620e6e8436f222df9cce04820ba0138c0bba8f963278eb1bf4d40bacba18",
+    "tests/test_repo_hygiene.py": "8fc7250cb97f4bd80fde6a7fe2a3ea66d33c0f2e58d67f78b920b5449e9208fd",
+    "tests/test_routing.py": "9490ce89ce684ac499b3b7120a0c903efc09700a4a2a9a831d378a412ae28fc3",
+    "tests/test_score.py": "3d95b9ffa3e7589ddb23da0ca1bace21d9ad927ce5970cd00d4340d6c212055e",
+    "tests/test_stage0.py": "08a26f08cfad647acbfce708c64d4c1e7f7fefb060a59cbfdf4c4dbc6f9357c6",
+    "tests/test_stage1.py": "07ab6f5ec81c0406d44ac1f6c3751ccd043b08cf7b046f37d6801c8fb7667b85",
+    "tests/test_verdict.py": "2967a6b1bc6ade338b80a11926068e3104bc70906805e352eb1ccf9af9946a9f",
+    "third_party/NOTICE.md": "63590007a872629a350c105162149a3bc9a6d7c7a300799c41fb6774e945018a",
+    "third_party/ag_news/agnews.yaml": "606f4588c8a6298fd75b31ee0cb27f96aded71b3b7d8b387eff23412600dc71e",
+    "third_party/banking77/banking77_intents.v1.json": "e5c7dedcdd70093502f091cb0e615789e1ab57b7953a0b0e544517494df2ceb1",
+    "uv.lock": "ccf953b9d470cf035153b49bb3c9e10b15b38c37678cea27a2e64e749bfb6f6a"
+  },
+  "freeze_tag": "freeze-v1",
+  "hash_note": "The freeze token is SHA-256 of this file's bytes at tag freeze-v1. seeds, thresholds and models are recorded values, not hashes; the files that hold them are hashed under files.",
+  "models": {
+    "datasets": {
+      "ag_news": {
+        "repo_id": "fancyzhx/ag_news",
+        "revision": "eb185aade064a813bc0b7f42de02595523103ca4"
+      },
+      "banking77": {
+        "repo_id": "PolyAI/banking77",
+        "revision": "1846984189f2bc0ac51c6fc3a600fa9e1714e0c6"
+      }
+    },
+    "embedder": {
+      "model": "BAAI/bge-small-en-v1.5",
+      "revision": "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
+    },
+    "jev": {
+      "build": "jev-1.14-20261014",
+      "model": "typesafe/jev-1.14",
+      "provider": "TypeSafe"
+    },
+    "nli": {
+      "base": {
+        "model": "MoritzLaurer/deberta-v3-base-zeroshot-v2.0-c",
+        "revision": "bddf8c5411c34ac3565e16e04384fd68b2618dda"
+      },
+      "large": {
+        "model": "MoritzLaurer/deberta-v3-large-zeroshot-v2.0-c",
+        "revision": "b2730f16019076bb0009481121efbe4705e0e378"
+      }
+    },
+    "small_llm": {
+      "model": "mistralai/mistral-nemo",
+      "price_per_million_tokens_usd": {
+        "as_of": "2026-11-05",
+        "input": 0.018,
+        "output": 0.03
+      },
+      "provider": "DekaLLM",
+      "provider_options": {
+        "allow_fallbacks": false,
+        "only": [
+          "DekaLLM"
+        ],
+        "require_parameters": true
+      },
+      "reasoning_field_sent": false,
+      "reply_model_suffix_pattern": "(?:-\\d{8})?",
+      "status": "selected"
+    },
+    "test_files": {
+      "PolyAI/banking77": {
+        "filename": "data/test-00000-of-00001.parquet",
+        "revision": "1846984189f2bc0ac51c6fc3a600fa9e1714e0c6"
+      },
+      "fancyzhx/ag_news": {
+        "filename": "data/test-00000-of-00001.parquet",
+        "revision": "eb185aade064a813bc0b7f42de02595523103ca4"
+      }
+    }
+  },
+  "repo_url": "https://github.com/aarmens702-hub/jev-benchmark",
+  "routing_rule_fingerprint": "61a4813bc3bac76e997cb791d59d28d0aff8ebfc35cacac417a668170a906fb3",
+  "schema": "jev-benchmark-manifest/2",
+  "seeds": {
+    "bootstrap": 2026,
+    "dry_run_gold_permutation": 2026,
+    "lr": 0,
+    "lr_cv_folds": 0,
+    "option_order": 1105,
+    "routing_bootstrap": 2026,
+    "routing_sample_prefix": "20261105:routing:",
+    "split": 20261105
+  },
+  "thresholds": {
+    "ag_news_ceiling_at": 96,
+    "bm25_b": 0.75,
+    "bm25_k1": 1.5,
+    "bootstrap_replicates": 10000,
+    "claim_ci_level": 98.33,
+    "claim_match_limit": -2,
+    "coverage": 0.8,
+    "draws": 10,
+    "ece_bins": 15,
+    "embed_sensitivity_temperatures": [
+      0.01,
+      0.2
+    ],
+    "embed_temperature": 0.05,
+    "examples_ci_level": 95.0,
+    "examples_limit": -2,
+    "failure_flag_at": {
+      "ag_news": 76,
+      "banking77": 31
+    },
+    "grid": [
+      1,
+      2,
+      3,
+      5,
+      8,
+      16,
+      35,
+      "all"
+    ],
+    "hard_cap_usd": 7.15,
+    "headline_coverages": [
+      0.7,
+      0.9
+    ],
+    "jev_sequence": [
+      1,
+      2,
+      3,
+      5,
+      8,
+      16,
+      35,
+      "all"
+    ],
+    "lr_c": 100,
+    "lr_cv_grid": [
+      1,
+      10,
+      100,
+      1000
+    ],
+    "lr_cv_max_folds": 5,
+    "lr_max_iter": 5000,
+    "lr_sequence": [
+      "all",
+      35,
+      16,
+      8,
+      5,
+      3,
+      2,
+      1
+    ],
+    "margin_points": 2,
+    "max_request_bytes": 30000,
+    "nli_bare_template": "This text is about {}.",
+    "nli_batch_size": 16,
+    "nli_limit_hours": 12.0,
+    "nli_max_len": 256,
+    "nll_floor": 0.005,
+    "realised_coverage_keep": 0.8,
+    "retrieval_max_per_class": 4,
+    "retrieval_max_total": 24,
+    "routing_agreement_range": [
+      40,
+      60
+    ],
+    "routing_blind_limit": 70,
+    "routing_ci_level": 95.0,
+    "routing_draw": 0,
+    "routing_intent_lr_s": 8,
+    "routing_lr_a_floor": 70,
+    "routing_lr_a_s": 35,
+    "routing_margin_points": 5,
+    "routing_n_sample": 800,
+    "secondary_coverages": [
+      0.5,
+      0.7,
+      0.9,
+      1.0
+    ],
+    "small_llm_max_tokens": 16,
+    "small_llm_select_pass_of_50": 49,
+    "stage_caps_usd": {
+      "stage0": 0.5
+    }
+  },
+  "train_parquet": {
+    "ag_news": {
+      "filename": "data/train-00000-of-00001.parquet",
+      "repo_id": "fancyzhx/ag_news",
+      "revision": "eb185aade064a813bc0b7f42de02595523103ca4",
+      "sha256": "fc508d6d9868594e3da960a8cfeb63ab5a4746598b93428c224397080c1f52ee"
+    },
+    "banking77": {
+      "filename": "data/train-00000-of-00001.parquet",
+      "repo_id": "PolyAI/banking77",
+      "revision": "1846984189f2bc0ac51c6fc3a600fa9e1714e0c6",
+      "sha256": "8dc89b87a188509c42cce5a086e8f7c1ff4a225bdd9ae3f23e6cdfa5806e363a"
+    }
+  }
+}
