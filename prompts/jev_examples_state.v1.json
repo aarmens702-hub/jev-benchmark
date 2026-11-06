@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "note": "State sent to Jev when labelled examples are given. Without examples the state is the bare text.",
+  "state_keys": ["text", "labelled_examples"],
+  "example_keys": ["text", "label"]
+}
