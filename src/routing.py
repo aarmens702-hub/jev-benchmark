@@ -38,7 +38,9 @@ from metrics import acc_at, bootstrap_contrasts
 
 REPO = Path(__file__).resolve().parents[1]
 ROUTING_DIR = REPO / "routing"
-FROZEN_FILES = ("rules.py", "families.yaml", "arm_text.md")
+# Files the fingerprint hashes from disk (relative to the repo root): the rule code, the family map, and the
+# request builders for the text-rule arms. The arm text itself is hashed live from render_arm_text().
+FROZEN_FILES = ("routing/rules.py", "routing/families.yaml", "src/jev_client.py", "src/llm_client.py")
 
 
 def _load_rules():
@@ -269,11 +271,21 @@ def invalid_reasons(checks: Mapping[str, bool], rules_changed: bool) -> list[str
 
 
 def rule_fingerprint(root: Path = REPO) -> str:
-    """SHA-256 over the rule code, the family map and the arm text. Record it with the first arm output on the 800."""
+    """SHA-256 over the live arm text, the instructions, the rule code, the family map and the request builders.
+
+    The arm text is `render_arm_text()` itself, not routing/arm_text.md on disk. Record it with the first arm
+    output on the 800.
+    """
     h = hashlib.sha256()
-    for name in FROZEN_FILES:
-        content = (Path(root) / "routing" / name).read_bytes()
+
+    def add(name: str, content: bytes) -> None:
         h.update(name.encode() + b"\0" + hashlib.sha256(content).digest())
+
+    add("render_arm_text", render_arm_text().encode())
+    add("instructions", INSTRUCTIONS.encode())
+    add("llm_instructions", LLM_INSTRUCTIONS.encode())
+    for name in FROZEN_FILES:
+        add(name, (Path(root) / name).read_bytes())
     return h.hexdigest()
 
 
@@ -554,7 +566,6 @@ def routing_result(
     out["vs_jev_B"] = {name: vs_jev.get(name, NOT_RUN) for name in ("small LLM", "NLI")}
     not_unique = any(c["lower"] > -MARGIN for c in vs_jev.values())
     out["follows"], out["not_unique"] = follows, not_unique
-
     if out["invalid"]:
         out["status"] = "invalid"
         return out
@@ -562,7 +573,12 @@ def routing_result(
     if follows:
         out["claims"].append(CLAIM_FOLLOWS)
     if not_unique:
-        out["claims"].append(CLAIM_NOT_UNIQUE)
+        # Never reported alone: the first claim's result, with numbers, is part of the claim text.
+        out["claims"].append(
+            f"{CLAIM_NOT_UNIQUE} ({CLAIM_FOLLOWS}: {'shown' if follows else 'not shown'}; Jev minus Intent LR + code "
+            f"under rule B {out['jev_vs_code_B']['estimate']:.1f} points, lower limit {out['jev_vs_code_B']['lower']:.1f}; "
+            f"Jev falls {out['jev_drop']:.1f} points from rule A to rule B)"
+        )
     if not out["claims"]:
         out["claims"].append(CLAIM_NONE)
     return out

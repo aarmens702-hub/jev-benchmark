@@ -153,8 +153,7 @@ def test_rule_text_has_no_numbers_dates_or_double_negatives():
     for text in texts:
         assert not re.search(r"\d", text), text
         assert not DATES.search(text), text
-        # "twice" in "a payment charged twice" names a topic, not a condition on a count.
-        assert not NUMBER_WORDS.search(text.replace("a payment charged twice", "")), text
+        assert not NUMBER_WORDS.search(text), text
         assert not NEGATIONS.search(text), text  # no negation at all, so no double negative
     # The checks themselves catch what they are for.
     assert NEGATIONS.search("send here unless the tier is not premium")
@@ -180,21 +179,45 @@ def test_arm_text_file_matches_the_code():
     assert (REPO / "routing" / "arm_text.md").read_text() == routing.render_arm_text()
 
 
-def test_rule_fingerprint_covers_rules_families_and_arm_text(tmp_path):
-    for name in ("rules.py", "families.yaml", "arm_text.md"):
-        (tmp_path / "routing").mkdir(exist_ok=True)
-        (tmp_path / "routing" / name).write_bytes((REPO / "routing" / name).read_bytes())
-    before = routing.rule_fingerprint(tmp_path)
-    assert before == routing.rule_fingerprint(REPO)
-    for name in ("rules.py", "families.yaml", "arm_text.md"):
-        path = tmp_path / "routing" / name
+def _fingerprint_root(tmp_path):
+    for name in routing.FROZEN_FILES:
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_bytes((REPO / name).read_bytes())
+    return tmp_path
+
+
+def test_rule_fingerprint_covers_rules_families_builders_live_arm_text_and_instructions(tmp_path, monkeypatch):
+    root = _fingerprint_root(tmp_path)
+    before = routing.rule_fingerprint(root)
+    assert before == routing.rule_fingerprint(REPO) and re.fullmatch(r"[0-9a-f]{64}", before)
+    assert set(routing.FROZEN_FILES) == {"routing/rules.py", "routing/families.yaml", "src/jev_client.py", "src/llm_client.py"}
+    for name in routing.FROZEN_FILES:
+        path = root / name
         original = path.read_bytes()
         path.write_bytes(original + b"\n")
-        assert routing.rule_fingerprint(tmp_path) != before, name
+        assert routing.rule_fingerprint(root) != before, name
         path.write_bytes(original)
-    assert routing.rules_changed_since(before, tmp_path) is False
-    assert routing.rules_changed_since("0" * 64, tmp_path) is True
-    assert routing.rules_changed_since(None, tmp_path) is False  # no arm output recorded yet
+    assert routing.rule_fingerprint(root) == before
+    # The live arm text counts, not routing/arm_text.md on disk.
+    monkeypatch.setattr(routing, "render_arm_text", lambda: "changed")
+    assert routing.rule_fingerprint(root) != before
+    monkeypatch.undo()
+    monkeypatch.setattr(routing, "INSTRUCTIONS", routing.INSTRUCTIONS + " Extra.")
+    assert routing.rule_fingerprint(root) != before
+    monkeypatch.undo()
+    # Editing the file on disk does not matter on its own.
+    assert routing.rule_fingerprint(root) == before
+    assert not (root / "routing" / "arm_text.md").exists()
+    assert routing.rules_changed_since(before, root) is False
+    assert routing.rules_changed_since("0" * 64, root) is True
+    assert routing.rules_changed_since(None, root) is False  # no arm output recorded yet
+
+
+def test_families_wording_puts_cards_and_currencies_with_card_ordering_and_currency_exchange_with_payments():
+    fam = routing.load_families()
+    assert "which cards and currencies are supported" in fam["card_ordering"]["examples"]
+    assert "holding or exchanging currencies" in fam["payments"]["examples"]
+    assert "a duplicated payment" in fam["payments"]["examples"] and "twice" not in fam["payments"]["examples"]
 
 
 # ------------------------------------------------------------------ sample and state
@@ -369,12 +392,27 @@ def test_not_unique_when_small_llm_or_nli_is_within_5_of_jev_under_rule_b():
     n = 200
     good = arm(np.ones(n))
     out = result(all_arms(**{"small LLM": {"A": good, "B": good}}))
-    assert out["claims"] == [routing.CLAIM_FOLLOWS, routing.CLAIM_NOT_UNIQUE]
+    assert out["claims"][0] == routing.CLAIM_FOLLOWS and len(out["claims"]) == 2
     assert out["not_unique"] is True
+    assert out["claims"][1].startswith(f"{routing.CLAIM_NOT_UNIQUE} ({routing.CLAIM_FOLLOWS}: shown; Jev minus Intent LR + code")
+    assert "lower limit" in out["claims"][1] and "falls 0.0 points from rule A to rule B)" in out["claims"][1]
     bad = np.zeros(n)
     out = result(all_arms(NLI={"A": arm(bad), "B": arm(bad)}))
     assert out["claims"] == [routing.CLAIM_FOLLOWS] and out["not_unique"] is False
+    assert "not_unique_context" not in out
     assert out["vs_jev_B"]["NLI"]["lower"] <= -5 and out["vs_jev_B"]["small LLM"] == routing.NOT_RUN
+
+    # Not unique while Jev does not follow the rule: the first claim's result is reported as not shown.
+    weak = np.ones(n)
+    weak[:60] = 0
+    out = result(all_arms(Jev={"A": arm(weak), "B": arm(weak)}, **{"small LLM": {"A": arm(weak), "B": arm(weak)}}))
+    assert len(out["claims"]) == 1
+    assert out["claims"][0].startswith(f"{routing.CLAIM_NOT_UNIQUE} ({routing.CLAIM_FOLLOWS}: not shown; Jev minus")
+
+    # An invalid run makes no claim and carries no context either.
+    checks = dict.fromkeys(("agreement_in_40_60", "state_blind_at_most_70", "text_blind_at_most_70", "lr_a_at_least_70"), True)
+    out = result(all_arms(**{"small LLM": {"A": arm(weak), "B": arm(weak)}}), valid={**checks, "agreement_in_40_60": False})
+    assert out["status"] == "invalid" and out["claims"] == [] and "not_unique_context" not in out
 
 
 def test_failed_rows_are_wrong_and_invalid_or_missing_jev_makes_no_claim():
@@ -628,3 +666,133 @@ def test_pilot_command_without_paid_flag_refuses_before_loading_anything(monkeyp
     monkeypatch.setattr(data, "load_train", boom)
     with pytest.raises(PaidFlagRequired):
         routing.main(["pilot", "--llm-model", "openai/gpt-oss-20b", "--llm-provider", "Darkbloom"])
+
+
+# ------------------------------------------------------------------ bootstrap grouping, bank draw, validation draw
+
+
+def test_bootstrap_resamples_within_the_gold_queue_of_rule_b_not_rule_a(monkeypatch):
+    seen = []
+    real = routing.bootstrap_contrasts
+
+    def spy(arms, base, classes, **kw):
+        seen.append(np.asarray(classes, dtype=object).copy())
+        return real(arms, base, classes, **kw)
+
+    monkeypatch.setattr(routing, "bootstrap_contrasts", spy)
+    n = 200
+    rng = np.random.default_rng(0)
+    gold_a = rng.choice(routing.QUEUES, n)
+    gold_b = np.where(rng.random(n) < 0.5, gold_a, rng.choice(routing.QUEUES, n))
+    assert not np.array_equal(gold_a, gold_b)
+    checks = dict.fromkeys(("agreement_in_40_60", "state_blind_at_most_70", "text_blind_at_most_70", "lr_a_at_least_70"), True)
+    good = arm(np.ones(n))
+    arms = all_arms(**{"small LLM": {"A": good, "B": good}})
+    routing.routing_result(gold_a, gold_b, arms, checks=checks, rules_changed=False, b=50)
+    assert len(seen) == 2  # Jev vs code, then the others vs Jev
+    for classes in seen:
+        assert np.array_equal(classes, gold_b) and not np.array_equal(classes, gold_a)
+
+
+def test_intent_lr_code_uses_bank_draw_0_specifically(monkeypatch):
+    intents = list(ONE_PER_FAMILY.values())
+    pool = synthetic_pool(12, intents)
+    rows = predict_rows(intents)
+    draws = []
+    real = routing.data.bank
+
+    def spy(pool_, draw, s, *a, **k):
+        draws.append((draw, s))
+        return real(pool_, draw, s, *a, **k)
+
+    monkeypatch.setattr(routing.data, "bank", spy)
+    routing.intent_lr_code(pool, rows, fake_encoder, classes=intents)
+    assert draws == [(0, 8)] and routing.DRAW == 0 and routing.INTENT_LR_S == 8
+    # Draw 0 is not draw 1: the two banks differ on this pool, so the test would notice a different draw.
+    assert real(pool, 0, 8)["row_id"].tolist() != real(pool, 1, 8)["row_id"].tolist()
+
+
+def _split(per_intent_pool=40, per_intent_val=5):
+    intents = list(ONE_PER_FAMILY.values())
+    pool = synthetic_pool(per_intent_pool, intents)
+    val = pd.DataFrame(
+        [
+            {"row_id": f"v{intent}{i}", "text": f"val message {i} {intent}", "label": intent}
+            for intent in intents
+            for i in range(per_intent_val)
+        ]
+    )
+    val["norm"] = val["text"].map(data.normalize)
+    return data.Split(val=val, pool=pool)
+
+
+def test_validation_draw_samples_on_text_only_and_joins_the_label_afterwards(monkeypatch):
+    split = _split()
+    seen = []
+    real = routing.sample_rows
+
+    def spy(frame, n=routing.N_SAMPLE):
+        seen.append((list(frame.columns), n))
+        return real(frame, n)
+
+    monkeypatch.setattr(routing, "sample_rows", spy)
+    draw = routing.validation_draw(split)
+    assert seen == [(["row_id", "text"], len(split.val))]  # no label column reaches sampling
+    expected_order = real(split.val[["row_id", "text"]], len(split.val))["row_id"].tolist()
+    assert draw["row_id"].tolist() == expected_order
+    labels = split.val.set_index("row_id")["label"]
+    assert draw["label"].tolist() == [labels[r] for r in draw["row_id"]]
+    # The order is the same whatever the labels say.
+    shuffled = split.val.assign(label=split.val["label"].iloc[::-1].to_numpy())
+    assert routing.validation_draw(data.Split(val=shuffled, pool=split.pool))["row_id"].tolist() == expected_order
+    assert all(f in draw.columns for f in routing.FIELDS)
+
+
+def test_run_validity_trains_lr_a_on_the_pool_only_and_scores_the_validation_draw(monkeypatch):
+    split = _split()
+    banks, fitted = [], []
+    real_fit = routing.fit_lr_a
+
+    def spy(bank, encode):
+        banks.append(bank)
+        return real_fit(bank, encode)
+
+    monkeypatch.setattr(routing, "fit_lr_a", spy)
+    stats, checks = routing.run_validity(split, fake_encoder)
+    assert len(banks) == 1
+    pool_ids, val_ids = set(split.pool["row_id"]), set(split.val["row_id"])
+    assert set(banks[0]["row_id"]) <= pool_ids and not set(banks[0]["row_id"]) & val_ids
+    assert banks[0]["row_id"].tolist() == routing.lr_a_bank(split.pool)["row_id"].tolist()
+    assert set(checks) == {"agreement_in_40_60", "state_blind_at_most_70", "text_blind_at_most_70", "lr_a_at_least_70"}
+    assert all(isinstance(v, (bool, np.bool_)) for v in checks.values())
+    assert stats == routing.validity_stats(routing.validation_draw(split))
+
+
+# ------------------------------------------------------------------ gold pinned
+
+
+PINNED_GOLD = [
+    # (intent, family, state, rule A queue, rule B queue)
+    ("change_pin", "card_problems", ("premium", "new", "email"), "blue", "coral"),
+    ("top_up_by_bank_transfer_charge", "top_ups", ("personal", "active", "app"), "silver", "teal"),
+    ("card_arrival", "card_ordering", ("business", "frozen", "phone"), "amber", "amber"),
+    ("activate_my_card", "card_ordering", ("business", "active", "phone"), "coral", "blue"),
+    ("verify_source_of_funds", "account", ("personal", "active", "email"), "teal", "silver"),
+    ("get_physical_card", "card_ordering", ("business", "active", "email"), "coral", "green"),
+    # The intents whose wording was fixed keep their family, hence their gold.
+    ("supported_cards_and_currencies", "card_ordering", ("personal", "active", "app"), "coral", "green"),
+    ("transaction_charged_twice", "payments", ("business", "new", "email"), "indigo", "indigo"),
+    ("exchange_rate", "payments", ("premium", "active", "phone"), "blue", "blue"),
+]
+
+
+def test_gold_is_pinned_for_chosen_intents_and_states_so_wording_changes_cannot_move_it():
+    for intent, family, (tier, status, channel), qa, qb in PINNED_GOLD:
+        assert routing.family_of(intent) == family, intent
+        row = {"label": intent, "tier": tier, "status": status, "channel": channel}
+        frame = pd.DataFrame([row])
+        assert routing.gold_queues(frame, "A")[0] == qa, intent
+        assert routing.gold_queues(frame, "B")[0] == qb, intent
+    # Family sizes are pinned too (12, 10, 6, 11, 11, 6, 12, 9 intents).
+    sizes = {f: len(spec["intents"]) for f, spec in routing.load_families().items()}
+    assert sizes == {"card_ordering": 12, "card_problems": 10, "security": 6, "top_ups": 11, "transfers": 11, "cash": 6, "payments": 12, "account": 9}
