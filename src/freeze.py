@@ -1,27 +1,26 @@
 """The freeze manifest: SHA-256 of every frozen input, so any later change is detectable (VALIDATION.md, Manifest).
 
 `build_manifest()` writes manifest.json with:
-- `files`: SHA-256 of every tracked file under src/, scripts/, routing/, prompts/ and third_party/, plus the lock
-  file, pyproject.toml, .python-version, the design and validation documents, the plan, the deviations table,
-  the registration document and Stage 0's outputs in stage0/. manifest.json itself is never in this list.
+- `files`: SHA-256 of every tracked file under src/, scripts/, routing/, prompts/, third_party/, stage0/ and
+  tests/, plus the lock file, pyproject.toml, .python-version, .gitignore, the design and validation documents,
+  the plan, the deviations table and the registration document. manifest.json itself is never in this list.
 - `train_parquet`: SHA-256 of each pinned train parquet if it is in the Hugging Face cache; otherwise its
-  repo, revision and filename with the hash marked "pending", for the controller to fill before the tag.
+  repo, revision and filename with the hash marked "pending". A pending hash must be resolved before the tag:
+  `verify_manifest` and `load_test` both refuse it.
 - `routing_rule_fingerprint`: `routing.rule_fingerprint()`.
-- `seeds`, `thresholds` and `models`: the values the code actually uses, read from the modules.
-- `registration`: null until the freeze tag exists.
+- `seeds`, `thresholds` and `models`: values recorded as the code uses them, read from the modules. They are
+  recorded, not hashed; the files that hold them are hashed under `files`.
+- `repo_url`: the public repo the freeze is registered in. It is known in advance, so it is written at build.
 
-`verify_manifest()` recomputes all of it and lists every difference. `register()` (CLI `--registration`) fills
-the registration with the public repo URL and the full commit SHA of the freeze tag.
+Registration is the public tag `freeze-v1` on the commit holding this manifest, in the repo named by
+`repo_url`. The tag records the commit; the manifest cannot, since a commit cannot contain its own SHA. The
+freeze token `load_test` needs is SHA-256 of manifest.json's bytes at that tag (`firewall.freeze_token`).
 
-The manifest's own hash (`firewall.manifest_hash`, the token `load_test` needs) is SHA-256 of the canonical JSON
-with the registration field set to null. A commit cannot contain its own SHA, so the registration can only be
-written after the tag; leaving it out of the hash means filling it changes neither the manifest's hash nor any
-frozen hash recorded in the manifest. The frozen manifest at the tag has registration null, so its hash is just
-the SHA-256 of that file's bytes.
+`verify_manifest()` recomputes all of it, compares canonical bytes, and lists every difference, plus anything
+that makes the tree unclean or hides a change from git. Every git call uses the firewall's hardened git.
 
-CLI (from the repo root): `scripts/freeze.sh` builds, `scripts/freeze.sh --verify` checks, and
-`scripts/freeze.sh --registration` fills the registration once the tag exists. Nothing here tags, commits,
-pushes or touches the network.
+CLI (from the repo root): `scripts/freeze.sh` builds, `scripts/freeze.sh --verify` checks. Nothing here tags,
+commits, pushes or touches the network.
 """
 from __future__ import annotations
 
@@ -29,22 +28,22 @@ import argparse
 import hashlib
 import inspect
 import json
-import subprocess
 import sys
 from pathlib import Path
 
 import yaml
 
 import firewall
-from firewall import FREEZE_TAG, MANIFEST_NAME, REGISTRATION_KEY, REGISTRATION_REPO_URL, canonical_bytes, manifest_hash
+from firewall import FREEZE_TAG, MANIFEST_NAME, PENDING, REGISTRATION_REPO_URL, REPO_URL_KEY, canonical_bytes
 
 REPO = Path(__file__).resolve().parents[1]
-SCHEMA = "jev-benchmark-manifest/1"
-FROZEN_DIRS = ("src", "scripts", "routing", "prompts", "third_party")
+SCHEMA = "jev-benchmark-manifest/2"
+FROZEN_DIRS = ("src", "scripts", "routing", "prompts", "third_party", "stage0", "tests")
 FROZEN_FILES = (
     "uv.lock",
     "pyproject.toml",
     ".python-version",
+    ".gitignore",
     "DESIGN.md",
     "VALIDATION.md",
     "PLAN.md",
@@ -53,15 +52,14 @@ FROZEN_FILES = (
     "stage0/frozen.yaml",
     "stage0/stage0_report.md",
 )
-PENDING = "pending"
 HASH_NOTE = (
-    "The manifest's hash is SHA-256 of this file in canonical form (sorted keys, 2-space indent, final newline) "
-    "with registration set to null. registration is filled after the freeze tag exists and is not part of that hash."
+    "The freeze token is SHA-256 of this file's bytes at tag freeze-v1. seeds, thresholds and models are recorded "
+    "values, not hashes; the files that hold them are hashed under files."
 )
 
 
 class FreezeError(Exception):
-    """The manifest cannot be built, verified or registered as asked."""
+    """The manifest cannot be built or verified as asked."""
 
 
 def sha256_file(path: Path) -> str:
@@ -72,21 +70,18 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def _git(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-    try:
-        return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, check=check)
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-        raise FreezeError(f"git {' '.join(args)} failed in {root}") from exc
-
-
-def _git_lines(root: Path, *args: str) -> list[str]:
-    return [line for line in _git(root, *args).stdout.split("\0") if line]
+def _z(root: Path, *args: str) -> list[str]:
+    return [p for p in firewall.git_bytes(root, *args, error=FreezeError).decode("utf-8", errors="replace").split("\0") if p]
 
 
 def tag_commit(root: Path) -> str | None:
     """Full commit SHA of the freeze tag, or None if the tag does not exist."""
-    done = _git(root, "rev-parse", "-q", "--verify", f"refs/tags/{FREEZE_TAG}^{{commit}}", check=False)
-    return done.stdout.strip() if done.returncode == 0 else None
+    return firewall.tag_commit(root, FREEZE_TAG, error=FreezeError)
+
+
+def tree_problems(root: Path) -> list[str]:
+    """Hardened clean-tree check (see firewall.worktree_problems); changes to manifest.json itself are allowed."""
+    return firewall.worktree_problems(root, FROZEN_DIRS, allow_changed=(MANIFEST_NAME,), error=FreezeError)
 
 
 # --------------------------------------------------------------------------- what is frozen
@@ -94,17 +89,11 @@ def tag_commit(root: Path) -> str | None:
 
 def frozen_paths(root: Path) -> list[str]:
     """Repo-relative paths of every frozen file: tracked files in FROZEN_DIRS plus FROZEN_FILES."""
-    root = Path(root)
-    tracked = set(_git_lines(root, "ls-files", "-z", "--cached", "--", *FROZEN_DIRS, *FROZEN_FILES))
+    tracked = set(_z(Path(root), "ls-files", "-z", "--cached", "--", *FROZEN_DIRS, *FROZEN_FILES))
     missing = [f for f in FROZEN_FILES if f not in tracked]
     if missing:
         raise FreezeError(f"frozen files must exist and be tracked by git: {missing}")
     return sorted(p for p in tracked if p != MANIFEST_NAME)
-
-
-def untracked_frozen(root: Path) -> list[str]:
-    """Untracked, not ignored files inside the frozen folders: code that would run but is not hashed."""
-    return sorted(_git_lines(Path(root), "ls-files", "-z", "--others", "--exclude-standard", "--", *FROZEN_DIRS, "stage0"))
 
 
 def file_hashes(root: Path) -> dict[str, str]:
@@ -112,8 +101,8 @@ def file_hashes(root: Path) -> dict[str, str]:
     hashes = {}
     for rel in frozen_paths(root):
         path = root / rel
-        if not path.is_file():
-            raise FreezeError(f"tracked frozen file is missing from the working tree: {rel}")
+        if path.is_symlink() or not path.is_file():
+            raise FreezeError(f"tracked frozen file is missing or a symlink in the working tree: {rel}")
         hashes[rel] = sha256_file(path)
     return hashes
 
@@ -249,7 +238,7 @@ def rule_fingerprint() -> str:
 
 def _parts(root: Path, hf_cache_dir: Path | None):
     """The manifest's sections, each computed lazily so verify can report one failing section and go on."""
-    yield "header", lambda: {"schema": SCHEMA, "hash_note": HASH_NOTE, "freeze_tag": FREEZE_TAG}
+    yield "header", lambda: {"schema": SCHEMA, "hash_note": HASH_NOTE, "freeze_tag": FREEZE_TAG, REPO_URL_KEY: REGISTRATION_REPO_URL}
     yield "files", lambda: {"files": file_hashes(root)}
     yield "train_parquet", lambda: {"train_parquet": train_parquet_hashes(hf_cache_dir)}
     yield "routing_rule_fingerprint", lambda: {"routing_rule_fingerprint": rule_fingerprint()}
@@ -257,11 +246,10 @@ def _parts(root: Path, hf_cache_dir: Path | None):
 
 
 def compute_manifest(root: Path = REPO, *, hf_cache_dir: Path | None = None) -> dict:
-    """The manifest as it would be written now, with registration null."""
+    """The manifest as it would be written now."""
     manifest = {}
     for _, compute in _parts(Path(root), hf_cache_dir):
         manifest.update(compute())
-    manifest[REGISTRATION_KEY] = None
     return manifest
 
 
@@ -270,13 +258,25 @@ def pending_hashes(manifest: dict) -> list[str]:
 
 
 def build_manifest(root: Path = REPO, *, hf_cache_dir: Path | None = None) -> dict:
-    """Write manifest.json for the current tree. Refuses once the freeze tag exists: the frozen manifest is final."""
+    """Write manifest.json for the current tree.
+
+    Refuses once the freeze tag exists (the frozen manifest is final) and refuses a dirty tree, since the
+    manifest must hash exactly what gets committed. Only manifest.json itself may differ from HEAD.
+    """
     root = Path(root)
     if tag_commit(root) is not None:
         raise FreezeError(f"freeze tag {FREEZE_TAG} exists; the frozen manifest cannot be rebuilt")
+    problems = tree_problems(root)
+    if problems:
+        raise FreezeError("tree is not clean; commit or remove changes first: " + "; ".join(problems))
     manifest = compute_manifest(root, hf_cache_dir=hf_cache_dir)
     (root / MANIFEST_NAME).write_bytes(canonical_bytes(manifest))
     return manifest
+
+
+def _same(a, b) -> bool:
+    """Equal as canonical JSON, so 1, 1.0 and true are all different."""
+    return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
 
 
 def _diff(recorded, current, path: str, out: list[str]) -> None:
@@ -289,25 +289,30 @@ def _diff(recorded, current, path: str, out: list[str]) -> None:
                 out.append(f"{where}: present now but not in the manifest")
             else:
                 _diff(recorded[key], current[key], where, out)
-    elif recorded != current:
+    elif not _same(recorded, current):
         out.append(f"{path}: changed (manifest {recorded!r}, now {current!r})")
 
 
 def verify_manifest(root: Path = REPO, *, hf_cache_dir: Path | None = None) -> list[str]:
     """Every difference between manifest.json and the tree now. An empty list means nothing frozen changed.
 
-    Also reported: a manifest not in canonical form, a train parquet hash still pending or not in the cache,
-    untracked files in the frozen folders, and a registration that is filled but wrong.
+    Compares canonical bytes, so a type change (1 to true, 0 to 0.0) counts. Also reported: a manifest not in
+    canonical form or a symlink, a pending train parquet hash or one not in the cache, and anything that makes
+    the tree unclean or hides a change from git (changes to manifest.json itself excepted).
     """
     root = Path(root)
     path = root / MANIFEST_NAME
-    if not path.is_file():
-        return [f"no {MANIFEST_NAME} at {root}"]
+    if path.is_symlink() or not path.is_file():
+        return [f"no {MANIFEST_NAME} file at {root}"]
+    raw = path.read_bytes()
     try:
-        recorded = firewall.read_manifest(path.read_bytes())
+        recorded = firewall.read_manifest(raw)
     except firewall.FirewallError as exc:
         return [str(exc)]
-    problems = []
+    try:
+        problems = tree_problems(root)
+    except FreezeError as exc:
+        problems = [str(exc)]
     current, failed_keys = {}, set()
     for name, compute in _parts(root, hf_cache_dir):
         try:
@@ -315,57 +320,16 @@ def verify_manifest(root: Path = REPO, *, hf_cache_dir: Path | None = None) -> l
         except Exception as exc:  # report and keep checking the other sections
             problems.append(f"{name}: cannot be recomputed: {exc}")
             failed_keys |= {"seeds", "thresholds", "models"} if name == "settings" else {name}
-    frozen_part = {k: v for k, v in recorded.items() if k != REGISTRATION_KEY and k not in failed_keys}
-    _diff(frozen_part, current, "", problems)
+    before = len(problems)
+    _diff({k: v for k, v in recorded.items() if k not in failed_keys}, current, "", problems)
+    if not failed_keys and len(problems) == before and canonical_bytes(current) != raw:
+        problems.append("manifest.json differs from the recomputed manifest")  # backstop; _diff should name it
     for name in pending_hashes(recorded):
         problems.append(f"train_parquet.{name}: hash is pending; cache the file and rebuild before the tag")
     for name in pending_hashes(current):
         if name not in pending_hashes(recorded):
             problems.append(f"train_parquet.{name}: not in the Hugging Face cache, so it cannot be verified")
-    for rel in untracked_frozen(root):
-        problems.append(f"{rel}: untracked file in a frozen folder is not covered by the manifest")
-    registration = recorded.get(REGISTRATION_KEY)
-    if registration is not None:
-        commit = tag_commit(root)
-        try:
-            if commit is None:
-                raise firewall.FirewallError(f"registration is filled but freeze tag {FREEZE_TAG} does not exist")
-            firewall.check_registration(recorded, commit)
-        except firewall.FirewallError as exc:
-            problems.append(str(exc))
     return problems
-
-
-def register(root: Path = REPO, *, hf_cache_dir: Path | None = None) -> dict:
-    """Fill the registration (repo URL and the freeze tag's full commit SHA) in manifest.json. Run once the tag exists.
-
-    Needs HEAD at the tag, a clean tree and a manifest that verifies. The manifest's hash is unchanged by this
-    (see the module docstring). Commit the result on top of the tag; the firewall accepts exactly that commit.
-    """
-    root = Path(root)
-    commit = tag_commit(root)
-    if commit is None:
-        raise FreezeError(f"freeze tag {FREEZE_TAG} does not exist yet; tag first, then register")
-    path = root / MANIFEST_NAME
-    manifest = firewall.read_manifest(path.read_bytes())
-    target = {"repo_url": REGISTRATION_REPO_URL, "commit": commit}
-    if manifest.get(REGISTRATION_KEY) == target:
-        return target
-    if manifest.get(REGISTRATION_KEY) is not None:
-        raise FreezeError(f"manifest already holds a different registration: {manifest[REGISTRATION_KEY]!r}")
-    if _git(root, "rev-parse", "HEAD").stdout.strip() != commit:
-        raise FreezeError(f"HEAD must be at freeze tag {FREEZE_TAG} to register")
-    if _git(root, "status", "--porcelain").stdout.strip():
-        raise FreezeError("git tree must be clean to register")
-    problems = verify_manifest(root, hf_cache_dir=hf_cache_dir)
-    if problems:
-        raise FreezeError("manifest does not verify; not registering:\n" + "\n".join(problems))
-    before = manifest_hash(manifest)
-    manifest[REGISTRATION_KEY] = target
-    if manifest_hash(manifest) != before:  # cannot happen by construction; refuse rather than write
-        raise FreezeError("filling the registration would change the manifest's hash")
-    path.write_bytes(canonical_bytes(manifest))
-    return target
 
 
 # --------------------------------------------------------------------------- CLI
@@ -373,9 +337,7 @@ def register(root: Path = REPO, *, hf_cache_dir: Path | None = None) -> dict:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--verify", action="store_true", help="list every difference from manifest.json")
-    mode.add_argument("--registration", action="store_true", help="fill the registration once the freeze tag exists")
+    parser.add_argument("--verify", action="store_true", help="list every difference from manifest.json")
     args = parser.parse_args(argv)
     try:
         if args.verify:
@@ -385,18 +347,13 @@ def main(argv=None) -> int:
             if problems:
                 print(f"manifest does NOT verify: {len(problems)} problem(s)")
                 return 1
-            print(f"manifest verifies; manifest hash {firewall.freeze_token(REPO / MANIFEST_NAME)}")
-            return 0
-        if args.registration:
-            reg = register(REPO)
-            print(f"registration: {reg['repo_url']} at {reg['commit']}")
-            print(f"manifest hash unchanged: {firewall.freeze_token(REPO / MANIFEST_NAME)}")
+            print(f"manifest verifies; SHA-256 of manifest.json {sha256_file(REPO / MANIFEST_NAME)}")
             return 0
         manifest = build_manifest(REPO)
         print(f"wrote {MANIFEST_NAME}: {len(manifest['files'])} files hashed")
         for name in pending_hashes(manifest):
-            print(f"train parquet {name}: hash PENDING (not in the Hugging Face cache)")
-        print(f"manifest hash {manifest_hash(manifest)}")
+            print(f"train parquet {name}: hash PENDING (not in the Hugging Face cache); the freeze cannot proceed")
+        print(f"SHA-256 of manifest.json {sha256_file(REPO / MANIFEST_NAME)} (the freeze token once tagged)")
         return 0
     except (FreezeError, firewall.FirewallError) as exc:
         print(f"refused: {exc}", file=sys.stderr)

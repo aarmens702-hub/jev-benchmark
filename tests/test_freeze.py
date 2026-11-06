@@ -12,7 +12,7 @@ import data
 import firewall
 import freeze
 import routing
-from firewall import FREEZE_TAG, REGISTRATION_REPO_URL, canonical_bytes, manifest_hash
+from firewall import FREEZE_TAG, REGISTRATION_REPO_URL, canonical_bytes
 from freeze import FROZEN_DIRS, FROZEN_FILES, PENDING, FreezeError
 
 REPO = Path(__file__).resolve().parents[1]
@@ -35,6 +35,7 @@ DIR_FILES = {
     "routing/rules.py": "RULE = 'a'\n",
     "prompts/p.v1.json": '{"instructions": "pick one"}\n',
     "third_party/NOTICE.md": "MIT\n",
+    "tests/test_x.py": "def test_x():\n    pass\n",
 }
 
 
@@ -103,7 +104,8 @@ def test_manifest_hashes_code_lock_labels_prompts_rules_seeds_thresholds_and_tra
     for rel in ("uv.lock", "pyproject.toml", "DESIGN.md", "VALIDATION.md", "PLAN.md", "deviations.md",
                 "stage0/frozen.yaml", "stage0/stage0_report.md", "registration.md"):
         assert rel in manifest["files"]
-    assert "README.md" not in manifest["files"] and ".gitignore" not in manifest["files"]
+    assert "README.md" not in manifest["files"] and ".gitignore" in manifest["files"]
+    assert manifest["repo_url"] == REGISTRATION_REPO_URL
 
     for name, (repo_id, revision) in data.PINNED.items():
         entry = manifest["train_parquet"][name]
@@ -128,11 +130,14 @@ def test_manifest_hashes_code_lock_labels_prompts_rules_seeds_thresholds_and_tra
     assert models["small_llm"]["provider"] == "DekaLLM"
     assert models["small_llm"]["provider_options"]["allow_fallbacks"] is False
     assert models["nli"]["large"]["revision"] == "b2730f16019076bb0009481121efbe4705e0e378"
-    assert manifest["registration"] is None
+    assert "registration" not in manifest
 
     raw = (repo / "manifest.json").read_bytes()
     assert raw == canonical_bytes(manifest)
-    assert firewall.freeze_token(repo / "manifest.json") == hashlib.sha256(raw).hexdigest()
+    git(repo, "add", "manifest.json")
+    git(repo, "commit", "-q", "-m", "manifest")
+    git(repo, "tag", FREEZE_TAG)
+    assert firewall.freeze_token(repo) == hashlib.sha256(raw).hexdigest()
 
 
 def test_manifest_excluded_from_its_own_hashes(repo, hub):
@@ -164,7 +169,7 @@ def test_real_repo_manifest_computes_with_pending_train_hashes(tmp_path):
     manifest = freeze.compute_manifest(REPO, hf_cache_dir=tmp_path / "empty-hub")
     assert freeze.pending_hashes(manifest) == ["ag_news", "banking77"]
     assert manifest["models"]["small_llm"]["model"] == "mistralai/mistral-nemo"
-    assert manifest["registration"] is None
+    assert manifest["repo_url"] == REGISTRATION_REPO_URL
 
 
 # --------------------------------------------------------------------------- any change is detected
@@ -190,7 +195,7 @@ def test_added_removed_and_untracked_files_are_detected(repo, hub):
     frozen_repo(repo, hub)
     (repo / "src" / "new.py").write_text("z = 3\n")
     problems = freeze.verify_manifest(repo, hf_cache_dir=hub)
-    assert any("src/new.py: untracked file in a frozen folder" in p for p in problems)
+    assert any("dirty" in p and "src/new.py" in p for p in problems)
     git(repo, "add", "src/new.py")
     problems = freeze.verify_manifest(repo, hf_cache_dir=hub)
     assert any(p.startswith("files.src/new.py: present now but not in the manifest") for p in problems)
@@ -259,11 +264,12 @@ def test_recorded_parquet_missing_from_cache_cannot_verify(repo, hub, tmp_path):
 
 def test_missing_frozen_file_refuses_build(repo, hub):
     git(repo, "rm", "-q", "deviations.md")
+    git(repo, "commit", "-q", "-m", "drop deviations")
     with pytest.raises(FreezeError, match="deviations.md"):
         freeze.build_manifest(repo, hf_cache_dir=hub)
 
 
-# --------------------------------------------------------------------------- tag and registration
+# --------------------------------------------------------------------------- build refusals and the firewall
 
 
 def test_build_refuses_once_the_tag_exists(repo, hub):
@@ -273,75 +279,78 @@ def test_build_refuses_once_the_tag_exists(repo, hub):
         freeze.build_manifest(repo, hf_cache_dir=hub)
 
 
-def test_registration_refused_before_the_tag(repo, hub):
+@pytest.mark.parametrize("how", ["modified", "untracked", "staged", "skip-worktree"])
+def test_build_refuses_a_dirty_tree(repo, hub, how):
+    if how == "modified":
+        (repo / "src" / "code.py").write_text("x = 2\n")
+    elif how == "untracked":
+        (repo / "notes.txt").write_text("x\n")
+    elif how == "staged":
+        (repo / "src" / "code.py").write_text("x = 2\n")
+        git(repo, "add", "src/code.py")
+    else:
+        git(repo, "update-index", "--skip-worktree", "src/code.py")
+    with pytest.raises(FreezeError, match="not clean"):
+        freeze.build_manifest(repo, hf_cache_dir=hub)
+    assert not (repo / "manifest.json").exists()
+
+
+def test_build_allows_rebuilding_its_own_manifest(repo, hub):
     frozen_repo(repo, hub)
-    with pytest.raises(FreezeError, match="does not exist"):
-        freeze.register(repo, hf_cache_dir=hub)
-
-
-def test_registration_fills_fields_without_changing_any_frozen_hash(repo, hub):
-    manifest = frozen_repo(repo, hub)
-    git(repo, "tag", FREEZE_TAG)
-    commit = git(repo, "rev-parse", "HEAD").strip()
-    token = firewall.freeze_token(repo / "manifest.json")
-    reg = freeze.register(repo, hf_cache_dir=hub)
-    assert reg == {"repo_url": REGISTRATION_REPO_URL, "commit": commit}
-    filled = json.loads((repo / "manifest.json").read_text())
-    assert filled["registration"] == reg
-    assert {k: v for k, v in filled.items() if k != "registration"} == {k: v for k, v in manifest.items() if k != "registration"}
-    assert firewall.freeze_token(repo / "manifest.json") == token == manifest_hash(manifest)
+    (repo / "manifest.json").write_text("stale\n")
+    freeze.build_manifest(repo, hf_cache_dir=hub)
     assert freeze.verify_manifest(repo, hf_cache_dir=hub) == []
-    assert freeze.register(repo, hf_cache_dir=hub) == reg  # idempotent, even with the change uncommitted
 
 
-def test_registered_freeze_opens_the_firewall_end_to_end(repo, hub, tmp_path):
-    frozen_repo(repo, hub)
-    git(repo, "tag", FREEZE_TAG)
-    freeze.register(repo, hf_cache_dir=hub)
-    git(repo, "commit", "-q", "-am", "registration")
-    token = firewall.freeze_token(repo / "manifest.json")
+def test_type_changes_in_recorded_values_are_detected(repo, hub):
+    manifest = frozen_repo(repo, hub)
+    manifest["thresholds"]["draws"] = 10.0
+    manifest["seeds"]["lr"] = False  # was 0
+    (repo / "manifest.json").write_bytes(canonical_bytes(manifest))
+    problems = freeze.verify_manifest(repo, hf_cache_dir=hub)
+    assert any(p.startswith("thresholds.draws: changed") for p in problems)
+    assert any(p.startswith("seeds.lr: changed") for p in problems)
 
-    def fake_download(repo_id, filename, revision):
+
+def _firewall_load(repo, hub, tmp_path):
+    head = git(repo, "rev-parse", "HEAD").strip()
+
+    def lister(url, refs):
+        return f"{head}\trefs/heads/main\n{head}\trefs/tags/{FREEZE_TAG}\n"
+
+    def download(repo_id, filename, revision):
         path = tmp_path / "fake.parquet"
         pd.DataFrame({"text": ["a"], "label": [0]}).to_parquet(path)
         return str(path)
 
-    texts, gold = firewall._load_test("banking77", token, repo_dir=repo, downloader=fake_download)
+    return firewall._load_test(
+        "banking77", firewall.freeze_token(repo), repo_dir=repo, downloader=download,
+        verifier=lambda r: freeze.verify_manifest(r, hf_cache_dir=hub), lister=lister, frozen_dirs=FROZEN_DIRS,
+    )
+
+
+def test_frozen_repo_opens_the_firewall_end_to_end(repo, hub, tmp_path):
+    frozen_repo(repo, hub)
+    git(repo, "tag", "-a", FREEZE_TAG, "-m", "freeze")
+    texts, gold = _firewall_load(repo, hub, tmp_path)
     assert texts["text"].tolist() == ["a"] and gold["label"].tolist() == [0]
 
 
-def test_registration_refused_on_dirty_tree_wrong_head_or_failed_verify(repo, hub):
+def test_firewall_runs_verify_at_load_including_train_parquets(repo, hub, tmp_path):
     frozen_repo(repo, hub)
     git(repo, "tag", FREEZE_TAG)
-    (repo / "scratch.txt").write_text("untracked\n")
-    with pytest.raises(FreezeError, match="clean"):
-        freeze.register(repo, hf_cache_dir=hub)
-    (repo / "scratch.txt").unlink()
-
-    (repo / "src" / "code.py").write_text("x = 2\n")
-    git(repo, "commit", "-q", "-am", "after the tag")
-    with pytest.raises(FreezeError, match="HEAD"):
-        freeze.register(repo, hf_cache_dir=hub)
+    flip_last_byte(parquet_path(hub, "banking77"))
+    with pytest.raises(firewall.FirewallError, match="does not verify"):
+        _firewall_load(repo, hub, tmp_path)
 
 
-def test_registration_refused_when_the_tagged_tree_does_not_verify(repo, hub):
-    frozen_repo(repo, hub)
-    (repo / "src" / "code.py").write_text("x = 2\n")
-    git(repo, "commit", "-q", "-am", "changed after the manifest was built")
+def test_firewall_refuses_a_tag_on_a_manifest_with_pending_hashes(repo, tmp_path):
+    freeze.build_manifest(repo, hf_cache_dir=tmp_path / "empty-hub")
+    git(repo, "add", "manifest.json")
+    git(repo, "commit", "-q", "-m", "manifest")
     git(repo, "tag", FREEZE_TAG)
-    with pytest.raises(FreezeError, match="does not verify"):
-        freeze.register(repo, hf_cache_dir=hub)
-    assert json.loads((repo / "manifest.json").read_text())["registration"] is None
-
-
-def test_wrong_registration_in_manifest_is_reported_by_verify(repo, hub):
-    manifest = frozen_repo(repo, hub)
-    git(repo, "tag", FREEZE_TAG)
-    manifest["registration"] = {"repo_url": REGISTRATION_REPO_URL, "commit": "0" * 40}
-    (repo / "manifest.json").write_bytes(canonical_bytes(manifest))
-    assert any("does not match the freeze tag" in p for p in freeze.verify_manifest(repo, hf_cache_dir=hub))
-    with pytest.raises(FreezeError, match="different registration"):
-        freeze.register(repo, hf_cache_dir=hub)
+    with pytest.raises(firewall.FirewallError, match="pending"):
+        _firewall_load(repo, tmp_path / "empty-hub", tmp_path)
 
 
 def test_cli_builds_and_verifies(repo, hub, monkeypatch, capsys):
@@ -355,7 +364,9 @@ def test_cli_builds_and_verifies(repo, hub, monkeypatch, capsys):
     flip_last_byte(repo / "src" / "code.py")
     assert freeze.main(["--verify"]) == 1
     assert "files.src/code.py: changed" in capsys.readouterr().out
-    assert freeze.main(["--registration"]) == 2  # no tag yet
+    flip_last_byte(repo / "src" / "code.py")
+    git(repo, "tag", FREEZE_TAG)
+    assert freeze.main([]) == 2  # the frozen manifest is never rebuilt
 
 
 # --------------------------------------------------------------------------- documents
@@ -389,6 +400,8 @@ QUOTED_RULES = [
     '"Not unique to Jev" if small LLM or NLI minus Jev has lower limit above -5.',
     "Registration prevents later changes; it does not make the design blind.",
     "Jev's training data is not disclosed, so memorisation of public datasets cannot be ruled out.",
+    "Hard cap CA$10 (about US$7.15 at 1.3994), everything included, enforced by a limit on the key",
+    'His claim, verbatim: "zeroshot NLI, embedding based classifiers and constrained output models already support dynamic classification without task specific retraining."',
 ]
 
 
@@ -399,6 +412,8 @@ def test_registration_quotes_design_rules_verbatim():
         assert sentence in design, sentence
         assert sentence in registration, sentence
     disclosure = next(p for p in design.split("\n\n") if p.startswith("**Disclosure, in the registration and the post:**"))
+    comment = next(p for p in design.split("\n\n") if p.startswith("Aarmen's comment, verbatim:"))
+    assert comment in registration
     text = disclosure.split(":** ", 1)[1]
     assert text.startswith("the analyst") and "The" + text[3:] in registration  # capitalised as a paragraph start
 
@@ -407,4 +422,6 @@ def test_registration_names_the_selected_small_llm_and_public_repo():
     registration = (REPO / "registration.md").read_text()
     assert "mistralai/mistral-nemo" in registration and "DekaLLM" in registration
     assert REGISTRATION_REPO_URL in registration and FREEZE_TAG in registration
+    assert "recorded as values, not hashed" in registration
+    assert "registration commit" not in registration
     assert "—" not in registration and "–" not in registration  # no em or en dashes

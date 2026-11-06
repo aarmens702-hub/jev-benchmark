@@ -6,6 +6,7 @@ import ast
 import hashlib
 import inspect
 import json
+import os
 import re
 import subprocess
 from pathlib import Path, PurePosixPath
@@ -23,7 +24,6 @@ from firewall import (
     canonical_bytes,
     freeze_token,
     load_test,
-    manifest_hash,
 )
 
 REPO = Path(__file__).resolve().parents[1]
@@ -137,39 +137,75 @@ def write_manifest(path, manifest):
     Path(path).write_bytes(canonical_bytes(manifest))
 
 
-def tag_commit(repo):
-    return git(repo, "rev-parse", f"refs/tags/{FREEZE_TAG}^{{commit}}").strip()
+FROZEN_MANIFEST = {"files": {"src/a.py": "0" * 64}, "repo_url": REGISTRATION_REPO_URL, "train_parquet": {"banking77": {"sha256": "ab" * 32}}}
+TEST_DIRS = ("src",)
 
 
-def register(repo, *, url=REGISTRATION_REPO_URL, commit=None, commit_it=True):
-    """Fill the registration after tagging, as freeze.py --registration does, then commit it on the tag."""
-    manifest = json.loads((repo / "manifest.json").read_text())
-    manifest["registration"] = {"repo_url": url, "commit": tag_commit(repo) if commit is None else commit}
-    write_manifest(repo / "manifest.json", manifest)
-    if commit_it:
-        git(repo, "commit", "-q", "-am", "registration")
-    return manifest
-
-
-def make_repo(tmp_path, *, manifest=None, tag=True, registered=True):
-    """A temp repo frozen like the real one: manifest with registration null, tag, then a registration commit."""
+def make_repo(tmp_path, *, manifest=None, tag=True, annotated=False):
+    """A temp repo frozen like the real one: canonical manifest naming the public repo, committed and tagged."""
     repo = tmp_path / "repo"
     repo.mkdir(parents=True)
-    git(repo, "init", "-q")
-    frozen_manifest = {"files": {"a.py": "0" * 64}, "registration": None} if manifest is None else manifest
-    write_manifest(repo / "manifest.json", frozen_manifest)
-    (repo / "a.py").write_text("x = 1\n")
+    git(repo, "init", "-q", "-b", "main")
+    write_manifest(repo / "manifest.json", FROZEN_MANIFEST if manifest is None else manifest)
+    (repo / "src").mkdir()
+    (repo / "src" / "a.py").write_text("x = 1\n")
+    (repo / ".gitignore").write_text("runs/\n__pycache__/\n*.log\n")
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "freeze")
     if tag:
-        git(repo, "tag", FREEZE_TAG)  # lightweight, so no identity is needed
-        if registered and manifest is None:
-            register(repo)
+        if annotated:
+            git(repo, "tag", "-a", FREEZE_TAG, "-m", "freeze")
+        else:
+            git(repo, "tag", FREEZE_TAG)
     return repo
 
 
+def head_of(repo):
+    return git(repo, "rev-parse", "HEAD").strip()
+
+
+def public_lister(tag_sha, main_sha, peeled=None):
+    """A fake ls-remote: what the public repo would report."""
+    calls = []
+
+    def lister(url, refs):
+        calls.append((url, list(refs)))
+        lines = [f"{main_sha}\trefs/heads/main", f"{tag_sha}\trefs/tags/{FREEZE_TAG}"]
+        if peeled:
+            lines.append(f"{peeled}\trefs/tags/{FREEZE_TAG}^{{}}")
+        return "\n".join(lines) + "\n"
+
+    lister.calls = calls
+    return lister
+
+
+def published(repo):
+    return public_lister(head_of(repo), head_of(repo))
+
+
 def token_for(repo):
-    return freeze_token(repo / "manifest.json")
+    return freeze_token(repo)
+
+
+def load(repo, tmp_path, *, token=None, lister=None, verifier=None, dataset=None):
+    dl = FakeDownloader(tmp_path)
+    out = _load_test(
+        dataset or PINNED[0], token_for(repo) if token is None else token, repo_dir=repo, downloader=dl,
+        verifier=verifier or (lambda r: []), lister=lister or published(repo), frozen_dirs=TEST_DIRS,
+    )
+    return out, dl
+
+
+def assert_refused(repo, tmp_path, match, **kw):
+    dl = FakeDownloader(tmp_path)
+    token = kw.pop("token") if "token" in kw else token_for(repo)
+    with pytest.raises(FirewallError, match=match):
+        _load_test(
+            PINNED[0], token, repo_dir=repo, downloader=dl,
+            verifier=kw.pop("verifier", lambda r: []), lister=kw.pop("lister", None) or published(repo),
+            frozen_dirs=TEST_DIRS,
+        )
+    assert dl.calls == []
 
 
 class FakeDownloader:
@@ -244,7 +280,6 @@ def test_forbidden_string_scan_detects_each_pattern(tmp_path):
     (repo / "b.py").write_text("name = 'test-00000-of-00001.parquet'\n")
     (repo / "c.py").write_text("from datasets import load_dataset\nload_dataset('x')\n")
     (repo / "NOTES.md").write_text('docs may say load_dataset( and split="test"\n')
-    (repo / "src").mkdir()
     (repo / "src" / "firewall.py").write_text("load_dataset(\n")
     hits = forbidden_string_hits(repo)
     assert sorted({h.split(":")[0] for h in hits}) == ["a.py", "b.py", "c.py"]
@@ -311,30 +346,23 @@ def test_gold_reader_check_allows_clean_predictors(tmp_path, source):
 # ------------------------------------------------------------- load_test conditions
 
 
-def test_freeze_token_is_sha256_of_frozen_manifest_bytes(tmp_path):
-    path = tmp_path / "manifest.json"
-    raw = b'{\n  "files": {},\n  "registration": null\n}\n'
-    path.write_bytes(raw)
-    assert freeze_token(path) == hashlib.sha256(raw).hexdigest()
+def test_freeze_token_is_sha256_of_tagged_manifest_bytes(tmp_path):
+    repo = make_repo(tmp_path)
+    tagged = git(repo, "show", f"{FREEZE_TAG}:manifest.json").encode()
+    assert freeze_token(repo) == hashlib.sha256(tagged).hexdigest()
+    assert freeze_token(repo / "manifest.json") == freeze_token(repo)  # the older call form
 
 
-def test_freeze_token_ignores_only_the_registration_field(tmp_path):
-    path = tmp_path / "manifest.json"
-    frozen = {"files": {"a.py": "1" * 64}, "registration": None}
-    write_manifest(path, frozen)
-    before = freeze_token(path)
-    write_manifest(path, {**frozen, "registration": {"repo_url": REGISTRATION_REPO_URL, "commit": "a" * 40}})
-    assert freeze_token(path) == before
-    write_manifest(path, {**frozen, "files": {"a.py": "2" * 64}})
-    assert freeze_token(path) != before
+def test_freeze_token_reads_the_tag_not_the_working_file(tmp_path):
+    repo = make_repo(tmp_path)
+    before = freeze_token(repo)
+    write_manifest(repo / "manifest.json", {**FROZEN_MANIFEST, "files": {}})
+    assert freeze_token(repo) == before
 
 
-@pytest.mark.parametrize("raw", [b'{"registration": null}', b'{\n  "registration": null\n}', b"[]\n", b"not json"])
-def test_freeze_token_refuses_non_canonical_or_non_object_manifest(tmp_path, raw):
-    path = tmp_path / "manifest.json"
-    path.write_bytes(raw)
-    with pytest.raises(FirewallError):
-        freeze_token(path)
+def test_freeze_token_needs_the_tag(tmp_path):
+    with pytest.raises(FirewallError, match="tag"):
+        freeze_token(make_repo(tmp_path, tag=False))
 
 
 @pytest.mark.parametrize("token", ["", "not-a-token", None])
@@ -351,13 +379,13 @@ def test_load_test_on_real_repo_refuses_before_freeze():
 
 def test_public_load_test_signature_is_dataset_and_token_only():
     assert list(inspect.signature(load_test).parameters) == ["dataset", "token"]
-    for kwargs in ({"repo_dir": "x"}, {"manifest_path": "x"}, {"freeze_tag": "x"}, {"downloader": print}):
+    for kwargs in ({"repo_dir": "x"}, {"freeze_tag": "x"}, {"downloader": print}, {"verifier": print}, {"lister": print}):
         with pytest.raises(TypeError):
             load_test(PINNED[0], "0" * 64, **kwargs)
 
 
 def test_load_test_ignores_a_throwaway_frozen_repo(tmp_path):
-    # The bypass from review: a temp repo with its own manifest and tag cannot satisfy the public function.
+    # A temp repo with its own manifest and tag cannot satisfy the public function.
     repo = make_repo(tmp_path)
     with pytest.raises(FirewallError):
         load_test(PINNED[0], token_for(repo))
@@ -376,49 +404,98 @@ def test_hub_download_refuses_anything_but_pinned_test_files(args):
         _hub_download(*args)
 
 
-def test_load_test_rejects_wrong_token(tmp_path):
+@pytest.mark.parametrize("dataset", PINNED)
+def test_load_test_success_splits_text_from_gold(tmp_path, dataset):
+    repo = make_repo(tmp_path)
+    lister = published(repo)
+    (texts, gold), dl = load(repo, tmp_path, dataset=dataset, lister=lister)
+    assert list(texts.columns) == ["row_id", "text"]
+    assert list(gold.columns) == ["row_id", "label"]
+    assert texts["row_id"].tolist() == gold["row_id"].tolist() == [0, 1, 2]
+    assert texts["text"].tolist() == ["alpha", "beta", "gamma"]
+    assert gold["label"].tolist() == [2, 0, 1]
+    assert [(c[0], c[2]) for c in dl.calls] == [(dataset, firewall.PINNED_TEST_FILES[dataset]["revision"])]
+    assert lister.calls == [(REGISTRATION_REPO_URL, [f"refs/tags/{FREEZE_TAG}", f"refs/tags/{FREEZE_TAG}^{{}}", "refs/heads/main"])]
+
+
+def test_load_test_success_with_annotated_tag(tmp_path):
+    repo = make_repo(tmp_path, annotated=True)
+    tag_object = git(repo, "rev-parse", f"refs/tags/{FREEZE_TAG}").strip()
+    assert tag_object != head_of(repo)
+    load(repo, tmp_path, lister=public_lister(tag_object, head_of(repo), peeled=head_of(repo)))
+
+
+def test_load_test_allows_bytecode_of_tracked_sources(tmp_path):
+    repo = make_repo(tmp_path)
+    (repo / "src" / "__pycache__").mkdir()
+    (repo / "src" / "__pycache__" / "a.cpython-312.pyc").write_bytes(b"\0")
+    load(repo, tmp_path)
+
+
+@pytest.mark.parametrize("short,full", [("banking77", PINNED[0]), ("ag_news", PINNED[1])])
+def test_load_test_accepts_short_dataset_names(tmp_path, short, full):
+    repo = make_repo(tmp_path)
+    _, dl = load(repo, tmp_path, dataset=short)
+    assert dl.calls[0][0] == full
+
+
+def test_load_test_rejects_unknown_dataset(tmp_path):
     repo = make_repo(tmp_path)
     dl = FakeDownloader(tmp_path)
-    with pytest.raises(FirewallError, match="token"):
-        _load_test(PINNED[0], "0" * 64, repo_dir=repo, downloader=dl)
+    with pytest.raises(FirewallError, match="dataset"):
+        _load_test("someone/else", token_for(repo), repo_dir=repo, downloader=dl, verifier=lambda r: [], lister=published(repo))
     assert dl.calls == []
 
 
-def assert_refused(repo, tmp_path, match, token=None):
-    dl = FakeDownloader(tmp_path)
-    with pytest.raises(FirewallError, match=match):
-        _load_test(PINNED[0], token_for(repo) if token is None else token, repo_dir=repo, downloader=dl)
-    assert dl.calls == []
+def test_load_test_default_downloader_cannot_run_in_tests(tmp_path):
+    # Every condition holds, no downloader injected: the conftest guard stops the real fetch.
+    repo = make_repo(tmp_path)
+    with pytest.raises(RuntimeError, match="blocked"):
+        _load_test(PINNED[0], token_for(repo), repo_dir=repo, verifier=lambda r: [], lister=published(repo), frozen_dirs=TEST_DIRS)
 
 
-@pytest.mark.parametrize(
-    "registration",
-    [None, {"osf_id": "abc12"}, {"repo_url": REGISTRATION_REPO_URL}, {"commit": "TAG"}, "https://github.com/aarmens702-hub/jev-benchmark"],
-)
-def test_load_test_rejects_manifest_without_registration(tmp_path, registration):
-    repo = make_repo(tmp_path, registered=False)
-    manifest = json.loads((repo / "manifest.json").read_text())
-    if registration == {"commit": "TAG"}:
-        registration = {"commit": tag_commit(repo)}
-    manifest["registration"] = registration
-    if registration is not None:  # None is the frozen state itself, HEAD at the tag
-        write_manifest(repo / "manifest.json", manifest)
-        git(repo, "commit", "-q", "-am", "registration")
-    assert_refused(repo, tmp_path, "registration")
+# 1. token
 
 
-def test_load_test_rejects_osf_only_manifest(tmp_path):
-    repo = make_repo(tmp_path, registered=False)
-    manifest = json.loads((repo / "manifest.json").read_text())
-    manifest["osf_id"] = "abc12"
-    write_manifest(repo / "manifest.json", manifest)
-    git(repo, "commit", "-q", "-am", "osf id only")
-    assert_refused(repo, tmp_path, "registration")
+@pytest.mark.parametrize("token", ["0" * 64, "", None])
+def test_load_test_rejects_wrong_token(tmp_path, token):
+    assert_refused(make_repo(tmp_path), tmp_path, "token", token=token)
+
+
+# 2. HEAD at the tag
+
+
+def test_load_test_rejects_missing_freeze_tag(tmp_path):
+    repo = make_repo(tmp_path, tag=False)
+    assert_refused(repo, tmp_path, "tag", token="0" * 64)
+
+
+def test_load_test_rejects_head_not_at_freeze_tag(tmp_path):
+    repo = make_repo(tmp_path)
+    token = token_for(repo)
+    (repo / "later.txt").write_text("a later commit\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "after freeze")
+    assert_refused(repo, tmp_path, "HEAD is not at freeze tag", token=token)
+
+
+def test_load_test_rejects_a_moved_tag(tmp_path):
+    # Code changed after the freeze and the tag forced onto it: the public tag still names the old commit.
+    repo = make_repo(tmp_path)
+    frozen_commit = head_of(repo)
+    (repo / "src" / "a.py").write_text("x = 2\n")
+    git(repo, "commit", "-q", "-am", "post-freeze change")
+    git(repo, "tag", "-f", FREEZE_TAG)
+    assert_refused(repo, tmp_path, "public repo's freeze-v1", lister=public_lister(frozen_commit, head_of(repo)))
+
+
+# 3. the tagged manifest
 
 
 @pytest.mark.parametrize(
     "url",
     [
+        None,
         "https://github.com/aarmens702-hub/jev-benchmark/",
         "https://github.com/aarmens702-hub/jev-benchmark.git",
         "http://github.com/aarmens702-hub/jev-benchmark",
@@ -427,146 +504,222 @@ def test_load_test_rejects_osf_only_manifest(tmp_path):
         "",
     ],
 )
-def test_load_test_rejects_a_different_repo_url(tmp_path, url):
-    repo = make_repo(tmp_path, registered=False)
-    register(repo, url=url)
-    assert_refused(repo, tmp_path, "repo_url")
+def test_load_test_rejects_a_different_or_missing_repo_url(tmp_path, url):
+    manifest = {k: v for k, v in FROZEN_MANIFEST.items() if k != "repo_url"}
+    if url is not None:
+        manifest["repo_url"] = url
+    assert_refused(make_repo(tmp_path, manifest=manifest), tmp_path, "repo_url")
 
 
-@pytest.mark.parametrize("which", ["earlier commit", "zeros", "short", "upper", "not a string"])
-def test_load_test_rejects_a_wrong_commit(tmp_path, which):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    git(repo, "init", "-q")
-    (repo / "first.txt").write_text("before the freeze\n")
-    git(repo, "add", "-A")
-    git(repo, "commit", "-q", "-m", "earlier")
-    earlier = git(repo, "rev-parse", "HEAD").strip()
-    write_manifest(repo / "manifest.json", {"files": {}, "registration": None})
-    git(repo, "add", "-A")
-    git(repo, "commit", "-q", "-m", "freeze")
-    git(repo, "tag", FREEZE_TAG)
-    sha = tag_commit(repo)
-    commit = {"earlier commit": earlier, "zeros": "0" * 40, "short": sha[:12], "upper": sha.upper(), "not a string": 123}[which]
-    register(repo, commit=commit)
-    assert_refused(repo, tmp_path, "commit")
+def test_load_test_rejects_osf_only_manifest(tmp_path):
+    manifest = {k: v for k, v in FROZEN_MANIFEST.items() if k != "repo_url"}
+    manifest["osf_id"] = "abc12"
+    assert_refused(make_repo(tmp_path, manifest=manifest), tmp_path, "repo_url")
 
 
-def test_load_test_rejects_registration_commit_that_changes_another_file(tmp_path):
-    repo = make_repo(tmp_path, registered=False)
-    register(repo, commit_it=False)
-    (repo / "a.py").write_text("x = 2\n")
-    git(repo, "commit", "-q", "-am", "registration plus a code change")
-    assert_refused(repo, tmp_path, "HEAD is not at freeze tag")
+def test_load_test_rejects_any_pending_hash(tmp_path):
+    manifest = {**FROZEN_MANIFEST, "train_parquet": {"banking77": {"sha256": "pending"}}}
+    assert_refused(make_repo(tmp_path, manifest=manifest), tmp_path, "pending")
 
 
-def test_load_test_rejects_registration_commit_that_changes_a_frozen_hash(tmp_path):
-    repo = make_repo(tmp_path, registered=False)
-    manifest = register(repo, commit_it=False)
-    manifest["files"]["a.py"] = "f" * 64
-    write_manifest(repo / "manifest.json", manifest)
-    git(repo, "commit", "-q", "-am", "registration plus a changed hash")
-    assert_refused(repo, tmp_path, "more than the manifest's registration")
-
-
-def test_load_test_rejects_registration_two_commits_after_the_tag(tmp_path):
-    repo = make_repo(tmp_path, registered=False)
-    (repo / "notes.txt").write_text("a later commit\n")
-    git(repo, "add", "-A")
-    git(repo, "commit", "-q", "-m", "later")
-    register(repo)
-    assert_refused(repo, tmp_path, "HEAD is not at freeze tag")
-
-
-def test_load_test_rejects_registration_split_over_two_commits(tmp_path):
-    # Both commits touch only the registration, but HEAD's parent is not the tag.
-    repo = make_repo(tmp_path, registered=False)
-    register(repo, commit="0" * 40)
-    register(repo)
-    assert_refused(repo, tmp_path, "HEAD is not at freeze tag")
-
-
-def test_load_test_rejects_uncommitted_registration(tmp_path):
-    repo = make_repo(tmp_path, registered=False)
-    register(repo, commit_it=False)
-    assert_refused(repo, tmp_path, "dirty|clean")
-
-
-def test_load_test_rejects_frozen_manifest_with_registration_already_set(tmp_path):
-    # A registration in the tagged manifest can never name its own commit; refuse any non-null value there.
-    repo = make_repo(tmp_path, manifest={"files": {}, "registration": {"repo_url": REGISTRATION_REPO_URL, "commit": "0" * 40}})
-    register(repo)
-    assert_refused(repo, tmp_path, "registration null")
-
-
-def test_registered_repo_token_equals_sha256_of_tagged_manifest(tmp_path):
+def test_load_test_rejects_a_manifest_that_does_not_verify(tmp_path):
     repo = make_repo(tmp_path)
-    tagged = subprocess.run(["git", "show", f"{FREEZE_TAG}:manifest.json"], cwd=repo, capture_output=True, check=True).stdout
-    assert token_for(repo) == hashlib.sha256(tagged).hexdigest() == manifest_hash(json.loads(tagged))
+    seen = []
+
+    def verifier(r):
+        seen.append(Path(r))
+        return ["files.src/a.py: changed"]
+
+    assert_refused(repo, tmp_path, "does not verify", verifier=verifier)
+    assert seen == [repo]
 
 
-def test_load_test_rejects_dirty_tree(tmp_path):
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"repo_url": "https://github.com/aarmens702-hub/jev-benchmark"}',  # not indented
+        b'{\n  "a": 1,\n  "a": 2,\n  "repo_url": "https://github.com/aarmens702-hub/jev-benchmark"\n}\n',  # duplicate keys
+        b"[]\n",
+        b"not json",
+    ],
+)
+def test_load_test_rejects_non_canonical_tagged_manifest(tmp_path, raw):
+    repo = make_repo(tmp_path, tag=False)
+    (repo / "manifest.json").write_bytes(raw)
+    git(repo, "commit", "-q", "-am", "bad manifest")
+    git(repo, "tag", FREEZE_TAG)
+    assert_refused(repo, tmp_path, "manifest")
+
+
+def test_load_test_rejects_a_symlinked_manifest(tmp_path):
+    repo = make_repo(tmp_path, tag=False)
+    (repo / "runs").mkdir()
+    (repo / "manifest.json").rename(repo / "runs" / "m.json")
+    (repo / "manifest.json").symlink_to("runs/m.json")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "symlink")
+    git(repo, "tag", FREEZE_TAG)
+    assert_refused(repo, tmp_path, "manifest")
+
+
+# 4. clean tree, nothing hidden from git
+
+
+def test_load_test_rejects_dirty_tracked_file(tmp_path):
+    repo = make_repo(tmp_path)
+    (repo / "src" / "a.py").write_text("x = 9\n")
+    assert_refused(repo, tmp_path, "dirty")
+
+
+def test_load_test_rejects_untracked_file(tmp_path):
     repo = make_repo(tmp_path)
     (repo / "scratch.txt").write_text("untracked change")
-    dl = FakeDownloader(tmp_path)
-    with pytest.raises(FirewallError, match="dirty|clean"):
-        _load_test(PINNED[0], token_for(repo), repo_dir=repo, downloader=dl)
-    assert dl.calls == []
+    assert_refused(repo, tmp_path, "dirty")
 
 
-def test_load_test_rejects_head_not_at_freeze_tag(tmp_path):
+@pytest.mark.parametrize("flag", ["--skip-worktree", "--assume-unchanged"])
+def test_load_test_rejects_hidden_index_edits(tmp_path, flag):
     repo = make_repo(tmp_path)
-    (repo / "later.txt").write_text("a later commit")
-    git(repo, "add", "-A")
-    git(repo, "commit", "-q", "-m", "after freeze")
-    dl = FakeDownloader(tmp_path)
-    with pytest.raises(FirewallError, match="tag"):
-        _load_test(PINNED[0], token_for(repo), repo_dir=repo, downloader=dl)
-    assert dl.calls == []
+    git(repo, "update-index", flag, "src/a.py")
+    (repo / "src" / "a.py").write_text("x = 666\n")
+    assert_refused(repo, tmp_path, "assume-unchanged or skip-worktree")
 
 
-def test_load_test_rejects_missing_freeze_tag(tmp_path):
-    repo = make_repo(tmp_path, tag=False)
-    dl = FakeDownloader(tmp_path)
-    with pytest.raises(FirewallError, match="tag"):
-        _load_test(PINNED[0], token_for(repo), repo_dir=repo, downloader=dl)
-    assert dl.calls == []
-
-
-def test_load_test_rejects_unknown_dataset(tmp_path):
+def test_load_test_rejects_show_untracked_files_no(tmp_path):
     repo = make_repo(tmp_path)
-    dl = FakeDownloader(tmp_path)
-    with pytest.raises(FirewallError, match="dataset"):
-        _load_test("someone/else", token_for(repo), repo_dir=repo, downloader=dl)
-    assert dl.calls == []
+    git(repo, "config", "status.showUntrackedFiles", "no")
+    (repo / "evil.py").write_text("print(1)\n")
+    assert_refused(repo, tmp_path, "dirty")
 
 
-def test_load_test_default_downloader_cannot_run_in_tests(tmp_path):
-    # All four conditions hold, no downloader injected: the conftest guard stops the real fetch.
+def test_load_test_rejects_file_hidden_by_info_exclude(tmp_path):
     repo = make_repo(tmp_path)
-    with pytest.raises(RuntimeError, match="blocked"):
-        _load_test(PINNED[0], token_for(repo), repo_dir=repo)
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "exclude").write_text("evil2.py\n")
+    (repo / "evil2.py").write_text("print(2)\n")
+    assert_refused(repo, tmp_path, "not ignored by .gitignore")
 
 
-@pytest.mark.parametrize("dataset", PINNED)
-def test_load_test_success_splits_text_from_gold(tmp_path, dataset):
+def test_load_test_rejects_ignored_file_inside_a_frozen_folder(tmp_path):
     repo = make_repo(tmp_path)
-    dl = FakeDownloader(tmp_path)
-    texts, gold = _load_test(dataset, token_for(repo), repo_dir=repo, downloader=dl)
-    assert list(texts.columns) == ["row_id", "text"]
-    assert list(gold.columns) == ["row_id", "label"]
-    assert texts["row_id"].tolist() == gold["row_id"].tolist() == [0, 1, 2]
-    assert texts["text"].tolist() == ["alpha", "beta", "gamma"]
-    assert gold["label"].tolist() == [2, 0, 1]
-    assert [(c[0], c[2]) for c in dl.calls] == [(dataset, firewall.PINNED_TEST_FILES[dataset]["revision"])]
+    (repo / "src" / "debug.log").write_text("ignored by *.log\n")
+    assert_refused(repo, tmp_path, "ignored files inside frozen folders")
+    (repo / "src" / "debug.log").unlink()
+    (repo / "src" / "__pycache__").mkdir()
+    (repo / "src" / "__pycache__" / "evil.cpython-312.pyc").write_bytes(b"\0")  # no tracked evil.py
+    assert_refused(repo, tmp_path, "ignored files inside frozen folders")
 
 
-@pytest.mark.parametrize("short,full", [("banking77", PINNED[0]), ("ag_news", PINNED[1])])
-def test_load_test_accepts_short_dataset_names(tmp_path, short, full):
+def test_load_test_ignores_git_dir_and_work_tree_variables(tmp_path, monkeypatch):
     repo = make_repo(tmp_path)
-    dl = FakeDownloader(tmp_path)
-    _load_test(short, token_for(repo), repo_dir=repo, downloader=dl)
-    assert dl.calls[0][0] == full
+    clean = tmp_path / "clean"
+    subprocess.run(["git", "clone", "-q", str(repo), str(clean)], check=True, capture_output=True)
+    (repo / "src" / "a.py").write_text("x = 999\n")  # the real tree is dirty
+    monkeypatch.setenv("GIT_DIR", str(clean / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(clean))
+    assert_refused(repo, tmp_path, "dirty")
+
+
+def test_load_test_rejects_core_worktree_redirect(tmp_path):
+    repo = make_repo(tmp_path)
+    other = tmp_path / "other"
+    other.mkdir()
+    git(repo, "config", "core.worktree", str(other))
+    assert_refused(repo, tmp_path, "top level")
+
+
+def test_load_test_rejects_a_subdirectory_as_repo(tmp_path):
+    repo = make_repo(tmp_path)
+    assert_refused(repo / "src", tmp_path, "top level", token="0" * 64)
+
+
+def test_load_test_rejects_git_replace(tmp_path):
+    repo = make_repo(tmp_path)
+    frozen_commit = head_of(repo)
+    git(repo, "checkout", "-q", "-b", "x")
+    (repo / "src" / "a.py").write_text("x = 3\n")
+    git(repo, "commit", "-q", "-am", "evil")
+    evil = head_of(repo)
+    git(repo, "checkout", "-q", "--detach", frozen_commit)
+    git(repo, "replace", frozen_commit, evil)
+    git(repo, "reset", "-q", "--hard")
+    assert_refused(repo, tmp_path, "replace", lister=public_lister(frozen_commit, frozen_commit))
+
+
+# 5. the public repo
+
+
+def test_load_test_rejects_when_the_repo_is_not_public(tmp_path):
+    repo = make_repo(tmp_path)
+
+    def private(url, refs):
+        raise FirewallError("git ls-remote failed: is the repo public?")
+
+    assert_refused(repo, tmp_path, "public", lister=private)
+
+
+def test_load_test_rejects_public_main_not_at_head(tmp_path):
+    repo = make_repo(tmp_path)
+    assert_refused(repo, tmp_path, "main", lister=public_lister(head_of(repo), "1" * 40))
+
+
+def test_load_test_rejects_annotated_public_tag_without_peeled_commit(tmp_path):
+    repo = make_repo(tmp_path, annotated=True)
+    tag_object = git(repo, "rev-parse", f"refs/tags/{FREEZE_TAG}").strip()
+    assert_refused(repo, tmp_path, "public repo's freeze-v1", lister=public_lister(tag_object, head_of(repo)))
+
+
+def test_check_public_reads_exact_ref_names_only():
+    head = "a" * 40
+    tricky = f"{head}\trefs/heads/x/refs/heads/main\n{head}\trefs/tags/x/refs/tags/{FREEZE_TAG}\n"
+    with pytest.raises(FirewallError):
+        firewall.check_public(head, lister=lambda url, refs: tricky)
+    firewall.check_public(head, lister=public_lister(head, head))
+
+
+def test_ls_remote_is_credential_free_and_outside_the_repo(monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen.update(cmd=cmd, **kw)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setenv("GIT_ASKPASS", "/bin/echo")
+    monkeypatch.setattr(firewall.subprocess, "run", fake_run)
+    firewall.ls_remote(REGISTRATION_REPO_URL, ["refs/heads/main"])
+    assert seen["cmd"][:3] == ["git", "-c", "credential.helper="]
+    assert REGISTRATION_REPO_URL in seen["cmd"] and "ls-remote" in seen["cmd"]
+    env = seen["env"]
+    assert env["GIT_TERMINAL_PROMPT"] == "0" and env["GIT_CONFIG_GLOBAL"] == os.devnull and env["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert "GIT_ASKPASS" not in env
+    assert Path(seen["cwd"]).resolve() != REPO.resolve() and seen["timeout"] > 0
+
+
+# --------------------------------------------------------------------------- cached gold
+
+
+def test_gold_cache_round_trip_and_never_overwrites(tmp_path):
+    gold = pd.DataFrame({"row_id": [0, 1, 2], "label": [2, 0, 1]})
+    firewall.cache_gold("banking77", gold, tmp_path)
+    assert firewall.read_cached_gold("PolyAI/banking77", tmp_path).equals(gold)
+    with pytest.raises(FirewallError, match="never overwritten"):
+        firewall.cache_gold("banking77", gold, tmp_path)
+
+
+def test_gold_cache_detects_tampering_and_bad_input(tmp_path):
+    firewall.cache_gold("ag_news", pd.DataFrame({"row_id": [0], "label": [3]}), tmp_path)
+    path = next(tmp_path.glob("*.gold.json"))
+    path.write_text(path.read_text().replace("3", "2"))
+    with pytest.raises(FirewallError, match="SHA-256"):
+        firewall.read_cached_gold("ag_news", tmp_path)
+    with pytest.raises(FirewallError, match="no cached gold"):
+        firewall.read_cached_gold("banking77", tmp_path)
+    with pytest.raises(FirewallError, match="columns"):
+        firewall.cache_gold("banking77", pd.DataFrame({"row_id": [0], "label": [1], "text": ["x"]}), tmp_path)
+
+
+def test_gold_cache_lives_in_gitignored_runs():
+    assert firewall.GOLD_CACHE.relative_to(REPO).parts[0] == "runs"
 
 
 def test_pinned_revisions_match_design():

@@ -4,10 +4,10 @@ This is the pre-registration for a small benchmark of Jev, a decision model serv
 
 ## How this registration works
 
-- The record is this public GitHub repository, https://github.com/aarmens702-hub/jev-benchmark, at the tag `freeze-v1`.
-- `manifest.json` at that tag holds the SHA-256 of every frozen input: code, lock file, label text, prompts, routing rules, seeds, thresholds, model ids and the pinned train files. `scripts/freeze.sh --verify` recomputes every hash and lists any difference.
-- A commit cannot contain its own SHA, so one commit directly on top of the tag fills in the manifest's registration field: the repo URL and the full commit SHA of `freeze-v1`. That field is left out of the manifest's own hash, so filling it changes no frozen value. The test loader refuses to run unless that registration is present and matches the tag.
-- The repo was private while it was built and becomes public at the freeze. There was no OSF registration (see Deviations).
+- The record is this public GitHub repository, https://github.com/aarmens702-hub/jev-benchmark, at the tag `freeze-v1`. The repo was private while it was built and became public at the freeze. There was no OSF registration (see Deviations).
+- `manifest.json` at that tag records the repo URL and holds the SHA-256 of every frozen input file: code, tests, lock file, label text, prompts, routing rules, Stage 0's outputs, these documents, and the pinned train files. The routing rule fingerprint is recorded too. Seeds, thresholds and model ids are recorded as values, not hashed; the files that hold them are hashed. `scripts/freeze.sh --verify` recomputes everything and lists any difference.
+- The tag records the commit. A commit cannot contain its own SHA, so the manifest names the repo and the public tag names the commit.
+- The test loader (`src/firewall.py`) refuses to load test data unless all of these hold: the token equals the SHA-256 of `manifest.json` at the tag; HEAD is the tagged commit; the tagged manifest names this repo, has no pending hash and verifies against the tree, the code's settings and the train files; the tree is clean, with nothing hidden from git; and the public repo, read without credentials, shows the tag and `main` at that same commit. The last check only passes once the repo is public.
 - The rules below are quoted from DESIGN.md and VALIDATION.md at the same tag. If anything here reads differently, those two files govern.
 - Registration prevents later changes. It does not make the design blind: the analyst read prior results before setting it (see Disclosure).
 
@@ -19,7 +19,11 @@ AI help was used to build the code and to draft this document.
 
 ## Why
 
-A reply on LinkedIn to a comment about Jev made this claim, verbatim: "zeroshot NLI, embedding based classifiers and constrained output models already support dynamic classification without task specific retraining." It asked, verbatim: "The more interesting comparison would be Jev versus optimized lightweight classifiers, measuring cost, latency, calibration, and accuracy at equivalent automation coverage. What fundamentally new capability does Jev introduce beyond those existing approaches?" This study answers with a public, pre-registered test, and the results are published whatever they show.
+A senior ML engineer replied on LinkedIn to Aarmen's comment on a post about Jev. This study answers him with a public, pre-registered test, and publishes whatever it shows.
+
+His claim, verbatim: "zeroshot NLI, embedding based classifiers and constrained output models already support dynamic classification without task specific retraining." His request, verbatim: "The more interesting comparison would be Jev versus optimized lightweight classifiers, measuring cost, latency, calibration, and accuracy at equivalent automation coverage. What fundamentally new capability does Jev introduce beyond those existing approaches?"
+
+Aarmen's comment, verbatim: "I think calling it a "rebranded classifier" is a bit of an overstatement. A traditional classifier is trained on fixed labels for one task. Jev gets the options when you call it, so one model can route requests or filter out irrelevant docs without being retrained. It also gives you a confidence score, so you only send the uncertain cases up to the LLM. Most agent stacks today send every routing decision to an LLM, paying for a full reasoning call to do what is essentially a classification. Jev is built as a decision model that can make the same call for a lot less and at lower latency."
 
 ## Question
 
@@ -175,11 +179,11 @@ From VALIDATION.md, "What stops the project":
 - **Halt spending:** projected spend passes the cap. Mark the rest as not run.
 - **Never:** change anything frozen after Stage 1 starts without a deviations row and a statement in the post.
 
-**Test firewall.** See VALIDATION.md. Test files are not on disk until the freeze. All predictions are written before any gold label is read. Once the test stage starts, stopping cannot depend on results, and every skipped run goes in the deviations table with its reason. `src/firewall.py` is the only module that may load test data, and it refuses unless the token matches the frozen manifest, the manifest holds this registration, the git tree is clean, and HEAD is at the freeze tag or its registration commit. The scorer runs once and writes `scored.lock`; rerunning it needs a new deviations row.
+**Test firewall.** See VALIDATION.md. Test files are not on disk until the freeze. All predictions are written before any gold label is read. Once the test stage starts, stopping cannot depend on results, and every skipped run goes in the deviations table with its reason. `src/firewall.py` is the only module that may load test data, under the conditions listed at the top of this document. The scorer runs once and writes `scored.lock`; rerunning it needs a new deviations row.
 
 ## Budget
 
-Hard cap CA$10 (about US$7.15 at 1.3994), everything included, enforced in code. Stage 0, before the freeze and on validation rows only, was capped at US$0.50 and spent US$0.146. Projected Stage 1 spend from measured tokens is US$1.60 with the 5.5% credit fee (about CA$2.23), routing excluded.
+Hard cap CA$10 (about US$7.15 at 1.3994), everything included, enforced by a limit on the key and in code. Stage 0, before the freeze and on validation rows only, was capped at US$0.50 and spent US$0.146. Projected Stage 1 spend from measured tokens is US$1.60 with the 5.5% credit fee (about CA$2.23), routing excluded.
 
 - **Stage 1, after freeze, approved all at once, in order:** Jev Banking77; Jev AG News; Jev + examples; routing; small LLM Banking77; small LLM AG News; Jev bare-name runs.
 
@@ -198,7 +202,7 @@ All four were decided and written into DESIGN.md before the freeze, before any t
 1. **Small LLM candidates replaced.** The first candidates, openai/gpt-oss-20b on Darkbloom and z-ai/glm-5.3-flash on Wafer, returned HTTP 400 "Reasoning is mandatory for this endpoint and cannot be disabled" in Stage 0, so neither could run with reasoning off. They were replaced by mistralai/mistral-nemo on DekaLLM, mistralai/mistral-small-3.2-24b-instruct on Parasail and meta-llama/llama-3.1-8b-instruct on CoreWeave, tried cheapest first with no reasoning field. Selection used no labels and picked mistralai/mistral-nemo on DekaLLM.
 2. **LR-CV folds.** Embedding LR-CV picks C by stratified k-fold inside the bank with k = min(s, 5), not leave-one-out, because leave-one-out could take many hours on the Mac. It is a secondary arm, and it uses no outside labels either way.
 3. **AG News descriptions read literally.** The descriptions are the literal text in the file, because a YAML flow mapping cuts each at its first comma. The upstream loader does cut them, so this study's AG News label text differs from the upstream repo's.
-4. **Registration by public GitHub repo instead of OSF.** Aarmen's decision on 2026-11-05. The registration is this repo made public at the tag `freeze-v1`, with the manifest recording the repo URL and tagged commit.
+4. **Registration by public GitHub repo instead of OSF.** Aarmen's decision on 2026-11-05. The registration is this repo made public at the tag `freeze-v1`, with the manifest at the tag recording the repo URL and the public tag recording the commit.
 
 Any later change to a frozen input gets a row in `deviations.md` and a statement in the post.
 

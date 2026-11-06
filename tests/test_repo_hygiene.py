@@ -9,7 +9,6 @@ REPO = Path(__file__).resolve().parents[1]
 
 # An OpenRouter key is sk-or-v1- and 64 hex characters. Flag the prefix followed by 32 or more letters or digits.
 KEY_LIKE = re.compile(r"sk-or-v1-([A-Za-z0-9]{32,})")
-TOKEN_TAIL = re.compile(r"[A-Za-z0-9_-]*")
 REPEATED = re.compile(r"(.{1,8})\1{3,}")
 
 
@@ -23,14 +22,14 @@ def commit_candidates(repo=REPO):
     return sorted(f for f in out.split("\0") if f and (Path(repo) / f).is_file())
 
 
-def is_fake(match: re.Match, text: str) -> bool:
-    """A clearly fake fixture: the whole token says FAKE or TEST, or its key part is one short unit repeated."""
-    token = text[match.start():match.start() + len("sk-or-v1-")] + TOKEN_TAIL.match(text, match.start() + len("sk-or-v1-")).group()
-    return "FAKE" in token or "TEST" in token or REPEATED.fullmatch(match.group(1)) is not None
+def is_fake(match: re.Match) -> bool:
+    """A clearly fake fixture: the matched key part itself says FAKE or TEST, or is one short unit repeated."""
+    key = match.group(1)
+    return "FAKE" in key or "TEST" in key or REPEATED.fullmatch(key) is not None
 
 
 def key_like_hits(text: str) -> list[str]:
-    return [m.group(0)[:14] + "..." for m in KEY_LIKE.finditer(text) if not is_fake(m, text)]
+    return [m.group(0)[:14] + "..." for m in KEY_LIKE.finditer(text) if not is_fake(m)]
 
 
 def real_looking_keys(repo=REPO) -> list[str]:
@@ -66,6 +65,8 @@ PREFIX = "sk-or" + "-v1-"
         'OPENROUTER_API_KEY="' + PREFIX + _fake_hex(64) + '"',
         '{"key": "' + PREFIX + "Zq8" + _fake_hex(40) + '"}',
         "Authorization: Bearer " + PREFIX + _fake_hex(48).upper(),
+        PREFIX + _fake_hex(64) + "-FAKE",  # FAKE outside the matched key does not excuse it
+        "TEST " + PREFIX + _fake_hex(64),
     ],
 )
 def test_key_scan_flags_real_looking_keys(text):
