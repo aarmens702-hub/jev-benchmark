@@ -1601,16 +1601,20 @@ def paid(tmp_path, monkeypatch):
     ledger_path = tmp_path / "home" / ".jev-benchmark" / "ledger.jsonl"
     monkeypatch.setenv(openrouter.TEST_LEDGER_ENV, str(ledger_path))
     monkeypatch.setattr(secrets_mac, "read_key", lambda: FAKE_KEY)
-    state = {"usage": 0.0, "posts": [], "gets": 0, "headers": [], "path": ledger_path, "cost": 0.0001}
+    # usage is what the key has been billed; lag is how much of it has not posted yet; billed is the
+    # factor OpenRouter bills over the cost it reports; reply, if set, replaces the answer.
+    state = {"usage": 0.0, "posts": [], "gets": 0, "headers": [], "path": ledger_path, "cost": 0.0001, "lag": 0.0, "billed": 1.0, "reply": None}
 
     def handler(request):
         state["headers"].append(request.headers.get("authorization"))
         if request.method == "GET":
             state["gets"] += 1
-            return httpx.Response(200, json={"data": {"usage": state["usage"]}})
+            return httpx.Response(200, json={"data": {"usage": max(0.0, state["usage"] - state["lag"])}})
         body = json.loads(request.content)
         state["posts"].append(body)
-        state["usage"] += state["cost"]
+        if state["reply"] is not None:
+            return state["reply"](body)
+        state["usage"] += state["cost"] * state["billed"]
         return httpx.Response(200, content=jev_ok(body, cost=state["cost"]).body)
 
     real_client = httpx.Client
@@ -1717,11 +1721,14 @@ def test_starting_key_usage_can_only_be_accepted_explicitly_and_by_amount(paid):
     with pytest.raises(openrouter.LedgerMismatch):
         build_client("stage0", sleep=no_sleep, accept_key_usage_usd=0.10)  # too small to cover it
     client = build_client("stage0", sleep=no_sleep, accept_key_usage_usd=0.49)
-    assert client.ledger.baseline() == 0.49
-    assert client.ledger.remaining() == pytest.approx(0.50)
+    # The accepted spend is in the ledger, against the total and the stage: it is not a fresh start.
+    assert client.ledger.baseline() == 0.0 and client.ledger.baseline_observed() == 0.49
+    assert client.ledger.spent() == pytest.approx(0.49) and client.ledger.stage_spent() == pytest.approx(0.49)
+    assert client.ledger.remaining() == pytest.approx(0.01)
     entries = [json.loads(line) for line in paid["path"].read_text().splitlines()]
+    assert [e["kind"] for e in entries] == ["baseline", "charge"]
     assert entries[0]["meta"]["accepted_usd"] == 0.49
-    # Once a baseline exists there is nothing left to accept.
+    # Once the ledger agrees with the key there is nothing left to accept.
     with pytest.raises(ValueError, match="baseline"):
         build_client("stage0", sleep=no_sleep, accept_key_usage_usd=0.49)
 
@@ -1750,6 +1757,13 @@ def test_key_usage_below_baseline_means_a_different_key(paid):
     paid["usage"] = 0.10  # all-time usage cannot fall
     with pytest.raises(openrouter.LedgerMismatch, match="different key"):
         build_client("stage0", sleep=no_sleep)
+
+    # Without an accepted amount the baseline is the usage seen at the first start; a dip within the floor is noise.
+    paid["path"].unlink()
+    paid["usage"] = 0.008
+    build_client("stage0", sleep=no_sleep)
+    paid["usage"] = 0.0
+    build_client("stage0", sleep=no_sleep)  # within the floor
 
 
 def test_paid_ledger_with_spend_but_no_baseline_refuses(paid):
@@ -2169,6 +2183,9 @@ def test_key_echoed_in_reply_fields_reaches_no_output(tmp_path, caplog, make_han
     "bad",
     [
         "", "x" * 81, "has space", "new\nline", "quote\"", "sk-abc", "SK-abc", "a/sk-abc", "a:sk-abc", "a.sk-abc", 7, None, ["a"],
+        # Fix round 2 (attack4): sk- anywhere, not only at the start of a segment, and a bare secret.
+        "t/a-" + LONG_KEY, "t/a_" + LONG_KEY, "t/1" + LONG_KEY, "a" + LONG_KEY, "ask-or-v1-abc", "task-model", "x/mask-1",
+        "ab" * 32, "AB" * 32, "x/" + "0" * 32, "m-" + "f" * 32 + "-z", "sk-or-", "SK-OR-v1",
     ],
 )
 def test_safe_name_refuses(bad):
@@ -2176,7 +2193,14 @@ def test_safe_name_refuses(bad):
         openrouter.safe_name(bad, "model")
 
 
-@pytest.mark.parametrize("good", ["typesafe/jev-1.14-20261014", "TypeSafe", "z-ai/glm-5.3-flash:nitro", "task-model", "x" * 80])
+@pytest.mark.parametrize(
+    "good",
+    [
+        "openai/gpt-oss-20b", "z-ai/glm-5.3-flash", "typesafe/jev-1.14-20261014", "Darkbloom", "Wafer",
+        "TypeSafe", "z-ai/glm-5.3-flash:nitro", "openai/gpt-4o-mini-2024-07-18", "deepseek/deepseek-r1:free", "x" * 80,
+        "m-" + "f" * 31 + "-z",  # a hex run one short of the limit
+    ],
+)
 def test_safe_name_allows(good):
     assert openrouter.safe_name(good, "model") == good
 
@@ -2285,3 +2309,251 @@ def test_documented_empty_reasoning_fields_are_allowed(tmp_path, details):
     client, _, _, _ = make_client(tmp_path, handler)
     assert llm_pick("r0", "t", OPTIONS, "openai/gpt-oss-20b", "Darkbloom", client=client).failed is False
     assert client.stop is None
+
+
+# ------------------------------------------------------------------ fix round 2, N1: excess, accepted usage
+
+
+def private(paid, name):
+    return paid["path"].parent / "runs" / "private" / f"{name}.jsonl"
+
+
+def test_recorded_excess_does_not_block_a_later_paid_start(paid):
+    """attack7: billed 0.003 a call against a reported 0.002. The gap stops the arm and stays counted as excess."""
+    paid["cost"], paid["billed"] = 0.002, 1.5
+    client = build_client("stage0", sleep=no_sleep)
+    report = run_arm(rows(20), jev_decider(client), client=client, results_path=private(paid, "fee"), expected_per_row=0.002)
+    assert report.stop_type == "ReconciliationGap"
+    assert client.ledger.spent() == pytest.approx(0.04) and client.ledger.excess() == pytest.approx(0.02)
+
+    # The excess is already held against the caps, so a restart agrees with the key and may send.
+    again = build_client("stage0", sleep=no_sleep)
+    assert again.ledger.remaining() == pytest.approx(0.50 - 0.06)
+    # Nothing is left to accept, so an accepted amount is refused rather than charged.
+    with pytest.raises(ValueError, match="nothing to accept"):
+        build_client("stage0", sleep=no_sleep, accept_key_usage_usd=0.02)
+
+    # Spend outside the ledger beyond the excess is still caught.
+    paid["usage"] += 0.05
+    with pytest.raises(openrouter.LedgerMismatch, match="0.05"):
+        build_client("stage0", sleep=no_sleep)
+
+
+def test_accepting_spend_outside_an_existing_ledger_charges_it_and_never_resets(paid):
+    client = build_client("stage0", sleep=no_sleep)
+    paid["cost"] = 0.1
+    run_arm(rows(2), jev_decider(client), client=client, results_path=private(paid, "a"), expected_per_row=0.1)
+    assert client.ledger.spent() == pytest.approx(0.2)
+    paid["usage"] += 0.15  # spend outside the ledger
+    with pytest.raises(openrouter.LedgerMismatch):
+        build_client("stage0", sleep=no_sleep)
+    with pytest.raises(openrouter.LedgerMismatch, match="cover"):
+        build_client("stage0", sleep=no_sleep, accept_key_usage_usd=0.135)  # 10% short: not within a cent
+    after = build_client("stage0", sleep=no_sleep, accept_key_usage_usd=0.15)
+    assert after.ledger.baseline() == 0.0  # the baseline is untouched
+    assert after.ledger.spent() == pytest.approx(0.35) and after.ledger.stage_spent() == pytest.approx(0.35)
+    assert after.ledger.remaining() == pytest.approx(0.15)
+    build_client("stage0", sleep=no_sleep)  # and the books now agree
+
+
+@pytest.mark.parametrize("accept", [math.nan, math.inf, -math.inf, -5, -0.01, "0.49", True])
+def test_accepted_usage_must_be_a_finite_amount_of_zero_or_more(paid, accept):
+    paid["usage"] = 0.49
+    with pytest.raises(ValueError, match="finite"):
+        build_client("stage0", sleep=no_sleep, accept_key_usage_usd=accept)
+    assert Ledger(paid["path"], stage="stage0").is_empty()
+    assert paid["posts"] == []
+
+
+def test_accepted_usage_must_cover_the_key_to_within_a_cent(paid):
+    paid["usage"] = 0.40
+    for short in (0.9 * 0.40, 0.36, 0.389):
+        with pytest.raises(openrouter.LedgerMismatch, match="cover"):
+            build_client("stage0", sleep=no_sleep, accept_key_usage_usd=short)
+    assert Ledger(paid["path"], stage="stage0").is_empty()
+    client = build_client("stage0", sleep=no_sleep, accept_key_usage_usd=0.391)
+    assert client.ledger.spent() == pytest.approx(0.40)  # charged at the larger of the accepted and the shown amount
+
+
+def test_lost_ledger_then_accept_does_not_give_the_stage_a_fresh_cap(paid):
+    """attack3 C: spend 0.40, delete the ledger, accept. Stage 0 has 0.10 left, not a new 0.50."""
+    paid["cost"] = 0.2
+    client = build_client("stage0", sleep=no_sleep)
+    report = run_arm(rows(2), jev_decider(client), client=client, results_path=private(paid, "a"), expected_per_row=0.2)
+    assert report.status == "complete" and paid["usage"] == pytest.approx(0.40)
+    paid["path"].unlink()
+    with pytest.raises(openrouter.LedgerMismatch):
+        build_client("stage0", sleep=no_sleep)
+    client = build_client("stage0", sleep=no_sleep, accept_key_usage_usd=0.40)
+    assert client.ledger.remaining() == pytest.approx(0.10)
+    report = run_arm(rows(3), jev_decider(client), client=client, results_path=private(paid, "b"), expected_per_row=0.2)
+    assert report.status == "refused" and len(paid["posts"]) == 2
+    # Stage 1 counts it against the total too.
+    assert build_client("stage1", sleep=no_sleep).ledger.remaining() == pytest.approx(7.15 - 0.40)
+
+
+# ------------------------------------------------------------------ fix round 2, N2: late usage, arms on one client
+
+
+def test_earlier_arms_spend_posting_late_is_not_read_as_overbilling(paid):
+    """attack6: arm 1's last 0.016 posts while arm 2 runs on a new client. Arm 2 must not stop."""
+    paid["cost"] = 0.002
+    sleeps = []
+    client = build_client("stage0", sleep=sleeps.append)
+    paid["lag"] = 0.016  # within 10% of arm 1's 0.20
+    report = run_arm(rows(100), jev_decider(client), client=client, results_path=private(paid, "a"), expected_per_row=0.002)
+    assert report.status == "complete"
+
+    client = build_client("stage0", sleep=sleeps.append)  # starts while 0.016 is still unposted
+    paid["lag"] = 0.0
+    report = run_arm(rows(20), jev_decider(client), client=client, results_path=private(paid, "b"), expected_per_row=0.002)
+    assert report.status == "complete", report.reason
+    assert client.ledger.excess() == 0.0
+
+    # Being billed more than the ledger is still caught at once, with no wait.
+    paid["billed"] = 2.0
+    client = build_client("stage0", sleep=sleeps.append)
+    report = run_arm(rows(20), jev_decider(client), client=client, results_path=private(paid, "c"), expected_per_row=0.002)
+    assert report.stop_type == "ReconciliationGap"
+    assert sleeps == []
+
+
+def test_unposted_spend_at_start_waits_out_the_grace_like_any_lag(paid):
+    paid["cost"] = 0.002
+    client = build_client("stage0", sleep=no_sleep)
+    run_arm(rows(50), jev_decider(client), client=client, results_path=private(paid, "a"), expected_per_row=0.002)
+    paid["lag"] = 0.05  # none of arm 1 has posted when arm 2's client starts
+    sleeps = []
+    client = build_client("stage0", sleep=lambda s: (sleeps.append(s), paid.update(lag=0.0)))
+    report = run_arm(rows(10), jev_decider(client), client=client, results_path=private(paid, "b"), expected_per_row=0.002)
+    assert report.status == "complete", report.reason
+    assert sleeps == [openrouter.DEFAULT_RECONCILE_GRACE_SECONDS]
+
+
+def test_earlier_estimates_that_were_never_billed_do_not_stop_the_next_client(paid):
+    """529s are charged at an estimate. If they were not billed, the next client must not read that as a gap."""
+    paid["reply"] = lambda body: httpx.Response(529)
+    client = build_client("stage0", sleep=no_sleep)
+    report = run_arm(rows(12), jev_decider(client), client=client, results_path=private(paid, "a"), expected_per_row=0.0001)
+    assert report.stop_type == "ConsecutiveFailures"
+    assert client.ledger.spent() >= 0.04 and client.ledger.confirmed() == 0.0 and paid["usage"] == 0.0  # 4 attempts a row at 0.001
+
+    paid["reply"] = None
+    client = build_client("stage0", sleep=no_sleep)
+    report = run_arm(rows(5), jev_decider(client), client=client, results_path=private(paid, "b"), expected_per_row=0.0001)
+    assert report.status == "complete", report.reason
+
+
+def test_earlier_estimates_that_were_billed_may_post_late_without_a_stop(paid):
+    def billed_529(body):
+        paid["usage"] += 0.001
+        return httpx.Response(529)
+
+    paid["reply"] = billed_529
+    client = build_client("stage0", sleep=no_sleep)
+    run_arm(rows(12), jev_decider(client), client=client, results_path=private(paid, "a"), expected_per_row=0.0001)
+    estimated = client.ledger.spent()
+    assert estimated == pytest.approx(paid["usage"]) and client.ledger.confirmed() == 0.0
+
+    paid["reply"], paid["lag"] = None, estimated  # none of it has posted when the next client starts
+    client = build_client("stage0", sleep=no_sleep)
+    paid["lag"] = 0.0  # it all posts during the next arm
+    report = run_arm(rows(5), jev_decider(client), client=client, results_path=private(paid, "b"), expected_per_row=0.0001)
+    assert report.status == "complete", report.reason
+
+
+def test_one_client_runs_the_jev_arm_then_the_llm_arm(tmp_path):
+    """attack3 B: the model pin and the stop are per arm, so one client can run both arms in turn."""
+
+    def handler(body, n):
+        return jev_ok(body) if "questions" in body else llm_ok(body)
+
+    client, transport, _, _ = make_client(tmp_path, handler)
+    first = run_arm(rows(3), jev_decider(client), client=client, results_path=tmp_path / "runs" / "private" / "jev.jsonl")
+    second = run_arm(rows(3), llm_decider(client), client=client, results_path=tmp_path / "runs" / "private" / "llm.jsonl")
+    assert first.status == "complete" and second.status == "complete", second.reason
+    assert {d.model for d in first.decisions.values()} == {BUILD}
+    assert {d.model for d in second.decisions.values()} == {"openai/gpt-oss-20b"}
+    assert len(transport.calls) == 6
+
+
+def test_each_arm_seeds_its_pin_from_its_own_saved_rows(tmp_path):
+    other = "typesafe/jev-1.14-20270101"
+    model = {"name": BUILD}
+    client, transport, _, _ = make_client(tmp_path, lambda body, n: jev_ok(body, model=model["name"]))
+    path_a, path_b = tmp_path / "runs" / "private" / "a.jsonl", tmp_path / "runs" / "private" / "b.jsonl"
+    assert run_arm(rows(3), jev_decider(client), client=client, results_path=path_a).status == "complete"
+    model["name"] = other
+    report = run_arm(rows(3), jev_decider(client, expected_build=other.split("/")[1]), client=client, results_path=path_b)
+    assert report.status == "complete", report.reason
+    # Back on arm a's file, its saved rows pin the old build, so the first reply from the new one stops it.
+    sent = len(transport.calls)
+    report = run_arm(rows(5), jev_decider(client, expected_build=other.split("/")[1]), client=client, results_path=path_a)
+    assert report.stop_type == "ModelChanged" and len(transport.calls) == sent + 1
+    assert report.not_run == ["r3", "r4"]  # the answer from the other build is not kept
+
+
+def test_an_arm_scoped_stop_ends_only_its_arm(tmp_path):
+    replies = {"mode": "fail"}
+
+    def handler(body, n):
+        failing = replies["mode"] == "fail" or body["state"] in ("message number 0", "message number 1")
+        return status(400) if failing else jev_ok(body)
+
+    client, transport, _, _ = make_client(tmp_path, handler, max_concurrency=1)
+    report = run_arm(rows(15), jev_decider(client), client=client, results_path=tmp_path / "runs" / "private" / "a.jsonl")
+    assert report.stop_type == "ConsecutiveFailures"
+    replies["mode"] = "first two fail"
+    report = run_arm(rows(5), jev_decider(client), client=client, results_path=tmp_path / "runs" / "private" / "b.jsonl")
+    assert report.status == "complete", report.reason  # the failure count started again at 0
+    assert [d.failed for d in report.decisions.values()].count(True) == 2
+
+
+def test_the_output_token_mean_is_per_arm(tmp_path):
+    tokens = {"n": 40}
+    client, _, _, _ = make_client(tmp_path, lambda body, n: llm_ok(body, tokens=tokens["n"]), max_concurrency=1)
+    report = run_arm(rows(1), llm_decider(client), client=client, results_path=tmp_path / "runs" / "private" / "a.jsonl")
+    assert report.stop_type == "HiddenReasoning"
+    tokens["n"] = 5
+    report = run_arm(rows(1), llm_decider(client), client=client, results_path=tmp_path / "runs" / "private" / "b.jsonl")
+    assert report.status == "complete", report.reason  # 5 tokens, not the mean of 40 and 5
+
+
+@pytest.mark.parametrize("make_stop", ["key", "gap"])
+def test_money_and_key_stops_stay_for_the_life_of_the_client(tmp_path, make_stop):
+    replies = {"mode": "first"}
+    ledger = Ledger(tmp_path / "ledger.jsonl")
+
+    def handler(body, n):
+        if replies["mode"] == "first" and make_stop == "key":
+            return status(401)
+        return jev_ok(body, cost=0.02)
+
+    reported = (lambda: 0.0) if make_stop == "gap" else ledger.confirmed
+    client, transport, _, _ = make_client(tmp_path, handler, ledger=ledger, reported=reported, max_concurrency=1)
+    first = run_arm(rows(3), jev_decider(client), client=client, results_path=tmp_path / "runs" / "private" / "a.jsonl")
+    assert first.stop_type == ("KeyOrCreditsStop" if make_stop == "key" else "ReconciliationGap")
+    replies["mode"] = "later"
+    sent = len(transport.calls)
+    second = run_arm(rows(3), jev_decider(client), client=client, results_path=tmp_path / "runs" / "private" / "b.jsonl")
+    assert second.status == "stopped" and second.stop_type == first.stop_type
+    assert len(transport.calls) == sent and second.not_run == ["r0", "r1", "r2"]
+
+
+def test_stop_scopes_are_as_documented():
+    for scoped in (ModelChanged, ProviderChanged, ArmNotRun, openrouter.ConsecutiveFailures, HiddenReasoning):
+        assert issubclass(scoped, openrouter.ARM_SCOPED_STOPS)
+    for lasting in (
+        BudgetExceeded, KeyOrCreditsStop, openrouter.LedgerMismatch, openrouter.ReconciliationGap,
+        openrouter.ReconciliationUnavailable, openrouter.UnexpectedStop,
+    ):
+        assert not issubclass(lasting, openrouter.ARM_SCOPED_STOPS)
+    assert "one arm at a time" in openrouter.__doc__ and "any" in openrouter.__doc__
+
+
+def test_a_client_runs_one_arm_at_a_time(tmp_path):
+    client, transport, _, _ = make_client(tmp_path, lambda body, n: jev_ok(body))
+    client._in_arm = True  # as if another thread were inside run_arm
+    with pytest.raises(RuntimeError, match="one after another"):
+        run_arm(rows(1), jev_decider(client), client=client, results_path=results_path(tmp_path))
+    assert transport.calls == []

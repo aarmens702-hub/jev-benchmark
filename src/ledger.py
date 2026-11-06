@@ -81,6 +81,7 @@ class Ledger:
         self._open: dict[str, tuple[float, str | None]] = {}
         self._entries = 0
         self._baseline: float | None = None
+        self._observed: float | None = None
         # Spend OpenRouter reported beyond the ledger. It stays added as the ledger grows, because
         # later spend lands on both figures; taking a plain max would lose it as the ledger caught up.
         self._excess = 0.0
@@ -113,6 +114,7 @@ class Ledger:
                 if self._baseline is not None:
                     raise ValueError("second baseline")
                 self._baseline = _check_amount(entry["usage"])
+                self._observed = _check_amount(entry.get("observed", entry["usage"]))
             elif kind == "reported":
                 self._excess = max(self._excess, _check_amount(entry["excess"]))
             elif kind == "reserve":
@@ -163,12 +165,19 @@ class Ledger:
         with self._synced():
             return self._baseline
 
-    def record_baseline(self, usage: float, meta: dict) -> None:
+    def baseline_observed(self) -> float | None:
+        """The key's usage as read when the baseline was recorded. All-time usage can never fall below it."""
+        with self._synced():
+            return self._observed
+
+    def record_baseline(self, usage: float, meta: dict, observed: float | None = None) -> None:
+        """usage is where reported usage reads as zero ledger spend; observed is what the key showed then."""
         usage = _check_amount(usage)
+        observed = usage if observed is None else _check_amount(observed)
         with self._synced():
             if self._baseline is not None:
                 raise ValueError("this ledger already has a baseline")
-            self._append({"kind": "baseline", "id": uuid.uuid4().hex, "usage": usage, "meta": meta})
+            self._append({"kind": "baseline", "id": uuid.uuid4().hex, "usage": usage, "observed": observed, "meta": meta})
 
     def note_reported(self, total: float) -> None:
         """Reported spend since the baseline. If it is above the ledger, the cap counts the difference from now on."""
@@ -176,6 +185,11 @@ class Ledger:
             excess = total - self._spent()
             if excess > self._excess + _EPS:
                 self._append({"kind": "reported", "id": uuid.uuid4().hex, "total": total, "excess": excess, "meta": {}})
+
+    def excess(self) -> float:
+        """Reported spend beyond the ledger, already counted against the caps."""
+        with self._synced():
+            return self._excess
 
     def spent(self) -> float:
         """The ledger's own figure: settled, plus reservations not settled yet."""

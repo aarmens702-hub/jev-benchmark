@@ -3,6 +3,16 @@
 Without `--paid <stage>` only a fake transport can be used. API shapes are recorded with their
 source URLs in tests/fixtures/sources.json. Nothing the server sends is copied into an exception
 or a log, so a response echoing the key cannot leak it.
+
+Clients and arms in a stage. A stage has one ledger, shared by every client in it, and may use any
+number of clients and arms. A client runs one arm at a time, and may run several arms one after
+another (for example the Jev arm, then an LLM arm). Only one client sends at a time, because the
+limit of 4 concurrent requests is held per client. Each arm starts with its own model pin, failure
+count and output-token mean. Stops that are about one arm end only that arm: a changed model or
+provider, missing logprobs, 10 failures in a row, hidden reasoning. Stops that are about money or
+the key end the client for good: the budget, a 401/402/403, a reconciliation gap or unreadable
+usage, a ledger mismatch, a bug or Ctrl-C. A new client after such a stop re-checks the ledger
+against the key's usage before it sends anything.
 """
 import hashlib
 import json
@@ -59,7 +69,9 @@ NO_USABLE_LOGPROBS = "no_usable_logprobs"
 # A row that failed on an outage gets its first pass plus 1 more, counted across reruns (ruling R2).
 OUTAGE_PASS_LIMIT = 2
 _SAFE_NAME = re.compile(r"[\w./:-]{1,80}")
-_KEY_LIKE = re.compile(r"(?:^|[/:.])sk-", re.IGNORECASE)
+# OpenRouter keys are sk-or-v1- and 64 hex characters. Anything carrying sk- or a long hex run, which
+# could be the key's secret part on its own, is refused wherever it sits in the name.
+_KEY_LIKE = re.compile(r"sk-|[0-9a-f]{32,}", re.IGNORECASE)
 ORDER_SEED = 1105
 STOP_STATUSES = {401, 402, 403}
 
@@ -132,6 +144,11 @@ class ArmNotRun(RunStop):
 
 class UnexpectedStop(RunStop):
     pass
+
+
+# Stops about one arm's model or rows. The next arm on the same client starts clear of them. Every
+# other stop (budget, key, reconciliation, ledger mismatch, a bug, Ctrl-C) stays for the client's life.
+ARM_SCOPED_STOPS = (ModelChanged, ProviderChanged, ArmNotRun, ConsecutiveFailures, HiddenReasoning)
 
 
 @dataclass(frozen=True)
@@ -355,7 +372,7 @@ def _body_stop_status(data) -> int | None:
 
 
 class Client:
-    """Sends one row at a time through every guard. One client per arm; the ledger may be shared."""
+    """Sends rows through every guard. One arm at a time, several arms in turn; the ledger may be shared."""
 
     def __init__(
         self,
@@ -393,45 +410,85 @@ class Client:
         self._output_tokens = 0
         self._output_calls = 0
         self._pinned_model: str | None = None
-        # Spend before this point belongs to earlier runs, on both sides of the comparison.
-        self._base_reported = reported_usage()
+        usage = reported_usage()
         if self.is_paid:
-            self._check_paid_start(accept_key_usage_usd)
+            self._check_paid_start(usage, accept_key_usage_usd)
         self._base_confirmed = ledger.confirmed()
         self._base_uncertain = ledger.uncertain()
         # Where reported usage reads as zero spend, so that it can be compared with the ledger's total.
         baseline = ledger.baseline()
-        self._reported_zero = baseline if baseline is not None else self._base_reported - ledger.spent()
-        ledger.note_reported(self._base_reported - self._reported_zero)
+        self._reported_zero = baseline if baseline is not None else usage - ledger.spent()
+        # Spend before this point belongs to earlier runs, on both sides of the comparison. A paid client
+        # starts from where usage will be once the ledger's confirmed spend has posted, so an earlier
+        # arm's spend posting late is not read as this client being billed more. Earlier spend the
+        # ledger only estimated (a 529, a crash mid-call) may or may not post, so it widens the upper
+        # bound instead; putting it in the starting point would read an unbilled estimate as a gap.
+        self._base_reported = usage
+        self._pre_start_slack = 0.0
+        if self.is_paid:
+            self._base_reported = max(usage, self._reported_zero + self._base_confirmed)
+            self._pre_start_slack = max(0.0, self._reported_zero + ledger.spent() - self._base_reported)
+        ledger.note_reported(usage - self._reported_zero)
 
-    def _check_paid_start(self, accept_usd) -> None:
+    def _check_paid_start(self, usage: float, accept_usd) -> None:
         """Compare the key's all-time usage with the ledger, so a lost or swapped ledger cannot reset the cap.
 
-        Only spend above the ledger counts here. Below it is safe, and usage can post late.
+        Only spend above the ledger counts here. Below it is safe, and usage can post late. Spend shown
+        by the key and not by the ledger can be accepted by amount, and is then written to the ledger as
+        spend, counted against the total and the current stage: accepting never gives room back.
         """
-        usage = self._base_reported
+        if accept_usd is not None and (not _is_number(accept_usd) or accept_usd < 0):
+            raise ValueError("accept_key_usage_usd must be a finite number of US dollars, zero or more")
         baseline = self.ledger.baseline()
         if baseline is None:
             if not self.ledger.is_empty():
                 raise LedgerMismatch("this ledger has entries but no baseline, so its spend can't be checked. Nothing sent.")
-            if reconciliation_stops(0.0, accept_usd or 0.0, usage):
-                raise LedgerMismatch(
-                    f"the ledger is empty but the key shows US${usage:.6f} spent: the ledger was lost, or there is spend "
-                    "outside it. Nothing sent. If that spend is known and accepted, pass accept_key_usage_usd with the amount."
-                )
-            self.ledger.record_baseline(usage, {"accepted_usd": accept_usd})
+            if accept_usd is None:
+                if usage > RECONCILE_FLOOR_USD:
+                    raise LedgerMismatch(
+                        f"the ledger is empty but the key shows US${usage:.6f} spent: the ledger was lost, or there is spend "
+                        "outside it. Nothing sent. If that spend is known and accepted, pass accept_key_usage_usd with the amount."
+                    )
+                self.ledger.record_baseline(usage, {"accepted_usd": None})
+                return
+            self._require_cover(accept_usd, usage, "the key's usage")
+            # The ledger now holds all of the key's usage, so reported usage reads as zero spend at 0.
+            self.ledger.record_baseline(0.0, {"accepted_usd": accept_usd}, observed=usage)
+            self._charge_accepted(accept_usd, usage)
             return
-        if accept_usd is not None:
-            raise ValueError("this ledger already has a baseline, so there is no starting usage to accept")
-        since = usage - baseline
-        if since < -RECONCILE_FLOOR_USD:
-            raise LedgerMismatch(f"the key shows US${usage:.6f}, below the baseline of US${baseline:.6f}: a different key? Nothing sent.")
-        spent = self.ledger.spent()
-        if reconciliation_stops(0.0, spent, since):
+        observed = self.ledger.baseline_observed()
+        if usage < max(baseline, observed) - RECONCILE_FLOOR_USD:
             raise LedgerMismatch(
-                f"the key shows US${since:.6f} since the baseline and the ledger holds US${spent:.6f}: "
-                "the ledger was lost, or there is spend outside it. Nothing sent."
+                f"the key shows US${usage:.6f}, below the US${max(baseline, observed):.6f} it showed when this ledger "
+                "began: a different key? Nothing sent."
             )
+        since = usage - baseline
+        held = self.ledger.spent() + self.ledger.excess()
+        mismatch = reconciliation_stops(0.0, held, since)
+        if accept_usd is None:
+            if mismatch:
+                raise LedgerMismatch(
+                    f"the key shows US${since:.6f} since the baseline and the ledger holds US${held:.6f}: "
+                    "the ledger was lost, or there is spend outside it. Nothing sent. If that spend is known and "
+                    f"accepted, pass accept_key_usage_usd with the US${since - held:.6f} difference."
+                )
+            return
+        if not mismatch:
+            raise ValueError("this ledger already has a baseline and agrees with the key's usage, so there is nothing to accept")
+        self._require_cover(accept_usd, since - held, "the spend outside the ledger")
+        self._charge_accepted(accept_usd, since - held)
+
+    @staticmethod
+    def _require_cover(accept_usd: float, amount: float, what: str) -> None:
+        if accept_usd < amount - RECONCILE_FLOOR_USD - 1e-12:
+            raise LedgerMismatch(
+                f"accept_key_usage_usd of US${accept_usd:.6f} does not cover {what}, US${amount:.6f}, "
+                f"to within US${RECONCILE_FLOOR_USD}. Nothing sent."
+            )
+
+    def _charge_accepted(self, accept_usd: float, amount: float) -> None:
+        """Counted against the total and the current stage. Raises BudgetExceeded, after writing, if it passes a cap."""
+        self.ledger.charge(max(accept_usd, amount), {"accepted_key_usage_usd": accept_usd, "unaccounted_usd": amount})
 
     def latch(self, stop: RunStop) -> None:
         """Record why the run must end. Later sends refuse; the current row's paid answer can still be kept."""
@@ -488,7 +545,20 @@ class Client:
 
     def _ledger_bounds(self) -> tuple[float, float]:
         lower = max(0.0, self.ledger.confirmed() - self._base_confirmed)
-        return lower, lower + max(0.0, self.ledger.uncertain() - self._base_uncertain)
+        return lower, lower + max(0.0, self.ledger.uncertain() - self._base_uncertain) + self._pre_start_slack
+
+    def begin_arm(self) -> None:
+        """Called by run_arm. A new arm gets its own model pin and counts, and clears a stop about the last arm."""
+        with self._lock:
+            if self._in_arm:
+                raise RuntimeError("this client is already running an arm; run arms one after another")
+            if isinstance(self.stop, ARM_SCOPED_STOPS):
+                self.stop = None
+            self._pinned_model = None
+            self.consecutive_failures = 0
+            self._output_tokens = 0
+            self._output_calls = 0
+            self._in_arm = True
 
     def _read_usage(self) -> float | None:
         try:
@@ -812,6 +882,14 @@ def run_arm(
     seen = {row_id(row) for row in rows}
     if len(seen) != len(rows):
         raise ValueError("row ids must be unique, or a row would be paid for twice")
+    client.begin_arm()
+    try:
+        return _run_arm(rows, decide, client, results_path, expected_per_row, row_id, allowed_arm_not_run, seen)
+    finally:
+        client._in_arm = False
+
+
+def _run_arm(rows, decide, client, results_path, expected_per_row, row_id, allowed_arm_not_run, seen) -> RunReport:
     results = _Results(results_path)
     report = RunReport(status="complete")
     todo = [row for row in rows if results.needs_run(row_id(row))]
@@ -867,7 +945,6 @@ def run_arm(
 
     refused = False
     position = 0
-    client._in_arm = True
     try:
         if client.stop is None and expected_per_row is not None and todo:
             try:
@@ -894,8 +971,6 @@ def run_arm(
             run_batch(todo[position:])
     except BudgetExceeded as stop:
         client.latch(stop)
-    finally:
-        client._in_arm = False
     client.reconcile_final()
 
     report.decisions = {key: value for key, value in results.finished.items() if key in seen}
