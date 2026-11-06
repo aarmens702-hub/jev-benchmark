@@ -425,3 +425,19 @@ def test_registration_names_the_selected_small_llm_and_public_repo():
     assert "recorded as values, not hashed" in registration
     assert "registration commit" not in registration
     assert "—" not in registration and "–" not in registration  # no em or en dashes
+
+
+def test_firewall_catches_code_hidden_by_a_clean_filter(repo, hub, tmp_path):
+    # git is fooled by the filter; verify hashes the bytes on disk, so the firewall still refuses.
+    frozen_repo(repo, hub)
+    git(repo, "tag", FREEZE_TAG)
+    original = tmp_path / "orig.py"
+    original.write_bytes((repo / "src" / "code.py").read_bytes())
+    git(repo, "config", "filter.hide.clean", f"cat {original}")
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "attributes").write_text("src/code.py filter=hide\n")
+    (repo / "src" / "code.py").write_text("x = 'changed after the freeze'\n")
+    git(repo, "add", "src/code.py")
+    assert git(repo, "status", "--porcelain") == ""
+    with pytest.raises(firewall.FirewallError, match="does not verify"):
+        _firewall_load(repo, hub, tmp_path)

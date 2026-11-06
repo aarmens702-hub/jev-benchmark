@@ -562,6 +562,20 @@ def test_load_test_rejects_a_symlinked_manifest(tmp_path):
     assert_refused(repo, tmp_path, "manifest")
 
 
+def test_load_test_rejects_disk_manifest_hidden_by_a_clean_filter(tmp_path):
+    # A clean filter makes git see the tagged manifest while the file on disk says something else.
+    repo = make_repo(tmp_path)
+    original = tmp_path / "orig.json"
+    original.write_bytes((repo / "manifest.json").read_bytes())
+    git(repo, "config", "filter.hide.clean", f"cat {original}")
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "attributes").write_text("manifest.json filter=hide\n")
+    write_manifest(repo / "manifest.json", {**FROZEN_MANIFEST, "files": {}})
+    git(repo, "add", "manifest.json")  # stores the filtered (tagged) bytes, so nothing is staged
+    assert git(repo, "status", "--porcelain") == ""  # git is fooled
+    assert_refused(repo, tmp_path, "on disk is not the tagged manifest")
+
+
 # 4. clean tree, nothing hidden from git
 
 
