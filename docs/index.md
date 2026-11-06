@@ -194,5 +194,3 @@ The whole test run cost **US$1.59** in API calls, across 38,320 requests with ze
 Everything is in the [repo](https://github.com/aarmens702-hub/jev-benchmark): the frozen plan at tag [`freeze-v1`](https://github.com/aarmens702-hub/jev-benchmark/tree/freeze-v1), every prediction (with its confidence, cost and response time), every results table, the code, and a log of every change from the plan. The test sets are public, so anyone can match the predictions to the correct answers and recompute the numbers. The paid calls can be re-run with your own OpenRouter key.
 
 Thanks to the engineer who pushed on this. It was the right question.
-
-*I used Claude, an AI assistant, to help design, code and check this study and to draft this post. I reviewed the design and every number.*
